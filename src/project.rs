@@ -7,12 +7,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use yaml_serde::{Mapping, Value};
 
 use crate::domain::{EntityId, EntityKind, prefixed_uuid};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectConfig {
     pub format_version: u8,
     pub work_id: EntityId,

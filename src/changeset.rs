@@ -9,10 +9,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{
-    domain::{EntityId, EntityKind, is_prefixed_uuid},
-    project::Project,
+    domain::{EntityId, EntityKind, is_known_entity_id, is_prefixed_uuid},
+    project::{Project, ProjectConfig, parse_markdown},
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -59,6 +60,7 @@ pub struct Changeset {
     pub id: EntityId,
     pub parent_changeset_id: Option<EntityId>,
     pub base_root_hash: String,
+    pub content_result_hash: String,
     pub result_root_hash: String,
     pub state: ChangesetState,
     pub operations: Vec<FileOperation>,
@@ -78,7 +80,11 @@ impl Changeset {
 
     pub fn mark_fully_revalidated(&mut self, validation_hash: impl Into<String>) {
         self.validation_hash = Some(validation_hash.into());
-        self.state = ChangesetState::Approvable;
+        self.state = if self.state == ChangesetState::NeedsRevalidation {
+            ChangesetState::Approved
+        } else {
+            ChangesetState::Approvable
+        };
     }
 }
 
@@ -99,6 +105,8 @@ pub enum ValidationErrorKind {
     CandidatePath,
     HashMismatch,
     InvalidOperation,
+    ApprovalNamespace,
+    Schema,
     Io,
     MissingChangeset,
 }
@@ -121,6 +129,8 @@ impl ValidationErrorKind {
             Self::CandidatePath => "candidate-path",
             Self::HashMismatch => "hash-mismatch",
             Self::InvalidOperation => "invalid-operation",
+            Self::ApprovalNamespace => "approval-namespace",
+            Self::Schema => "schema",
             Self::Io => "io",
             Self::MissingChangeset => "missing-changeset",
         }
@@ -139,6 +149,9 @@ pub struct ApprovalRecord {
     pub base_root_hash: String,
     pub candidate_hash: String,
     pub operations_hash: String,
+    pub content_result_hash: String,
+    pub validation_hash: String,
+    pub dependencies: Vec<ChangesetDependency>,
     pub chapter_order: u32,
 }
 
@@ -211,6 +224,8 @@ pub fn validate_changeset(project: &Project, change: &Changeset) -> Result<(), V
         );
     }
 
+    validate_reserved_targets(&change.operations)?;
+
     let actual_root = canon_root_hash(project)?;
     if actual_root != change.base_root_hash {
         return validation_error(
@@ -218,103 +233,28 @@ pub fn validate_changeset(project: &Project, change: &Changeset) -> Result<(), V
             "canon no longer matches the changeset base root",
         );
     }
-    if change.parent_changeset_id.as_ref().is_some_and(|parent| {
-        !change
-            .dependencies
-            .iter()
-            .any(|dependency| dependency.id == *parent)
-    }) {
-        return validation_error(
-            ValidationErrorKind::DependencyOrder,
-            "parent changeset has no durable approval dependency",
-        );
-    }
-    let expected_order = change
-        .dependencies
-        .iter()
-        .map(|dependency| dependency.chapter_order)
-        .max()
-        .map_or(Some(1), |order| order.checked_add(1));
-    if Some(change.chapter_order) != expected_order
-        || change.parent_changeset_id.as_ref().is_some_and(|parent| {
-            !change.dependencies.iter().any(|dependency| {
-                dependency.id == *parent
-                    && dependency.chapter_order.checked_add(1) == Some(change.chapter_order)
-            })
-        })
-    {
-        return validation_error(
-            ValidationErrorKind::DependencyOrder,
-            "changeset is outside chapter approval order",
-        );
-    }
-    for dependency in &change.dependencies {
-        if dependency.chapter_order >= change.chapter_order {
-            return validation_error(
-                ValidationErrorKind::DependencyOrder,
-                format!(
-                    "dependency {} is not approved earlier",
-                    dependency.id.as_str()
-                ),
-            );
-        }
-        let record_path = approval_record_path(&project.root, &dependency.id);
-        let record_bytes = fs::read(&record_path).map_err(|error| {
-            ValidationError::new(
-                ValidationErrorKind::DependencyHash,
-                format!(
-                    "failed to read approval record {}: {error}",
-                    record_path.display()
-                ),
-            )
-        })?;
-        if sha256_bytes(&record_bytes) != dependency.approval_record_sha256 {
-            return validation_error(
-                ValidationErrorKind::DependencyHash,
-                format!(
-                    "dependency {} approval record changed",
-                    dependency.id.as_str()
-                ),
-            );
-        }
-        let record: ApprovalRecord = serde_json::from_slice(&record_bytes).map_err(|error| {
-            ValidationError::new(
-                ValidationErrorKind::DependencyHash,
-                format!(
-                    "dependency {} approval record is invalid: {error}",
-                    dependency.id.as_str()
-                ),
-            )
-        })?;
-        if record.changeset_id != dependency.id || record.chapter_order != dependency.chapter_order
-        {
-            return validation_error(
-                ValidationErrorKind::DependencyHash,
-                format!(
-                    "dependency {} approval record does not match",
-                    dependency.id.as_str()
-                ),
-            );
-        }
-    }
-
-    let approval_path = approval_record_path(&project.root, &change.id);
-    if approval_path.exists() {
-        return validation_error(
-            ValidationErrorKind::InvalidOperation,
-            format!(
-                "approval record already exists: {}",
-                approval_path.display()
-            ),
-        );
-    }
-
+    validate_approval_order(project, change)?;
     validate_operations(project, &change.id, &change.operations)?;
     let actual_candidate_hash = calculate_candidate_hash(project, change)?;
     if actual_candidate_hash != change.candidate_hash {
         return validation_error(
             ValidationErrorKind::CandidateHash,
             "candidate files changed after validation",
+        );
+    }
+    let entries = projected_content(project, change)?;
+    let actual_content = hash_entries(entries.iter().map(|(path, bytes)| (path, bytes.as_slice())));
+    if actual_content != change.content_result_hash {
+        return validation_error(
+            ValidationErrorKind::ResultRoot,
+            "projected content root does not match the changeset",
+        );
+    }
+    validate_projected_schema(project, change, &entries)?;
+    if change.validation_hash.as_deref() != Some(calculate_validation_hash(change).as_str()) {
+        return validation_error(
+            ValidationErrorKind::ValidationHash,
+            "changeset validation hash is missing or invalid",
         );
     }
     let actual_result = projected_root_hash(project, change)?;
@@ -324,12 +264,6 @@ pub fn validate_changeset(project: &Project, change: &Changeset) -> Result<(), V
             "projected canon root does not match the changeset result",
         );
     }
-    if change.validation_hash.as_deref() != Some(calculate_validation_hash(change).as_str()) {
-        return validation_error(
-            ValidationErrorKind::ValidationHash,
-            "changeset validation hash is missing or invalid",
-        );
-    }
     Ok(())
 }
 
@@ -337,24 +271,23 @@ pub fn calculate_validation_hash(change: &Changeset) -> String {
     #[derive(Serialize)]
     struct ValidationMaterial<'a> {
         id: &'a EntityId,
-        parent_changeset_id: &'a Option<EntityId>,
         base_root_hash: &'a str,
-        result_root_hash: &'a str,
-        operations: &'a [FileOperation],
+        content_result_hash: &'a str,
+        operations_hash: String,
         candidate_hash: &'a str,
-        unresolved_blocker_ids: &'a [EntityId],
         dependencies: &'a [ChangesetDependency],
         chapter_order: u32,
     }
 
     let material = ValidationMaterial {
         id: &change.id,
-        parent_changeset_id: &change.parent_changeset_id,
         base_root_hash: &change.base_root_hash,
-        result_root_hash: &change.result_root_hash,
-        operations: &change.operations,
+        content_result_hash: &change.content_result_hash,
+        operations_hash: sha256_bytes(
+            &serde_json::to_vec(&change.operations)
+                .expect("file operations contain only serializable values"),
+        ),
         candidate_hash: &change.candidate_hash,
-        unresolved_blocker_ids: &change.unresolved_blocker_ids,
         dependencies: &change.dependencies,
         chapter_order: change.chapter_order,
     };
@@ -401,6 +334,30 @@ pub fn projected_root_hash(
     project: &Project,
     change: &Changeset,
 ) -> Result<String, ValidationError> {
+    let mut entries = projected_content(project, change)?;
+    entries.insert(
+        approval_record_relative_path(&change.id),
+        approval_record_bytes(change)?,
+    );
+    Ok(hash_entries(
+        entries.iter().map(|(path, bytes)| (path, bytes.as_slice())),
+    ))
+}
+
+pub fn content_result_hash(
+    project: &Project,
+    change: &Changeset,
+) -> Result<String, ValidationError> {
+    let entries = projected_content(project, change)?;
+    Ok(hash_entries(
+        entries.iter().map(|(path, bytes)| (path, bytes.as_slice())),
+    ))
+}
+
+fn projected_content(
+    project: &Project,
+    change: &Changeset,
+) -> Result<BTreeMap<PathBuf, Vec<u8>>, ValidationError> {
     let mut entries = collect_canon_files(&project.root)?;
     for operation in &change.operations {
         validate_target_path(&project.root, &operation.path)?;
@@ -426,13 +383,7 @@ pub fn projected_root_hash(
             }
         }
     }
-    entries.insert(
-        approval_record_relative_path(&change.id),
-        approval_record_bytes(change),
-    );
-    Ok(hash_entries(
-        entries.iter().map(|(path, bytes)| (path, bytes.as_slice())),
-    ))
+    Ok(entries)
 }
 
 pub fn render_diff(project: &Project, change: &Changeset) -> Result<String, ValidationError> {
@@ -541,7 +492,7 @@ pub fn approval_record_path(project_root: &Path, changeset_id: &EntityId) -> Pat
     project_root.join(approval_record_relative_path(changeset_id))
 }
 
-pub fn approval_record_bytes(change: &Changeset) -> Vec<u8> {
+pub fn approval_record_bytes(change: &Changeset) -> Result<Vec<u8>, ValidationError> {
     let operations_hash = sha256_bytes(
         &serde_json::to_vec(&change.operations)
             .expect("file operations contain only serializable values"),
@@ -551,15 +502,250 @@ pub fn approval_record_bytes(change: &Changeset) -> Vec<u8> {
         base_root_hash: change.base_root_hash.clone(),
         candidate_hash: change.candidate_hash.clone(),
         operations_hash,
+        content_result_hash: change.content_result_hash.clone(),
+        validation_hash: change.validation_hash.clone().ok_or_else(|| {
+            ValidationError::new(
+                ValidationErrorKind::ValidationHash,
+                "approval record requires a validation hash",
+            )
+        })?,
+        dependencies: change.dependencies.clone(),
         chapter_order: change.chapter_order,
     };
     let mut bytes = serde_json::to_vec_pretty(&record)
         .expect("approval record contains only serializable values");
     bytes.push(b'\n');
-    bytes
+    Ok(bytes)
+}
+
+struct ScannedApproval {
+    record: ApprovalRecord,
+    sha256: String,
+}
+
+fn validate_approval_order(project: &Project, change: &Changeset) -> Result<(), ValidationError> {
+    let approvals = scan_approval_records(&project.root)?;
+    if approvals
+        .iter()
+        .any(|approval| approval.record.changeset_id == change.id)
+    {
+        return validation_error(
+            ValidationErrorKind::InvalidOperation,
+            "changeset already has an approval record",
+        );
+    }
+    let mut dependency_ids = HashSet::new();
+    for dependency in &change.dependencies {
+        if !dependency_ids.insert(dependency.id.as_str()) {
+            return validation_error(
+                ValidationErrorKind::DependencyOrder,
+                "changeset has duplicate dependencies",
+            );
+        }
+        if dependency.chapter_order >= change.chapter_order {
+            return validation_error(
+                ValidationErrorKind::DependencyOrder,
+                "dependency is not earlier than the changeset",
+            );
+        }
+        let Some(approved) = approvals
+            .iter()
+            .find(|approval| approval.record.changeset_id == dependency.id)
+        else {
+            return validation_error(
+                ValidationErrorKind::DependencyHash,
+                format!(
+                    "dependency {} is not durably approved",
+                    dependency.id.as_str()
+                ),
+            );
+        };
+        if approved.sha256 != dependency.approval_record_sha256
+            || approved.record.chapter_order != dependency.chapter_order
+        {
+            return validation_error(
+                ValidationErrorKind::DependencyHash,
+                format!(
+                    "dependency {} approval proof changed",
+                    dependency.id.as_str()
+                ),
+            );
+        }
+    }
+
+    match approvals.last() {
+        None if change.chapter_order == 1
+            && change.parent_changeset_id.is_none()
+            && change.dependencies.is_empty() =>
+        {
+            Ok(())
+        }
+        Some(head)
+            if change.chapter_order == head.record.chapter_order.checked_add(1).unwrap_or(0)
+                && change.parent_changeset_id.as_ref() == Some(&head.record.changeset_id)
+                && change.dependencies.iter().any(|dependency| {
+                    dependency.id == head.record.changeset_id
+                        && dependency.approval_record_sha256 == head.sha256
+                        && dependency.chapter_order == head.record.chapter_order
+                }) =>
+        {
+            Ok(())
+        }
+        _ => validation_error(
+            ValidationErrorKind::DependencyOrder,
+            "changeset does not extend the durable approval chain head",
+        ),
+    }
+}
+
+fn scan_approval_records(root: &Path) -> Result<Vec<ScannedApproval>, ValidationError> {
+    let directory = root.join(".phemius/records/approvals");
+    let mut entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|error| ValidationError::io("failed to enumerate approval records", error))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(ValidationError::io(
+                "failed to read approval records",
+                error,
+            ));
+        }
+    };
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut approvals = Vec::with_capacity(entries.len());
+    let mut orders = HashSet::new();
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| ValidationError::io("failed to inspect approval record", error))?;
+        if !file_type.is_file() {
+            return validation_error(
+                ValidationErrorKind::DependencyHash,
+                format!("unknown approval entry: {}", entry.path().display()),
+            );
+        }
+        let bytes = fs::read(entry.path())
+            .map_err(|error| ValidationError::io("failed to read approval record", error))?;
+        let record: ApprovalRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            ValidationError::new(
+                ValidationErrorKind::DependencyHash,
+                format!(
+                    "invalid approval record {}: {error}",
+                    entry.path().display()
+                ),
+            )
+        })?;
+        let expected_name = format!("{}.json", record.changeset_id.as_str());
+        if entry.file_name() != expected_name.as_str()
+            || !is_prefixed_uuid(record.changeset_id.as_str(), EntityKind::Changeset)
+            || record.chapter_order == 0
+            || !orders.insert(record.chapter_order)
+            || ![
+                &record.base_root_hash,
+                &record.candidate_hash,
+                &record.operations_hash,
+                &record.content_result_hash,
+                &record.validation_hash,
+            ]
+            .into_iter()
+            .all(|hash| is_sha256(hash))
+            || approval_validation_hash(&record) != record.validation_hash
+        {
+            return validation_error(
+                ValidationErrorKind::DependencyHash,
+                format!("invalid approval proof: {}", entry.path().display()),
+            );
+        }
+        approvals.push(ScannedApproval {
+            record,
+            sha256: sha256_bytes(&bytes),
+        });
+    }
+    approvals.sort_by_key(|approval| approval.record.chapter_order);
+    for (index, approval) in approvals.iter().enumerate() {
+        let expected_order = index as u32 + 1;
+        if approval.record.chapter_order != expected_order {
+            return validation_error(
+                ValidationErrorKind::DependencyOrder,
+                "approval chain contains a chapter-order gap",
+            );
+        }
+        if index == 0 {
+            if !approval.record.dependencies.is_empty() {
+                return validation_error(
+                    ValidationErrorKind::DependencyOrder,
+                    "first approval record has dependencies",
+                );
+            }
+            continue;
+        }
+        let previous = &approvals[index - 1];
+        if !approval.record.dependencies.iter().any(|dependency| {
+            dependency.id == previous.record.changeset_id
+                && dependency.chapter_order == previous.record.chapter_order
+                && dependency.approval_record_sha256 == previous.sha256
+        }) {
+            return validation_error(
+                ValidationErrorKind::DependencyOrder,
+                "approval chain does not reference its previous head",
+            );
+        }
+        for dependency in &approval.record.dependencies {
+            if !approvals[..index].iter().any(|earlier| {
+                dependency.id == earlier.record.changeset_id
+                    && dependency.chapter_order == earlier.record.chapter_order
+                    && dependency.approval_record_sha256 == earlier.sha256
+            }) {
+                return validation_error(
+                    ValidationErrorKind::DependencyHash,
+                    "approval record has an invalid dependency proof",
+                );
+            }
+        }
+    }
+    Ok(approvals)
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn approval_validation_hash(record: &ApprovalRecord) -> String {
+    #[derive(Serialize)]
+    struct Material<'a> {
+        id: &'a EntityId,
+        base_root_hash: &'a str,
+        content_result_hash: &'a str,
+        operations_hash: &'a str,
+        candidate_hash: &'a str,
+        dependencies: &'a [ChangesetDependency],
+        chapter_order: u32,
+    }
+    sha256_bytes(
+        &serde_json::to_vec(&Material {
+            id: &record.changeset_id,
+            base_root_hash: &record.base_root_hash,
+            content_result_hash: &record.content_result_hash,
+            operations_hash: &record.operations_hash,
+            candidate_hash: &record.candidate_hash,
+            dependencies: &record.dependencies,
+            chapter_order: record.chapter_order,
+        })
+        .expect("approval validation material is serializable"),
+    )
 }
 
 pub(crate) fn validate_target_path(root: &Path, path: &Path) -> Result<(), ValidationError> {
+    validate_target_lexical(path)?;
+    reject_symlink_components(root, path, ValidationErrorKind::InvalidPath)?;
+    ensure_within_root(root, path, ValidationErrorKind::InvalidPath)
+}
+
+pub(crate) fn validate_target_lexical(path: &Path) -> Result<(), ValidationError> {
     validate_lexical_path(path, ValidationErrorKind::InvalidPath)?;
     let segments = path_segments(path, ValidationErrorKind::InvalidPath)?;
     if is_git_path(&segments) || is_runtime_path(&segments) || is_local_settings_path(&segments) {
@@ -568,8 +754,13 @@ pub(crate) fn validate_target_path(root: &Path, path: &Path) -> Result<(), Valid
             format!("target path is outside canon: {}", path.display()),
         );
     }
-    reject_symlink_components(root, path, ValidationErrorKind::InvalidPath)?;
-    ensure_within_root(root, path, ValidationErrorKind::InvalidPath)
+    if is_approval_namespace(path)? {
+        return validation_error(
+            ValidationErrorKind::ApprovalNamespace,
+            format!("approval records are controller-owned: {}", path.display()),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_candidate_path(
@@ -639,10 +830,12 @@ fn validate_operations(
             "changeset has no file operations",
         );
     }
+    validate_reserved_targets(operations)?;
     let mut targets = HashSet::new();
+    let mut affected_entities = HashSet::new();
     for operation in operations {
         validate_target_path(&project.root, &operation.path)?;
-        let alias = operation.path.to_string_lossy().to_lowercase();
+        let alias = path_alias_key(&operation.path)?;
         if !targets.insert(alias) {
             return validation_error(
                 ValidationErrorKind::InvalidOperation,
@@ -650,6 +843,16 @@ fn validate_operations(
             );
         }
         let target = project.root.join(&operation.path);
+        for entity in &operation.affected_entities {
+            if !is_known_entity_id(entity.as_str())
+                || !affected_entities.insert(entity.as_str().to_owned())
+            {
+                return validation_error(
+                    ValidationErrorKind::InvalidOperation,
+                    "affected entity IDs must be valid and unique",
+                );
+            }
+        }
         match operation.kind {
             OperationKind::Create => {
                 if target.exists()
@@ -679,6 +882,7 @@ fn validate_operations(
                 if operation.before_sha256.is_none()
                     || operation.after_sha256.is_some()
                     || operation.candidate_path.is_some()
+                    || is_required_project_path(&operation.path)?
                 {
                     return validation_error(
                         ValidationErrorKind::InvalidOperation,
@@ -709,6 +913,102 @@ fn validate_operations(
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_reserved_targets(operations: &[FileOperation]) -> Result<(), ValidationError> {
+    for operation in operations {
+        validate_target_lexical(&operation.path)?;
+    }
+    Ok(())
+}
+
+fn validate_projected_schema(
+    project: &Project,
+    change: &Changeset,
+    entries: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<(), ValidationError> {
+    let config_bytes = entries.get(Path::new("project.toml")).ok_or_else(|| {
+        ValidationError::new(ValidationErrorKind::Schema, "project.toml is missing")
+    })?;
+    let config_text = std::str::from_utf8(config_bytes).map_err(|error| {
+        ValidationError::new(
+            ValidationErrorKind::Schema,
+            format!("project.toml is not UTF-8: {error}"),
+        )
+    })?;
+    let config: ProjectConfig = toml::from_str(config_text).map_err(|error| {
+        ValidationError::new(
+            ValidationErrorKind::Schema,
+            format!("project.toml is invalid: {error}"),
+        )
+    })?;
+    if config.format_version != 1 || !is_prefixed_uuid(config.work_id.as_str(), EntityKind::Work) {
+        return validation_error(
+            ValidationErrorKind::Schema,
+            "project.toml has an unsupported format or work ID",
+        );
+    }
+
+    for operation in &change.operations {
+        if !path_alias_key(&operation.path)?.ends_with(".md") {
+            continue;
+        }
+        if matches!(
+            operation.kind,
+            OperationKind::Replace | OperationKind::Delete
+        ) {
+            validate_markdown_schema(
+                &fs::read(project.root.join(&operation.path)).map_err(|error| {
+                    ValidationError::io("failed to read changed canon Markdown", error)
+                })?,
+                &operation.path,
+            )?;
+        }
+        if matches!(
+            operation.kind,
+            OperationKind::Create | OperationKind::Replace
+        ) {
+            validate_markdown_schema(
+                entries.get(&operation.path).ok_or_else(|| {
+                    ValidationError::new(
+                        ValidationErrorKind::Schema,
+                        format!(
+                            "projected Markdown is missing: {}",
+                            operation.path.display()
+                        ),
+                    )
+                })?,
+                &operation.path,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_markdown_schema(bytes: &[u8], path: &Path) -> Result<(), ValidationError> {
+    let artifact = parse_markdown(bytes).map_err(|error| {
+        ValidationError::new(
+            ValidationErrorKind::Schema,
+            format!("invalid Markdown {}: {error}", path.display()),
+        )
+    })?;
+    let id = artifact
+        .frontmatter()
+        .get("id")
+        .and_then(yaml_serde::Value::as_str)
+        .ok_or_else(|| {
+            ValidationError::new(
+                ValidationErrorKind::Schema,
+                format!("Markdown {} has no semantic ID", path.display()),
+            )
+        })?;
+    if !is_known_entity_id(id) {
+        return validation_error(
+            ValidationErrorKind::Schema,
+            format!("Markdown {} has an invalid semantic ID", path.display()),
+        );
     }
     Ok(())
 }
@@ -946,4 +1246,36 @@ fn is_local_settings_path(segments: &[&str]) -> bool {
     segments.len() == 2
         && segments[0].eq_ignore_ascii_case(".phemius")
         && segments[1].eq_ignore_ascii_case("local.toml")
+}
+
+pub(crate) fn path_alias_key(path: &Path) -> Result<String, ValidationError> {
+    let text = path.to_str().ok_or_else(|| {
+        ValidationError::new(
+            ValidationErrorKind::InvalidPath,
+            format!("path is not valid UTF-8: {}", path.display()),
+        )
+    })?;
+    Ok(text.nfkc().flat_map(char::to_lowercase).collect::<String>())
+}
+
+fn is_approval_namespace(path: &Path) -> Result<bool, ValidationError> {
+    let key = path_alias_key(path)?;
+    Ok(key == ".phemius/records/approvals" || key.starts_with(".phemius/records/approvals/"))
+}
+
+fn is_required_project_path(path: &Path) -> Result<bool, ValidationError> {
+    let key = path_alias_key(path)?;
+    Ok([
+        "project.toml",
+        "agents.md",
+        "前提/作品.md",
+        "前提/世界観設定.md",
+        "前提/時系列.md",
+        "前提/伏線.md",
+        "前提/文章スタイル.md",
+        "前提/執筆ルール.md",
+        "箱書き/構成.md",
+        "資料/manifest.md",
+    ]
+    .contains(&key.as_str()))
 }

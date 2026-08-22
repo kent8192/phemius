@@ -69,3 +69,26 @@ pub fn is_prefixed_uuid(value: &str, kind: EntityKind) -> bool {
     };
     uuid.get_version_num() == 7 && uuid.hyphenated().to_string() == uuid_text
 }
+
+pub fn is_known_entity_id(value: &str) -> bool {
+    [
+        EntityKind::Work,
+        EntityKind::Part,
+        EntityKind::Chapter,
+        EntityKind::Scene,
+        EntityKind::Box,
+        EntityKind::Character,
+        EntityKind::Source,
+        EntityKind::Changeset,
+        EntityKind::Finding,
+        EntityKind::Run,
+        EntityKind::World,
+        EntityKind::Timeline,
+        EntityKind::Foreshadowing,
+        EntityKind::Style,
+        EntityKind::Rule,
+        EntityKind::Structure,
+    ]
+    .into_iter()
+    .any(|kind| is_prefixed_uuid(value, kind))
+}

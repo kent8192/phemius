@@ -28,5 +28,6 @@ similar = "2"
 tokio = { version = "~1.51", features = ["macros", "rt-multi-thread", "process", "signal", "sync", "time"] }
 toml = "1.1"
 unicode-segmentation = "1"
+unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v7", "serde"] }
 yaml_serde = "0.10"

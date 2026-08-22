@@ -1336,6 +1336,7 @@ dependencies = [
  "similar",
  "tokio",
  "toml",
+ "unicode-normalization",
  "unicode-segmentation",
  "uuid",
  "yaml_serde",
