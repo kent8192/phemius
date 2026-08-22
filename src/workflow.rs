@@ -580,7 +580,39 @@ impl RunController {
     pub fn with_project(project: Project, backend: ModelBackend) -> Self {
         let mut controller = Self::new(backend);
         controller.project = Some(project);
+        controller.load_declared_project_plan();
         controller
+    }
+
+    fn load_declared_project_plan(&mut self) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let structure_path = project.root.join(".phemius/structure.json");
+        let framework_path = project.root.join(".phemius/framework.json");
+        let structure = fs::read(&structure_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StoryStructure>(&bytes).ok());
+        if let Some(structure) = structure
+            && validate_structure(&structure).is_ok()
+        {
+            self.structure = Some(structure);
+            self.preflight = PreflightReport {
+                approved_scene_plan: true,
+                approved_box_plan: true,
+                macro_links: true,
+            };
+        }
+        if let Ok(bytes) = fs::read(&framework_path)
+            && let Ok(framework) =
+                serde_json::from_slice::<crate::plot::FrameworkDefinition>(&bytes)
+        {
+            self.plot_framework = Some(if framework.id.starts_with("custom:") {
+                framework.id
+            } else {
+                format!("custom:{}", framework.id)
+            });
+        }
     }
 
     /// Returns the attached project, if this controller has a durable approval boundary.
@@ -801,11 +833,13 @@ impl RunController {
             return Ok(());
         };
         let root = project.root.join(".phemius/records/sessions");
-        let mut candidates = fs::read_dir(&root)
-            .ok()
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut candidates = entries
             .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
                 entry
                     .file_type()
@@ -813,17 +847,26 @@ impl RunController {
                     .filter(|file_type| file_type.is_dir())
                     .map(|_| entry.path())
             })
-            .filter(|path| path.join("checkpoint.json").is_file())
+            .filter(|path| {
+                path.join("session.jsonl").is_file() && path.join("cost.jsonl").is_file()
+            })
             .collect::<Vec<_>>();
         candidates.sort();
         let Some(session_dir) = candidates.pop() else {
             return Ok(());
         };
+        let checkpoint_path = session_dir.join("checkpoint.json");
+        if !checkpoint_path.is_file() {
+            bail!(
+                "unfinished session {} has no durable checkpoint; manual resolution is required",
+                session_dir.display()
+            );
+        }
         let journal_path = session_dir.join("session.jsonl");
         let cost_path = session_dir.join("cost.jsonl");
         self.session = Some(SessionJournal::open(&journal_path)?);
         self.cost_ledger = BudgetLedger::open(&cost_path)?;
-        self.checkpoint_path = Some(session_dir.join("checkpoint.json"));
+        self.checkpoint_path = Some(checkpoint_path);
         Ok(())
     }
 
@@ -1314,6 +1357,9 @@ impl RunController {
         }
         if self.request_maximum_cost.is_none() {
             bail!("unknown model price; generation is stopped");
+        }
+        if self.project.is_some() && self.session.is_none() {
+            self.attach_latest_session()?;
         }
         self.ensure_durable_session()?;
         self.append_session_event(SessionEvent::UserInstruction {

@@ -315,6 +315,61 @@ async fn a_new_project_controller_resumes_the_latest_session_directory() {
 }
 
 #[tokio::test]
+async fn project_controller_loads_declared_structure_and_framework_files() {
+    let directory = TestDir::new("workflow-plan-load");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let part = prefixed_uuid(EntityKind::Part);
+    let chapter = prefixed_uuid(EntityKind::Chapter);
+    let scene = prefixed_uuid(EntityKind::Scene);
+    let box_id = prefixed_uuid(EntityKind::Box);
+    let macro_beat = prefixed_uuid(EntityKind::Structure);
+    let structure = serde_json::json!({
+        "parts": [{"id": part.as_str(), "order": 1}],
+        "chapters": [{"id": chapter.as_str(), "part_id": part.as_str(), "order": 1}],
+        "scenes": [{"id": scene.as_str(), "chapter_id": chapter.as_str(), "order": 1}],
+        "boxes": [{"id": box_id.as_str(), "scene_id": scene.as_str(), "order": 1}],
+        "macro_beats": [{"id": macro_beat.as_str(), "order": 1, "scene_ids": [scene.as_str()]}]
+    });
+    fs::write(
+        directory.path().join(".phemius/structure.json"),
+        serde_json::to_vec(&structure).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join(".phemius/framework.json"),
+        br#"{"id":"three-act","name":"Three Act","stages":[],"beats":[]}"#,
+    )
+    .unwrap();
+
+    let mut controller = RunController::with_project(project, ScriptedModel::new([]).into());
+    let error = controller
+        .write_chapter(chapter.as_str())
+        .await
+        .unwrap_err();
+    assert!(
+        !error
+            .to_string()
+            .contains("approved scene, box, and macro plans")
+    );
+}
+
+#[test]
+fn checkpointless_existing_session_requires_manual_resolution() {
+    let directory = TestDir::new("workflow-checkpointless");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let session_dir = directory
+        .path()
+        .join(".phemius/records/sessions/run-incomplete");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(session_dir.join("session.jsonl"), b"").unwrap();
+    fs::write(session_dir.join("cost.jsonl"), b"").unwrap();
+
+    let mut controller = RunController::with_project(project, ScriptedModel::new([]).into());
+    let error = controller.resume_checkpoint().unwrap_err();
+    assert!(error.to_string().contains("manual resolution is required"));
+}
+
+#[tokio::test]
 async fn structure_preflight_requires_scene_box_and_macro_links() {
     let directory = TestDir::new("workflow-links");
     let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
