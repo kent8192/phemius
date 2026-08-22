@@ -4,28 +4,23 @@ use std::{
     ffi::{CString, OsStr, OsString},
     fmt,
     fs::File,
-    io::{Read, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::ffi::OsStrExt,
-    },
-    path::{Component, Path, PathBuf},
+    io::Write,
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    path::{Path, PathBuf},
 };
 
 use crate::{
     changeset::{
-        Changeset, FileOperation, OperationKind, approval_record_bytes, canon_root_hash,
-        canon_root_hash_at, path_alias_key, sha256_bytes, validate_changeset,
-        validate_target_lexical,
+        ApprovalRecord, Changeset, FileOperation, OperationKind, PinnedPath,
+        approval_chain_head_in, approval_record_bytes, canon_root_hash_in, open_dir_no_follow_io,
+        open_pinned_path_io, open_project_root_io, path_alias_key, read_regular_at_io,
+        sha256_bytes, validate_changeset_in, validate_target_lexical,
     },
     domain::{EntityKind, is_prefixed_uuid},
     project::Project,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, MetadataExt, OpenOptions, OpenOptionsExt},
-};
+use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -33,9 +28,10 @@ use serde::{Deserialize, Serialize};
 enum JournalState {
     Prepared,
     Committed,
+    RolledBack,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyJournal {
     changeset_id: String,
@@ -43,10 +39,11 @@ pub struct ApplyJournal {
     base_root_hash: String,
     result_root_hash: String,
     approval_record_sha256: String,
+    chapter_order: u32,
     entries: Vec<JournalEntry>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct JournalEntry {
     kind: OperationKind,
@@ -101,7 +98,7 @@ pub fn apply_changeset_with_test_hook(
 }
 
 pub fn recover_pending(project_root: &Path) -> Result<RecoveryOutcome> {
-    recover(project_root, None)
+    recover(project_root, None, None)
 }
 
 #[doc(hidden)]
@@ -109,16 +106,28 @@ pub fn recover_pending_for_test(
     project_root: &Path,
     interruption: TestRecoveryInterruption,
 ) -> Result<RecoveryOutcome> {
-    recover(project_root, Some(interruption))
+    recover(project_root, Some(interruption), None)
+}
+
+#[doc(hidden)]
+pub fn recover_pending_with_root_test_hook(
+    project_root: &Path,
+    hook: fn(&Path),
+) -> Result<RecoveryOutcome> {
+    recover(project_root, None, Some(hook))
 }
 
 fn recover(
     project_root: &Path,
     interruption: Option<TestRecoveryInterruption>,
+    root_hook: Option<fn(&Path)>,
 ) -> Result<RecoveryOutcome> {
     let root = project_dir(project_root)?;
+    if let Some(hook) = root_hook {
+        hook(project_root);
+    }
     let lock = WriterLock::acquire(&root)?;
-    recover_pending_locked(&root, &lock.runtime, project_root, interruption)
+    recover_pending_locked(&root, &lock.runtime, interruption)
 }
 
 fn apply(
@@ -129,16 +138,13 @@ fn apply(
 ) -> Result<()> {
     let root = project_dir(&project.root)?;
     let lock = WriterLock::acquire(&root)?;
-    recover_pending_locked(&root, &lock.runtime, &project.root, None)?;
-    validate_changeset(project, change).context("changeset is not approvable")?;
+    recover_pending_locked(&root, &lock.runtime, None)?;
+    validate_changeset_in(project, &root, change).context("changeset is not approvable")?;
 
-    let transaction = prepare_transaction(&root, &lock.runtime, &project.root, change)?;
-    if let Err(error) = persist_journal(&transaction.dir, &transaction.journal, false, false) {
+    let transaction = prepare_transaction(&root, &lock.runtime, change)?;
+    if let Err(error) = persist_journal(&transaction.dir, &transaction.journal, false) {
         return match error {
-            PersistError::Before(error) => {
-                let _ = remove_unprepared(&transaction);
-                Err(error)
-            }
+            PersistError::Before(error) => Err(error),
             PersistError::After(error) => Err(error
                 .context("prepared journal durability is unknown; run recovery before retrying")),
         };
@@ -168,7 +174,7 @@ fn apply(
     if interruption == Some(TestInterruption::AfterApprovalInstall) {
         return Err(SimulatedCrash.into());
     }
-    match canon_root_hash(project) {
+    match canon_root_hash_in(&transaction.root) {
         Ok(actual) if actual == transaction.journal.result_root_hash => {}
         Ok(actual) => {
             return rollback_after_error(
@@ -185,7 +191,7 @@ fn apply(
     let mut committed = transaction.journal.clone();
     committed.state = JournalState::Committed;
     let force_sync_failure = interruption == Some(TestInterruption::CommitDurabilityUnknown);
-    match persist_journal(&transaction.dir, &committed, true, force_sync_failure) {
+    match persist_journal(&transaction.dir, &committed, force_sync_failure) {
         Ok(()) => {}
         Err(PersistError::Before(error)) => return rollback_after_error(&transaction, error),
         Err(PersistError::After(error)) => {
@@ -195,34 +201,20 @@ fn apply(
     if interruption == Some(TestInterruption::AfterCommit) {
         return Err(SimulatedCrash.into());
     }
-    if interruption == Some(TestInterruption::CleanupPending) {
-        return Ok(());
-    }
-    let _ = cleanup_transaction(&transaction);
     Ok(())
 }
 
 struct Transaction {
-    project_root: PathBuf,
-    journal_root: Dir,
+    root: Dir,
     dir: Dir,
     journal: ApplyJournal,
     targets: Vec<ManagedPath>,
     approval: ManagedPath,
 }
 
-struct ManagedPath {
-    parent: Dir,
-    leaf: OsString,
-    display: PathBuf,
-}
+type ManagedPath = PinnedPath;
 
-fn prepare_transaction(
-    root: &Dir,
-    runtime: &Dir,
-    project_root: &Path,
-    change: &Changeset,
-) -> Result<Transaction> {
+fn prepare_transaction(root: &Dir, runtime: &Dir, change: &Changeset) -> Result<Transaction> {
     let journal_root = open_or_create_dir(runtime, OsStr::new("journal"))
         .context("failed to open runtime journal directory")?;
     let name = OsString::from(change.id.as_str());
@@ -258,8 +250,7 @@ fn prepare_transaction(
         write_new_synced(&dir, OsStr::new("approval-record.json"), &approval_bytes)?;
         sync_dir(&dir)?;
         Ok(Transaction {
-            project_root: project_root.to_path_buf(),
-            journal_root: journal_root.try_clone()?,
+            root: root.try_clone()?,
             dir: dir.try_clone()?,
             journal: ApplyJournal {
                 changeset_id: change.id.as_str().to_owned(),
@@ -267,16 +258,13 @@ fn prepare_transaction(
                 base_root_hash: change.base_root_hash.clone(),
                 result_root_hash: change.result_root_hash.clone(),
                 approval_record_sha256: sha256_bytes(&approval_bytes),
+                chapter_order: change.chapter_order,
                 entries,
             },
             targets,
             approval,
         })
     })();
-    if result.is_err() {
-        let _ = dir.try_clone().and_then(Dir::remove_open_dir_all);
-        let _ = sync_dir(&journal_root);
-    }
     result
 }
 
@@ -397,7 +385,7 @@ fn install_approval_record(transaction: &Transaction) -> Result<()> {
 }
 
 fn rollback_after_error(transaction: &Transaction, error: anyhow::Error) -> Result<()> {
-    match rollback_prepared(transaction, None).and_then(|()| cleanup_transaction(transaction)) {
+    match rollback_prepared(transaction, None).and_then(|()| persist_rolled_back(transaction)) {
         Ok(()) => Err(error),
         Err(rollback) => Err(anyhow!(
             "apply failed: {error}; rollback remains pending: {rollback}"
@@ -408,35 +396,40 @@ fn rollback_after_error(transaction: &Transaction, error: anyhow::Error) -> Resu
 fn recover_pending_locked(
     root: &Dir,
     runtime: &Dir,
-    project_root: &Path,
     interruption: Option<TestRecoveryInterruption>,
 ) -> Result<RecoveryOutcome> {
-    let Some(transaction) = load_pending(root, runtime, project_root)? else {
+    let transactions = load_transactions(root, runtime)?;
+    if transactions.is_empty() {
         return Ok(RecoveryOutcome::default());
-    };
-    match transaction.journal.state {
-        JournalState::Prepared => {
-            rollback_prepared(&transaction, interruption)?;
-            cleanup_transaction(&transaction)?;
-            Ok(RecoveryOutcome {
-                rolled_back: 1,
-                kept_committed: 0,
-            })
-        }
-        JournalState::Committed => {
-            verify_committed(&transaction)?;
-            cleanup_transaction(&transaction)?;
-            Ok(RecoveryOutcome {
-                rolled_back: 0,
-                kept_committed: 1,
-            })
+    }
+    for transaction in &transactions {
+        if transaction.journal.state == JournalState::Committed {
+            verify_committed_approval(transaction)?;
         }
     }
+    let prepared = transactions
+        .iter()
+        .find(|transaction| transaction.journal.state == JournalState::Prepared);
+    let rolled_back = if let Some(transaction) = prepared {
+        rollback_prepared(transaction, interruption)?;
+        persist_rolled_back(transaction)?;
+        1
+    } else {
+        0
+    };
+    verify_current_committed_head(root, &transactions)?;
+    Ok(RecoveryOutcome {
+        rolled_back,
+        kept_committed: transactions
+            .iter()
+            .filter(|transaction| transaction.journal.state == JournalState::Committed)
+            .count(),
+    })
 }
 
-fn load_pending(root: &Dir, runtime: &Dir, project_root: &Path) -> Result<Option<Transaction>> {
+fn load_transactions(root: &Dir, runtime: &Dir) -> Result<Vec<Transaction>> {
     let Some(journal_root) = try_open_dir(runtime, OsStr::new("journal"))? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let mut entries = journal_root
         .entries()
@@ -444,22 +437,65 @@ fn load_pending(root: &Dir, runtime: &Dir, project_root: &Path) -> Result<Option
         .collect::<std::io::Result<Vec<_>>>()
         .context("failed to read journal root entry")?;
     entries.sort_by_key(|entry| entry.file_name());
-    if entries.is_empty() {
-        return Ok(None);
+    let mut transactions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry.file_name();
+        transactions.push(load_transaction(root, &journal_root, &name)?);
     }
-    ensure!(entries.len() == 1, "multiple pending journal transactions");
-    let name = entries[0].file_name();
+    ensure!(
+        transactions
+            .iter()
+            .filter(|transaction| transaction.journal.state == JournalState::Prepared)
+            .count()
+            <= 1,
+        "multiple prepared journal transactions"
+    );
+    Ok(transactions)
+}
+
+fn load_transaction(root: &Dir, journal_root: &Dir, name: &OsStr) -> Result<Transaction> {
     let name_text = name.to_string_lossy();
     ensure!(
         is_prefixed_uuid(&name_text, EntityKind::Changeset),
         "invalid journal transaction name: {name_text}"
     );
-    let dir = open_dir_no_follow(&journal_root, &name)
+    let dir = open_dir_no_follow(journal_root, name)
         .with_context(|| format!("journal entry is not a real directory: {name_text}"))?;
-    let journal_bytes = read_regular_at(&dir, OsStr::new("journal.json"))
-        .context("pending journal.json is missing or invalid")?;
-    let journal: ApplyJournal =
-        serde_json::from_slice(&journal_bytes).context("failed to parse pending journal")?;
+    let prepared = read_journal(&dir, "journal.prepared.json")?
+        .ok_or_else(|| anyhow!("journal.prepared.json is missing"))?;
+    ensure!(
+        prepared.state == JournalState::Prepared,
+        "prepared journal has the wrong state"
+    );
+    let committed = read_journal(&dir, "journal.committed.json")?;
+    let rolled_back = read_journal(&dir, "journal.rolled-back.json")?;
+    ensure!(
+        committed
+            .as_ref()
+            .is_none_or(|journal| journal.state == JournalState::Committed),
+        "committed journal has the wrong state"
+    );
+    ensure!(
+        rolled_back
+            .as_ref()
+            .is_none_or(|journal| journal.state == JournalState::RolledBack),
+        "rolled-back journal has the wrong state"
+    );
+    ensure!(
+        !(committed.is_some() && rolled_back.is_some()),
+        "transaction has conflicting terminal journals"
+    );
+    let journal = committed
+        .or(rolled_back)
+        .unwrap_or_else(|| prepared.clone());
+    if journal.state != JournalState::Prepared {
+        let mut expected = prepared.clone();
+        expected.state = journal.state;
+        ensure!(
+            expected == journal,
+            "terminal journal does not match prepared evidence"
+        );
+    }
     ensure!(
         journal.changeset_id == name_text,
         "journal identity does not match its transaction directory"
@@ -480,8 +516,7 @@ fn load_pending(root: &Dir, runtime: &Dir, project_root: &Path) -> Result<Option
         targets.push(open_managed(root, &entry.target_path)?);
     }
     let transaction = Transaction {
-        project_root: project_root.to_path_buf(),
-        journal_root,
+        root: root.try_clone()?,
         dir,
         journal,
         targets,
@@ -490,11 +525,23 @@ fn load_pending(root: &Dir, runtime: &Dir, project_root: &Path) -> Result<Option
     if transaction.journal.state == JournalState::Prepared {
         validate_recovery_evidence(&transaction)?;
     }
-    Ok(Some(transaction))
+    Ok(transaction)
+}
+
+fn read_journal(dir: &Dir, name: &str) -> Result<Option<ApplyJournal>> {
+    let bytes = match read_regular_at(dir, OsStr::new(name)) {
+        Ok(bytes) => bytes,
+        Err(error) if io_kind(&error) == Some(std::io::ErrorKind::NotFound) => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("{name} is invalid")),
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {name}"))
+        .map(Some)
 }
 
 fn validate_journal(journal: &ApplyJournal) -> Result<()> {
     ensure!(!journal.entries.is_empty(), "journal has no operations");
+    ensure!(journal.chapter_order > 0, "journal has no chapter order");
     ensure!(
         is_hash(&journal.base_root_hash)
             && is_hash(&journal.result_root_hash)
@@ -532,7 +579,9 @@ fn validate_journal(journal: &ApplyJournal) -> Result<()> {
 
 fn validate_transaction_entries(dir: &Dir, journal: &ApplyJournal) -> Result<()> {
     let mut allowed = HashSet::from([
-        OsString::from("journal.json"),
+        OsString::from("journal.prepared.json"),
+        OsString::from("journal.committed.json"),
+        OsString::from("journal.rolled-back.json"),
         OsString::from("approval-record.json"),
         OsString::from("approval-quarantine"),
     ]);
@@ -648,10 +697,22 @@ fn rollback_prepared(
         }
     }
     ensure!(
-        canon_root_hash_at(&transaction.project_root)? == transaction.journal.base_root_hash,
+        canon_root_hash_in(&transaction.root)? == transaction.journal.base_root_hash,
         "rolled-back canon does not match the journal base root"
     );
     Ok(())
+}
+
+fn persist_rolled_back(transaction: &Transaction) -> Result<()> {
+    let mut rolled_back = transaction.journal.clone();
+    rolled_back.state = JournalState::RolledBack;
+    match persist_journal(&transaction.dir, &rolled_back, false) {
+        Ok(()) => Ok(()),
+        Err(PersistError::Before(error)) => Err(error),
+        Err(PersistError::After(error)) => {
+            Err(error.context("rollback durability is unknown; run recovery before retrying"))
+        }
+    }
 }
 
 fn quarantine_created(
@@ -778,16 +839,42 @@ fn restore_before(
     ensure_hash(target, Some(before), "restored target changed")
 }
 
-fn verify_committed(transaction: &Transaction) -> Result<()> {
+fn verify_committed_approval(transaction: &Transaction) -> Result<()> {
+    let bytes = read_regular(&transaction.approval)?;
     ensure!(
-        canon_root_hash_at(&transaction.project_root)? == transaction.journal.result_root_hash,
-        "committed canon root changed"
+        sha256_bytes(&bytes) == transaction.journal.approval_record_sha256,
+        "committed approval record changed"
     );
-    ensure_hash(
-        &transaction.approval,
-        Some(&transaction.journal.approval_record_sha256),
-        "committed approval record changed",
-    )
+    let record: ApprovalRecord =
+        serde_json::from_slice(&bytes).context("committed approval record is invalid")?;
+    ensure!(
+        record.changeset_id.as_str() == transaction.journal.changeset_id
+            && record.base_root_hash == transaction.journal.base_root_hash
+            && record.chapter_order == transaction.journal.chapter_order,
+        "committed journal does not match its approval record"
+    );
+    Ok(())
+}
+
+fn verify_current_committed_head(root: &Dir, transactions: &[Transaction]) -> Result<()> {
+    let Some((head_id, head_order)) = approval_chain_head_in(root)? else {
+        return Ok(());
+    };
+    let Some(head) = transactions.iter().find(|transaction| {
+        transaction.journal.state == JournalState::Committed
+            && transaction.journal.changeset_id == head_id.as_str()
+    }) else {
+        return Ok(());
+    };
+    ensure!(
+        head.journal.chapter_order == head_order,
+        "committed journal chapter order does not match the approval chain head"
+    );
+    ensure!(
+        canon_root_hash_in(root)? == head.journal.result_root_hash,
+        "current committed canon root changed"
+    );
+    Ok(())
 }
 
 enum PersistError {
@@ -798,7 +885,6 @@ enum PersistError {
 fn persist_journal(
     transaction: &Dir,
     journal: &ApplyJournal,
-    replace: bool,
     force_sync_failure: bool,
 ) -> std::result::Result<(), PersistError> {
     let temporary = OsString::from(format!("journal-{}.tmp", uuid::Uuid::now_v7()));
@@ -806,21 +892,14 @@ fn persist_journal(
         serde_json::to_vec_pretty(journal).map_err(|error| PersistError::Before(anyhow!(error)))?;
     bytes.push(b'\n');
     if let Err(error) = write_new_synced(transaction, &temporary, &bytes) {
-        let _ = transaction.remove_file(&temporary);
         return Err(PersistError::Before(error));
     }
-    let rename = if replace {
-        transaction.rename(&temporary, transaction, "journal.json")
-    } else {
-        rename_no_replace(
-            transaction,
-            &temporary,
-            transaction,
-            OsStr::new("journal.json"),
-        )
+    let name = match journal.state {
+        JournalState::Prepared => OsStr::new("journal.prepared.json"),
+        JournalState::Committed => OsStr::new("journal.committed.json"),
+        JournalState::RolledBack => OsStr::new("journal.rolled-back.json"),
     };
-    if let Err(error) = rename {
-        let _ = transaction.remove_file(&temporary);
+    if let Err(error) = rename_no_replace(transaction, &temporary, transaction, name) {
         return Err(PersistError::Before(
             anyhow!(error).context("failed to rename journal"),
         ));
@@ -831,21 +910,6 @@ fn persist_journal(
         )));
     }
     sync_dir(transaction).map_err(PersistError::After)
-}
-
-fn cleanup_transaction(transaction: &Transaction) -> Result<()> {
-    validate_transaction_entries(&transaction.dir, &transaction.journal)?;
-    transaction
-        .dir
-        .try_clone()?
-        .remove_open_dir_all()
-        .context("failed to clean transaction directory")?;
-    sync_dir(&transaction.journal_root)
-}
-
-fn remove_unprepared(transaction: &Transaction) -> Result<()> {
-    transaction.dir.try_clone()?.remove_open_dir_all()?;
-    sync_dir(&transaction.journal_root)
 }
 
 fn approval_directory(root: &Dir, create: bool) -> Result<Option<Dir>> {
@@ -866,29 +930,13 @@ fn open_or_missing(parent: &Dir, name: &OsStr, create: bool) -> Result<Option<Di
 }
 
 fn project_dir(root: &Path) -> Result<Dir> {
-    Dir::open_ambient_dir(root, ambient_authority())
+    open_project_root_io(root)
         .with_context(|| format!("project root is not a real directory: {}", root.display()))
 }
 
 fn open_managed(root: &Dir, relative: &Path) -> Result<ManagedPath> {
-    ensure!(!relative.is_absolute(), "managed path must be relative");
-    let components = relative.components().collect::<Vec<_>>();
-    ensure!(!components.is_empty(), "managed path is empty");
-    let mut parent = root.try_clone()?;
-    for component in &components[..components.len() - 1] {
-        let Component::Normal(name) = component else {
-            bail!("unsafe managed path: {}", relative.display());
-        };
-        parent = open_dir_no_follow(&parent, name)?;
-    }
-    let Component::Normal(leaf) = components[components.len() - 1] else {
-        bail!("unsafe managed path: {}", relative.display());
-    };
-    Ok(ManagedPath {
-        parent,
-        leaf: leaf.to_os_string(),
-        display: relative.to_path_buf(),
-    })
+    open_pinned_path_io(root, relative)
+        .with_context(|| format!("failed to open managed path {}", relative.display()))
 }
 
 fn open_or_create_dir(parent: &Dir, name: &OsStr) -> Result<Dir> {
@@ -921,22 +969,7 @@ fn io_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
 }
 
 fn open_dir_no_follow(parent: &Dir, name: &OsStr) -> Result<Dir> {
-    let anchor = parent.try_clone()?.into_std_file();
-    let name = c_string(name)?;
-    // SAFETY: The directory descriptor and NUL-terminated leaf name stay valid for this call.
-    let descriptor = unsafe {
-        libc::openat(
-            anchor.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if descriptor == -1 {
-        return Err(std::io::Error::last_os_error()).context("failed to open managed directory");
-    }
-    // SAFETY: openat returned a new owned descriptor which is transferred exactly once.
-    let file = unsafe { File::from_raw_fd(descriptor) };
-    Ok(Dir::from_std_file(file))
+    open_dir_no_follow_io(parent, name).context("failed to open managed directory")
 }
 
 fn rename_no_replace(
@@ -966,10 +999,6 @@ fn rename_no_replace(
     }
 }
 
-fn c_string(value: &OsStr) -> Result<CString> {
-    c_string_io(value).map_err(anyhow::Error::from)
-}
-
 fn c_string_io(value: &OsStr) -> std::io::Result<CString> {
     CString::new(value.as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "name contains NUL"))
@@ -996,20 +1025,7 @@ fn read_regular(path: &ManagedPath) -> Result<Vec<u8>> {
 }
 
 fn read_regular_at(dir: &Dir, name: &OsStr) -> Result<Vec<u8>> {
-    let mut options = OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let mut file = dir.open_with(name, &options)?;
-    let before = file.metadata()?;
-    ensure!(before.is_file(), "managed entry is not a regular file");
-    let identity = (before.dev(), before.ino());
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let after = file.metadata()?;
-    ensure!(
-        identity == (after.dev(), after.ino()),
-        "managed file identity changed while reading"
-    );
-    Ok(bytes)
+    Ok(read_regular_at_io(dir, name)?)
 }
 
 fn maybe_hash(path: &ManagedPath) -> Result<Option<String>> {

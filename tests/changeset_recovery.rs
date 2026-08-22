@@ -11,7 +11,7 @@ use phemius::{
     journal::{
         RecoveryOutcome, TestInterruption, TestRecoveryInterruption, apply_changeset,
         apply_changeset_for_test, apply_changeset_with_test_hook, recover_pending,
-        recover_pending_for_test,
+        recover_pending_for_test, recover_pending_with_root_test_hook,
     },
     project::{Project, ProjectConfig},
 };
@@ -112,6 +112,84 @@ fn create_replace_delete_apply_as_one_changeset() {
         canon_root_hash(&fixture.project).unwrap(),
         fixture.change.result_root_hash
     );
+}
+
+#[test]
+fn successful_and_rolled_back_transactions_retain_append_only_evidence() {
+    let committed = ApplyFixture::new();
+    apply_changeset(&committed.project, &committed.change).unwrap();
+    let committed_transaction = committed.transaction_path();
+    assert!(
+        committed_transaction
+            .join("journal.prepared.json")
+            .is_file()
+    );
+    assert!(
+        committed_transaction
+            .join("journal.committed.json")
+            .is_file()
+    );
+    assert_eq!(recover_pending(&committed.root).unwrap().kept_committed, 1);
+    assert!(committed_transaction.is_dir());
+
+    let rolled_back = ApplyFixture::new();
+    apply_changeset_for_test(
+        &rolled_back.project,
+        &rolled_back.change,
+        TestInterruption::AfterFirstRename,
+    )
+    .unwrap_err();
+    assert_eq!(recover_pending(&rolled_back.root).unwrap().rolled_back, 1);
+    let rolled_back_transaction = rolled_back.transaction_path();
+    assert!(
+        rolled_back_transaction
+            .join("journal.prepared.json")
+            .is_file()
+    );
+    assert!(
+        rolled_back_transaction
+            .join("journal.rolled-back.json")
+            .is_file()
+    );
+    assert_eq!(
+        recover_pending(&rolled_back.root).unwrap(),
+        RecoveryOutcome::default()
+    );
+    assert!(rolled_back_transaction.is_dir());
+}
+
+#[test]
+fn retained_committed_history_survives_later_approvals() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    let followup = fixture.followup_change("retained-history");
+    apply_changeset(&fixture.project, &followup).unwrap();
+
+    assert_eq!(recover_pending(&fixture.root).unwrap().kept_committed, 2);
+    assert!(fixture.transaction_path().is_dir());
+    assert!(fixture.transaction_path_for(&followup.id).is_dir());
+}
+
+#[test]
+fn injected_or_externally_renamed_transaction_evidence_is_never_deleted() {
+    let injected = ApplyFixture::new();
+    apply_changeset(&injected.project, &injected.change).unwrap();
+    let injected_entry = injected.transaction_path().join("external-entry");
+    fs::create_dir(&injected_entry).unwrap();
+    fs::write(injected_entry.join("nested-evidence"), b"external evidence").unwrap();
+    assert!(recover_pending(&injected.root).is_err());
+    assert_eq!(
+        fs::read(injected_entry.join("nested-evidence")).unwrap(),
+        b"external evidence"
+    );
+
+    let renamed = ApplyFixture::new();
+    apply_changeset(&renamed.project, &renamed.change).unwrap();
+    let moved = renamed.outside.join("externally-renamed-transaction");
+    fs::rename(renamed.transaction_path(), &moved).unwrap();
+    recover_pending(&renamed.root).unwrap();
+    assert!(moved.join("journal.prepared.json").is_file());
+    assert!(moved.join("journal.committed.json").is_file());
 }
 
 #[test]
@@ -246,7 +324,8 @@ fn a_parent_dependency_is_proven_by_its_durable_approval_record() {
         .join(id.as_str())
         .join("followup.md");
     fs::create_dir_all(fixture.root.join(candidate_path.parent().unwrap())).unwrap();
-    let followup_bytes = markdown(EntityKind::Chapter, "followup");
+    let followup_id = prefixed_uuid(EntityKind::Chapter);
+    let followup_bytes = markdown_with_id(&followup_id, "followup");
     fs::write(fixture.root.join(&candidate_path), &followup_bytes).unwrap();
     let operations = vec![FileOperation {
         kind: OperationKind::Create,
@@ -254,7 +333,7 @@ fn a_parent_dependency_is_proven_by_its_durable_approval_record() {
         before_sha256: None,
         after_sha256: Some(sha256_bytes(&followup_bytes)),
         candidate_path: Some(candidate_path),
-        affected_entities: Vec::new(),
+        affected_entities: vec![followup_id],
     }];
     let mut followup = Changeset {
         id,
@@ -404,6 +483,7 @@ fn projected_generic_schema_and_affected_entity_ids_are_enforced() {
     invalid_project.operations[1].before_sha256 = Some(sha256_bytes(
         &fs::read(fixture.root.join("project.toml")).unwrap(),
     ));
+    invalid_project.operations[1].affected_entities = vec![fixture.project.config.work_id.clone()];
     refresh_change(&fixture.project, &mut invalid_project);
     assert_eq!(
         validate_changeset(&fixture.project, &invalid_project)
@@ -437,11 +517,8 @@ fn projected_generic_schema_and_affected_entity_ids_are_enforced() {
     );
 
     let mut duplicate_entity = fixture.change.clone();
-    let entity = prefixed_uuid(EntityKind::Chapter);
+    let entity = duplicate_entity.operations[0].affected_entities[0].clone();
     duplicate_entity.operations[0]
-        .affected_entities
-        .push(entity.clone());
-    duplicate_entity.operations[1]
         .affected_entities
         .push(entity);
     assert_eq!(
@@ -450,6 +527,176 @@ fn projected_generic_schema_and_affected_entity_ids_are_enforced() {
             .kind(),
         ValidationErrorKind::InvalidOperation
     );
+}
+
+#[test]
+fn projected_schema_validates_unchanged_artifacts_and_semantic_identity() {
+    let fixture = ApplyFixture::new();
+    fs::write(fixture.root.join("本文/broken.md"), b"no frontmatter").unwrap();
+    let mut unchanged_broken = fixture.change.clone();
+    rebase_and_refresh(&fixture.project, &mut unchanged_broken);
+    assert_eq!(
+        validate_changeset(&fixture.project, &unchanged_broken)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::Schema
+    );
+
+    let fixture = ApplyFixture::new();
+    let mut duplicate_id = fixture.change.clone();
+    let existing_id = duplicate_id.operations[1].affected_entities[0].clone();
+    let candidate = duplicate_id.operations[0].candidate_path.clone().unwrap();
+    let duplicate_bytes = markdown_with_id(&existing_id, "duplicate");
+    fs::write(fixture.root.join(&candidate), &duplicate_bytes).unwrap();
+    duplicate_id.operations[0].after_sha256 = Some(sha256_bytes(&duplicate_bytes));
+    duplicate_id.operations[0].affected_entities = vec![prefixed_uuid(EntityKind::Chapter)];
+    refresh_change(&fixture.project, &mut duplicate_id);
+    assert_eq!(
+        validate_changeset(&fixture.project, &duplicate_id)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::Schema
+    );
+
+    let fixture = ApplyFixture::new();
+    let mut replace_id_change = fixture.change.clone();
+    let candidate = replace_id_change.operations[1]
+        .candidate_path
+        .clone()
+        .unwrap();
+    let changed_bytes = markdown(EntityKind::Chapter, "changed identity");
+    fs::write(fixture.root.join(&candidate), &changed_bytes).unwrap();
+    replace_id_change.operations[1].after_sha256 = Some(sha256_bytes(&changed_bytes));
+    refresh_change(&fixture.project, &mut replace_id_change);
+    assert_eq!(
+        validate_changeset(&fixture.project, &replace_id_change)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::Schema
+    );
+
+    let fixture = ApplyFixture::new();
+    let mut work_id_change = fixture.change.clone();
+    let candidate = work_id_change.operations[1].candidate_path.clone().unwrap();
+    let changed_config = ProjectConfig {
+        format_version: 1,
+        work_id: prefixed_uuid(EntityKind::Work),
+    };
+    let config_bytes = toml::to_string(&changed_config).unwrap().into_bytes();
+    fs::write(fixture.root.join(&candidate), &config_bytes).unwrap();
+    work_id_change.operations[1].path = PathBuf::from("project.toml");
+    work_id_change.operations[1].before_sha256 = Some(sha256_bytes(
+        &fs::read(fixture.root.join("project.toml")).unwrap(),
+    ));
+    work_id_change.operations[1].after_sha256 = Some(sha256_bytes(&config_bytes));
+    work_id_change.operations[1].affected_entities = vec![fixture.project.config.work_id.clone()];
+    refresh_change(&fixture.project, &mut work_id_change);
+    assert_eq!(
+        validate_changeset(&fixture.project, &work_id_change)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::Schema
+    );
+}
+
+#[test]
+fn projected_schema_excludes_non_artifact_markdown() {
+    let fixture = ApplyFixture::new();
+    for path in [
+        "AGENTS.md",
+        "assets/readme.md",
+        "docs/readme.md",
+        ".phemius/records/raw.md",
+        "資料/snapshots/raw.md",
+    ] {
+        let path = fixture.root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"not a canon artifact").unwrap();
+    }
+    let mut change = fixture.change.clone();
+    rebase_and_refresh(&fixture.project, &mut change);
+    validate_changeset(&fixture.project, &change).unwrap();
+}
+
+#[test]
+fn create_targets_cannot_alias_existing_canon_paths() {
+    let fixture = ApplyFixture::new();
+    let mut case_alias = fixture.change.clone();
+    case_alias.operations[0].path = PathBuf::from("PROJECT.TOML");
+    refresh_change(&fixture.project, &mut case_alias);
+    assert_eq!(
+        validate_changeset(&fixture.project, &case_alias)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::InvalidOperation
+    );
+
+    let fixture = ApplyFixture::new();
+    let existing_id = prefixed_uuid(EntityKind::Chapter);
+    fs::write(
+        fixture.root.join("本文/が.md"),
+        markdown_with_id(&existing_id, "existing alias"),
+    )
+    .unwrap();
+    let mut unicode_alias = fixture.change.clone();
+    unicode_alias.operations[0].path = PathBuf::from("本文/か\u{3099}.md");
+    rebase_and_refresh(&fixture.project, &mut unicode_alias);
+    assert_eq!(
+        validate_changeset(&fixture.project, &unicode_alias)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::InvalidOperation
+    );
+}
+
+#[test]
+fn affected_entities_are_required_per_operation_but_reusable_across_operations() {
+    let fixture = ApplyFixture::new();
+    let mut empty = fixture.change.clone();
+    empty.operations[0].affected_entities.clear();
+    refresh_change(&fixture.project, &mut empty);
+    assert_eq!(
+        validate_changeset(&fixture.project, &empty)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::InvalidOperation
+    );
+
+    let fixture = ApplyFixture::new();
+    let mut shared = fixture.change.clone();
+    let entity = prefixed_uuid(EntityKind::Chapter);
+    for operation in &mut shared.operations {
+        operation.affected_entities = vec![entity.clone()];
+    }
+    refresh_change(&fixture.project, &mut shared);
+    validate_changeset(&fixture.project, &shared).unwrap();
+}
+
+#[test]
+fn project_toml_operation_uses_the_immutable_work_id() {
+    let fixture = ApplyFixture::new();
+    let mut change = fixture.change.clone();
+    let candidate = change.operations[1].candidate_path.clone().unwrap();
+    let mut config_bytes = fs::read(fixture.root.join("project.toml")).unwrap();
+    config_bytes.extend_from_slice(b"\n# retained work id\n");
+    fs::write(fixture.root.join(&candidate), &config_bytes).unwrap();
+    change.operations[1].path = PathBuf::from("project.toml");
+    change.operations[1].before_sha256 = Some(sha256_bytes(
+        &fs::read(fixture.root.join("project.toml")).unwrap(),
+    ));
+    change.operations[1].after_sha256 = Some(sha256_bytes(&config_bytes));
+    change.operations[1].affected_entities = vec![prefixed_uuid(EntityKind::Chapter)];
+    refresh_change(&fixture.project, &mut change);
+    assert_eq!(
+        validate_changeset(&fixture.project, &change)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::InvalidOperation
+    );
+
+    change.operations[1].affected_entities = vec![fixture.project.config.work_id.clone()];
+    refresh_change(&fixture.project, &mut change);
+    validate_changeset(&fixture.project, &change).unwrap();
 }
 
 #[test]
@@ -539,7 +786,7 @@ fn every_apply_boundary_recovers_idempotently() {
 }
 
 #[test]
-fn committed_cleanup_pending_is_success_and_startup_finishes_cleanup() {
+fn committed_cleanup_pending_remains_append_only_history() {
     let fixture = ApplyFixture::new();
 
     apply_changeset_for_test(
@@ -550,10 +797,7 @@ fn committed_cleanup_pending_is_success_and_startup_finishes_cleanup() {
     .unwrap();
 
     assert_eq!(recover_pending(&fixture.root).unwrap().kept_committed, 1);
-    assert_eq!(
-        recover_pending(&fixture.root).unwrap(),
-        RecoveryOutcome::default()
-    );
+    assert_eq!(recover_pending(&fixture.root).unwrap().kept_committed, 1);
 }
 
 #[test]
@@ -664,6 +908,55 @@ fn prepared_capabilities_cannot_be_redirected_by_parent_symlink_swaps() {
     assert_eq!(fixture.read_canon()[0], None);
 }
 
+#[cfg(unix)]
+#[test]
+fn apply_keeps_using_the_pinned_root_after_the_project_path_is_swapped() {
+    let fixture = ApplyFixture::new();
+
+    let result =
+        apply_changeset_with_test_hook(&fixture.project, &fixture.change, swap_project_root);
+    assert_eq!(
+        fs::read(fixture.root.join("replacement-root-marker")).unwrap(),
+        b"outside replacement root"
+    );
+    assert!(!fixture.root.join("本文/create.md").exists());
+    restore_project_root(&fixture.root);
+
+    result.unwrap();
+    assert!(fixture.root.join("本文/create.md").is_file());
+    assert!(fixture.transaction_path().is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_keeps_using_the_pinned_root_after_the_project_path_is_swapped() {
+    let fixture = ApplyFixture::new();
+    let before = fixture.read_canon();
+    apply_changeset_for_test(
+        &fixture.project,
+        &fixture.change,
+        TestInterruption::AfterFirstRename,
+    )
+    .unwrap_err();
+
+    let result = recover_pending_with_root_test_hook(&fixture.root, swap_project_root_path);
+    assert_eq!(
+        fs::read(fixture.root.join("replacement-root-marker")).unwrap(),
+        b"outside replacement root"
+    );
+    assert!(!fixture.root.join("本文/create.md").exists());
+    restore_project_root(&fixture.root);
+
+    assert_eq!(result.unwrap().rolled_back, 1);
+    assert_eq!(fixture.read_canon(), before);
+    assert!(
+        fixture
+            .transaction_path()
+            .join("journal.rolled-back.json")
+            .is_file()
+    );
+}
+
 #[test]
 fn missing_or_corrupt_journal_evidence_is_preserved_fail_closed() {
     for corrupt in [false, true] {
@@ -680,7 +973,7 @@ fn missing_or_corrupt_journal_evidence_is_preserved_fail_closed() {
             .root
             .join(".phemius/runtime/journal")
             .join(fixture.change.id.as_str());
-        let journal = transaction.join("journal.json");
+        let journal = transaction.join("journal.prepared.json");
         if corrupt {
             fs::write(&journal, b"not json").unwrap();
         } else {
@@ -691,6 +984,38 @@ fn missing_or_corrupt_journal_evidence_is_preserved_fail_closed() {
         assert!(transaction.exists());
         assert!(fixture.root.join("本文/create.md").exists());
     }
+}
+
+#[test]
+fn journal_state_must_match_its_append_only_marker_name() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    let marker = fixture.transaction_path().join("journal.committed.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    journal["state"] = serde_json::Value::String("rolled-back".into());
+    fs::write(&marker, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+
+    assert!(recover_pending(&fixture.root).is_err());
+    assert!(marker.is_file());
+}
+
+#[test]
+fn retained_committed_journal_must_match_its_approval_record() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    let followup = fixture.followup_change("journal-record-match");
+    apply_changeset(&fixture.project, &followup).unwrap();
+    for name in ["journal.prepared.json", "journal.committed.json"] {
+        let marker = fixture.transaction_path().join(name);
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        journal["chapter_order"] = serde_json::Value::Number(99.into());
+        fs::write(marker, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+    }
+
+    assert!(recover_pending(&fixture.root).is_err());
+    assert!(fixture.transaction_path().is_dir());
 }
 
 #[test]
@@ -807,10 +1132,13 @@ impl ApplyFixture {
             work_id: prefixed_uuid(EntityKind::Work),
         };
         fs::write(root.join("project.toml"), toml::to_string(&config).unwrap()).unwrap();
-        let create = markdown(EntityKind::Chapter, "new");
-        let before = markdown(EntityKind::Chapter, "before");
-        let after = markdown(EntityKind::Chapter, "after");
-        let delete = markdown(EntityKind::Chapter, "delete");
+        let create_id = prefixed_uuid(EntityKind::Chapter);
+        let replace_id = prefixed_uuid(EntityKind::Chapter);
+        let delete_id = prefixed_uuid(EntityKind::Chapter);
+        let create = markdown_with_id(&create_id, "new");
+        let before = markdown_with_id(&replace_id, "before");
+        let after = markdown_with_id(&replace_id, "after");
+        let delete = markdown_with_id(&delete_id, "delete");
         fs::write(root.join("本文/replace.md"), &before).unwrap();
         fs::write(root.join("本文/delete.md"), &delete).unwrap();
         let project = Project {
@@ -830,7 +1158,7 @@ impl ApplyFixture {
                 before_sha256: None,
                 after_sha256: Some(sha256_bytes(&create)),
                 candidate_path: Some(candidate_root.join("create.md")),
-                affected_entities: Vec::new(),
+                affected_entities: vec![create_id],
             },
             FileOperation {
                 kind: OperationKind::Replace,
@@ -838,7 +1166,7 @@ impl ApplyFixture {
                 before_sha256: Some(sha256_bytes(&before)),
                 after_sha256: Some(sha256_bytes(&after)),
                 candidate_path: Some(candidate_root.join("replace.md")),
-                affected_entities: Vec::new(),
+                affected_entities: vec![replace_id],
             },
             FileOperation {
                 kind: OperationKind::Delete,
@@ -846,7 +1174,7 @@ impl ApplyFixture {
                 before_sha256: Some(sha256_bytes(&delete)),
                 after_sha256: None,
                 candidate_path: None,
-                affected_entities: Vec::new(),
+                affected_entities: vec![delete_id],
             },
         ];
         let mut change = Changeset {
@@ -899,10 +1227,60 @@ impl ApplyFixture {
             .join(".phemius/records/approvals")
             .join(format!("{}.json", self.change.id.as_str()))
     }
+
+    fn transaction_path(&self) -> PathBuf {
+        self.transaction_path_for(&self.change.id)
+    }
+
+    fn transaction_path_for(&self, id: &phemius::domain::EntityId) -> PathBuf {
+        self.root.join(".phemius/runtime/journal").join(id.as_str())
+    }
+
+    fn followup_change(&self, name: &str) -> Changeset {
+        let id = prefixed_uuid(EntityKind::Changeset);
+        let entity = prefixed_uuid(EntityKind::Chapter);
+        let candidate_path = PathBuf::from(".phemius/runtime/candidates")
+            .join(id.as_str())
+            .join(format!("{name}.md"));
+        fs::create_dir_all(self.root.join(candidate_path.parent().unwrap())).unwrap();
+        let bytes = markdown_with_id(&entity, name);
+        fs::write(self.root.join(&candidate_path), &bytes).unwrap();
+        let mut change = Changeset {
+            id,
+            parent_changeset_id: Some(self.change.id.clone()),
+            base_root_hash: canon_root_hash(&self.project).unwrap(),
+            content_result_hash: String::new(),
+            result_root_hash: String::new(),
+            state: ChangesetState::Approvable,
+            operations: vec![FileOperation {
+                kind: OperationKind::Create,
+                path: PathBuf::from("本文").join(format!("{name}.md")),
+                before_sha256: None,
+                after_sha256: Some(sha256_bytes(&bytes)),
+                candidate_path: Some(candidate_path),
+                affected_entities: vec![entity],
+            }],
+            candidate_hash: String::new(),
+            validation_hash: None,
+            unresolved_blocker_ids: Vec::new(),
+            dependencies: vec![ChangesetDependency {
+                id: self.change.id.clone(),
+                approval_record_sha256: sha256_bytes(&fs::read(self.approval_path()).unwrap()),
+                chapter_order: 1,
+            }],
+            chapter_order: 2,
+        };
+        refresh_change(&self.project, &mut change);
+        change
+    }
 }
 
 fn markdown(kind: EntityKind, body: &str) -> Vec<u8> {
-    format!("---\nid: {}\n---\n{body}\n", prefixed_uuid(kind).as_str()).into_bytes()
+    markdown_with_id(&prefixed_uuid(kind), body)
+}
+
+fn markdown_with_id(id: &phemius::domain::EntityId, body: &str) -> Vec<u8> {
+    format!("---\nid: {}\n---\n{body}\n", id.as_str()).into_bytes()
 }
 
 impl Drop for ApplyFixture {
@@ -917,6 +1295,11 @@ fn refresh_change(project: &Project, change: &mut Changeset) {
     change.content_result_hash = content_result_hash(project, change).unwrap();
     change.validation_hash = Some(calculate_validation_hash(change));
     change.result_root_hash = projected_root_hash(project, change).unwrap();
+}
+
+fn rebase_and_refresh(project: &Project, change: &mut Changeset) {
+    change.base_root_hash = canon_root_hash(project).unwrap();
+    refresh_change(project, change);
 }
 
 fn approval_validation_hash(record: &ApprovalRecord) -> String {
@@ -977,4 +1360,26 @@ fn restore_managed_parents(project: &Project) {
         fs::remove_file(&path).unwrap();
         fs::rename(held, path).unwrap();
     }
+}
+
+#[cfg(unix)]
+fn swap_project_root(project: &Project) {
+    swap_project_root_path(&project.root);
+}
+
+#[cfg(unix)]
+fn swap_project_root_path(root: &std::path::Path) {
+    fs::rename(root, root.with_extension("held-root")).unwrap();
+    fs::create_dir(root).unwrap();
+    fs::write(
+        root.join("replacement-root-marker"),
+        b"outside replacement root",
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn restore_project_root(root: &std::path::Path) {
+    fs::remove_dir_all(root).unwrap();
+    fs::rename(root.with_extension("held-root"), root).unwrap();
 }

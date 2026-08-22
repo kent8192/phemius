@@ -1,11 +1,18 @@
 use std::{
     collections::{BTreeMap, HashSet},
     error::Error,
-    fmt, fs,
-    os::unix::ffi::OsStrExt,
+    ffi::{CString, OsStr, OsString},
+    fmt,
+    fs::File,
+    io::{self, Read},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Component, Path, PathBuf},
 };
 
+use cap_std::fs::{Dir, MetadataExt, OpenOptions, OpenOptionsExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
@@ -181,6 +188,15 @@ impl fmt::Display for ValidationError {
 impl Error for ValidationError {}
 
 pub fn validate_changeset(project: &Project, change: &Changeset) -> Result<(), ValidationError> {
+    let root = open_project_root(&project.root)?;
+    validate_changeset_in(project, &root, change)
+}
+
+pub(crate) fn validate_changeset_in(
+    project: &Project,
+    root: &Dir,
+    change: &Changeset,
+) -> Result<(), ValidationError> {
     if !is_prefixed_uuid(change.id.as_str(), EntityKind::Changeset)
         || change
             .parent_changeset_id
@@ -226,23 +242,28 @@ pub fn validate_changeset(project: &Project, change: &Changeset) -> Result<(), V
 
     validate_reserved_targets(&change.operations)?;
 
-    let actual_root = canon_root_hash(project)?;
+    let base_entries = collect_canon_files_in(root)?;
+    let actual_root = hash_entries(
+        base_entries
+            .iter()
+            .map(|(path, bytes)| (path, bytes.as_slice())),
+    );
     if actual_root != change.base_root_hash {
         return validation_error(
             ValidationErrorKind::BaseRoot,
             "canon no longer matches the changeset base root",
         );
     }
-    validate_approval_order(project, change)?;
-    validate_operations(project, &change.id, &change.operations)?;
-    let actual_candidate_hash = calculate_candidate_hash(project, change)?;
+    validate_approval_order_in(root, change)?;
+    validate_operations_in(project, root, &change.id, &change.operations, &base_entries)?;
+    let actual_candidate_hash = calculate_candidate_hash_in(root, change)?;
     if actual_candidate_hash != change.candidate_hash {
         return validation_error(
             ValidationErrorKind::CandidateHash,
             "candidate files changed after validation",
         );
     }
-    let entries = projected_content(project, change)?;
+    let entries = projected_content_in(root, change, base_entries.clone())?;
     let actual_content = hash_entries(entries.iter().map(|(path, bytes)| (path, bytes.as_slice())));
     if actual_content != change.content_result_hash {
         return validation_error(
@@ -250,14 +271,14 @@ pub fn validate_changeset(project: &Project, change: &Changeset) -> Result<(), V
             "projected content root does not match the changeset",
         );
     }
-    validate_projected_schema(project, change, &entries)?;
+    validate_projected_schema(project, change, &base_entries, &entries)?;
     if change.validation_hash.as_deref() != Some(calculate_validation_hash(change).as_str()) {
         return validation_error(
             ValidationErrorKind::ValidationHash,
             "changeset validation hash is missing or invalid",
         );
     }
-    let actual_result = projected_root_hash(project, change)?;
+    let actual_result = projected_root_hash_from_entries(change, entries)?;
     if actual_result != change.result_root_hash {
         return validation_error(
             ValidationErrorKind::ResultRoot,
@@ -300,16 +321,19 @@ pub fn calculate_candidate_hash(
     project: &Project,
     change: &Changeset,
 ) -> Result<String, ValidationError> {
+    let root = open_project_root(&project.root)?;
+    calculate_candidate_hash_in(&root, change)
+}
+
+pub(crate) fn calculate_candidate_hash_in(
+    root: &Dir,
+    change: &Changeset,
+) -> Result<String, ValidationError> {
     let mut entries = Vec::new();
     for operation in &change.operations {
         if let Some(path) = &operation.candidate_path {
-            validate_candidate_path(project, &change.id, path)?;
-            let bytes = fs::read(project.root.join(path)).map_err(|error| {
-                ValidationError::io(
-                    &format!("failed to read candidate {}", path.display()),
-                    error,
-                )
-            })?;
+            validate_candidate_path_in(root, &change.id, path)?;
+            let bytes = read_regular_path(root, path, ValidationErrorKind::CandidatePath)?;
             entries.push((path.clone(), bytes));
         }
     }
@@ -320,11 +344,12 @@ pub fn calculate_candidate_hash(
 }
 
 pub fn canon_root_hash(project: &Project) -> Result<String, ValidationError> {
-    canon_root_hash_at(&project.root)
+    let root = open_project_root(&project.root)?;
+    canon_root_hash_in(&root)
 }
 
-pub(crate) fn canon_root_hash_at(root: &Path) -> Result<String, ValidationError> {
-    let entries = collect_canon_files(root)?;
+pub(crate) fn canon_root_hash_in(root: &Dir) -> Result<String, ValidationError> {
+    let entries = collect_canon_files_in(root)?;
     Ok(hash_entries(
         entries.iter().map(|(path, bytes)| (path, bytes.as_slice())),
     ))
@@ -334,7 +359,22 @@ pub fn projected_root_hash(
     project: &Project,
     change: &Changeset,
 ) -> Result<String, ValidationError> {
-    let mut entries = projected_content(project, change)?;
+    let root = open_project_root(&project.root)?;
+    projected_root_hash_in(&root, change)
+}
+
+pub(crate) fn projected_root_hash_in(
+    root: &Dir,
+    change: &Changeset,
+) -> Result<String, ValidationError> {
+    let entries = projected_content_in(root, change, collect_canon_files_in(root)?)?;
+    projected_root_hash_from_entries(change, entries)
+}
+
+fn projected_root_hash_from_entries(
+    change: &Changeset,
+    mut entries: BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<String, ValidationError> {
     entries.insert(
         approval_record_relative_path(&change.id),
         approval_record_bytes(change)?,
@@ -348,19 +388,20 @@ pub fn content_result_hash(
     project: &Project,
     change: &Changeset,
 ) -> Result<String, ValidationError> {
-    let entries = projected_content(project, change)?;
+    let root = open_project_root(&project.root)?;
+    let entries = projected_content_in(&root, change, collect_canon_files_in(&root)?)?;
     Ok(hash_entries(
         entries.iter().map(|(path, bytes)| (path, bytes.as_slice())),
     ))
 }
 
-fn projected_content(
-    project: &Project,
+fn projected_content_in(
+    root: &Dir,
     change: &Changeset,
+    mut entries: BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<BTreeMap<PathBuf, Vec<u8>>, ValidationError> {
-    let mut entries = collect_canon_files(&project.root)?;
     for operation in &change.operations {
-        validate_target_path(&project.root, &operation.path)?;
+        validate_target_path_in(root, &operation.path)?;
         match operation.kind {
             OperationKind::Create | OperationKind::Replace => {
                 let candidate_path = operation.candidate_path.as_ref().ok_or_else(|| {
@@ -369,13 +410,9 @@ fn projected_content(
                         "create and replace operations require a candidate file",
                     )
                 })?;
-                validate_candidate_path(project, &change.id, candidate_path)?;
-                let bytes = fs::read(project.root.join(candidate_path)).map_err(|error| {
-                    ValidationError::io(
-                        &format!("failed to read candidate {}", candidate_path.display()),
-                        error,
-                    )
-                })?;
+                validate_candidate_path_in(root, &change.id, candidate_path)?;
+                let bytes =
+                    read_regular_path(root, candidate_path, ValidationErrorKind::CandidatePath)?;
                 entries.insert(operation.path.clone(), bytes);
             }
             OperationKind::Delete => {
@@ -387,28 +424,42 @@ fn projected_content(
 }
 
 pub fn render_diff(project: &Project, change: &Changeset) -> Result<String, ValidationError> {
-    validate_operations(project, &change.id, &change.operations)?;
+    let root = open_project_root(&project.root)?;
+    let base_entries = collect_canon_files_in(&root)?;
+    validate_operations_in(
+        project,
+        &root,
+        &change.id,
+        &change.operations,
+        &base_entries,
+    )?;
     let mut operations = change.operations.iter().collect::<Vec<_>>();
     operations.sort_by(|left, right| left.path.cmp(&right.path));
     let mut rendered = String::new();
     for operation in operations {
         let before = match operation.kind {
             OperationKind::Create => String::new(),
-            OperationKind::Replace | OperationKind::Delete => {
-                read_utf8(project.root.join(&operation.path), "canon file")?
-            }
+            OperationKind::Replace | OperationKind::Delete => read_utf8_bytes(
+                base_entries
+                    .get(&operation.path)
+                    .expect("validated canon operation has a base file"),
+                &operation.path,
+                "canon file",
+            )?,
         };
         let after = match operation.kind {
             OperationKind::Delete => String::new(),
-            OperationKind::Create | OperationKind::Replace => read_utf8(
-                project.root.join(
-                    operation
-                        .candidate_path
-                        .as_ref()
-                        .expect("validated operation has a candidate path"),
-                ),
-                "candidate file",
-            )?,
+            OperationKind::Create | OperationKind::Replace => {
+                let candidate = operation
+                    .candidate_path
+                    .as_ref()
+                    .expect("validated operation has a candidate path");
+                read_utf8_bytes(
+                    &read_regular_path(&root, candidate, ValidationErrorKind::CandidatePath)?,
+                    candidate,
+                    "candidate file",
+                )?
+            }
         };
         let name = operation.path.to_string_lossy();
         rendered.push_str(
@@ -523,8 +574,8 @@ struct ScannedApproval {
     sha256: String,
 }
 
-fn validate_approval_order(project: &Project, change: &Changeset) -> Result<(), ValidationError> {
-    let approvals = scan_approval_records(&project.root)?;
+fn validate_approval_order_in(root: &Dir, change: &Changeset) -> Result<(), ValidationError> {
+    let approvals = scan_approval_records_in(root)?;
     if approvals
         .iter()
         .any(|approval| approval.record.changeset_id == change.id)
@@ -598,20 +649,23 @@ fn validate_approval_order(project: &Project, change: &Changeset) -> Result<(), 
     }
 }
 
-fn scan_approval_records(root: &Path) -> Result<Vec<ScannedApproval>, ValidationError> {
-    let directory = root.join(".phemius/records/approvals");
-    let mut entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|error| ValidationError::io("failed to enumerate approval records", error))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(ValidationError::io(
-                "failed to read approval records",
-                error,
-            ));
-        }
+fn scan_approval_records_in(root: &Dir) -> Result<Vec<ScannedApproval>, ValidationError> {
+    let Some(directory) = try_open_directory_chain(
+        root,
+        &[
+            OsStr::new(".phemius"),
+            OsStr::new("records"),
+            OsStr::new("approvals"),
+        ],
+    )?
+    else {
+        return Ok(Vec::new());
     };
+    let mut entries = directory
+        .entries()
+        .map_err(|error| ValidationError::io("failed to enumerate approval records", error))?
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(|error| ValidationError::io("failed to read approval record entry", error))?;
     entries.sort_by_key(|entry| entry.file_name());
     let mut approvals = Vec::with_capacity(entries.len());
     let mut orders = HashSet::new();
@@ -622,22 +676,30 @@ fn scan_approval_records(root: &Path) -> Result<Vec<ScannedApproval>, Validation
         if !file_type.is_file() {
             return validation_error(
                 ValidationErrorKind::DependencyHash,
-                format!("unknown approval entry: {}", entry.path().display()),
+                format!(
+                    "unknown approval entry: {}",
+                    PathBuf::from(".phemius/records/approvals")
+                        .join(entry.file_name())
+                        .display()
+                ),
             );
         }
-        let bytes = fs::read(entry.path())
+        let name = entry.file_name();
+        let bytes = read_regular_at_io(&directory, &name)
             .map_err(|error| ValidationError::io("failed to read approval record", error))?;
         let record: ApprovalRecord = serde_json::from_slice(&bytes).map_err(|error| {
             ValidationError::new(
                 ValidationErrorKind::DependencyHash,
                 format!(
                     "invalid approval record {}: {error}",
-                    entry.path().display()
+                    PathBuf::from(".phemius/records/approvals")
+                        .join(&name)
+                        .display()
                 ),
             )
         })?;
         let expected_name = format!("{}.json", record.changeset_id.as_str());
-        if entry.file_name() != expected_name.as_str()
+        if name != expected_name.as_str()
             || !is_prefixed_uuid(record.changeset_id.as_str(), EntityKind::Changeset)
             || record.chapter_order == 0
             || !orders.insert(record.chapter_order)
@@ -654,7 +716,12 @@ fn scan_approval_records(root: &Path) -> Result<Vec<ScannedApproval>, Validation
         {
             return validation_error(
                 ValidationErrorKind::DependencyHash,
-                format!("invalid approval proof: {}", entry.path().display()),
+                format!(
+                    "invalid approval proof: {}",
+                    PathBuf::from(".phemius/records/approvals")
+                        .join(&name)
+                        .display()
+                ),
             );
         }
         approvals.push(ScannedApproval {
@@ -707,6 +774,17 @@ fn scan_approval_records(root: &Path) -> Result<Vec<ScannedApproval>, Validation
     Ok(approvals)
 }
 
+pub(crate) fn approval_chain_head_in(
+    root: &Dir,
+) -> Result<Option<(EntityId, u32)>, ValidationError> {
+    Ok(scan_approval_records_in(root)?.last().map(|approval| {
+        (
+            approval.record.changeset_id.clone(),
+            approval.record.chapter_order,
+        )
+    }))
+}
+
 fn is_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -739,10 +817,26 @@ fn approval_validation_hash(record: &ApprovalRecord) -> String {
     )
 }
 
-pub(crate) fn validate_target_path(root: &Path, path: &Path) -> Result<(), ValidationError> {
+pub(crate) fn validate_target_path_in(root: &Dir, path: &Path) -> Result<(), ValidationError> {
     validate_target_lexical(path)?;
-    reject_symlink_components(root, path, ValidationErrorKind::InvalidPath)?;
-    ensure_within_root(root, path, ValidationErrorKind::InvalidPath)
+    let target = open_pinned_path_io(root, path).map_err(|error| {
+        ValidationError::io(
+            &format!("failed to open target parent {}", path.display()),
+            error,
+        )
+    })?;
+    match target.parent.symlink_metadata(&target.leaf) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => validation_error(
+            ValidationErrorKind::InvalidPath,
+            format!("target is a symlink or special entry: {}", path.display()),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ValidationError::io(
+            &format!("failed to inspect target {}", path.display()),
+            error,
+        )),
+    }
 }
 
 pub(crate) fn validate_target_lexical(path: &Path) -> Result<(), ValidationError> {
@@ -763,8 +857,8 @@ pub(crate) fn validate_target_lexical(path: &Path) -> Result<(), ValidationError
     Ok(())
 }
 
-pub(crate) fn validate_candidate_path(
-    project: &Project,
+pub(crate) fn validate_candidate_path_in(
+    root: &Dir,
     changeset_id: &EntityId,
     path: &Path,
 ) -> Result<(), ValidationError> {
@@ -780,49 +874,15 @@ pub(crate) fn validate_candidate_path(
             ),
         );
     }
-    reject_symlink_components(&project.root, path, ValidationErrorKind::CandidatePath)?;
-    let expected_absolute = project.root.join(&expected);
-    let expected_canonical = fs::canonicalize(&expected_absolute).map_err(|error| {
-        ValidationError::io(
-            &format!(
-                "failed to canonicalize candidate root {}",
-                expected_absolute.display()
-            ),
-            error,
-        )
-    })?;
-    let candidate = project.root.join(path);
-    let candidate_canonical = fs::canonicalize(&candidate).map_err(|error| {
-        ValidationError::io(
-            &format!("failed to canonicalize candidate {}", candidate.display()),
-            error,
-        )
-    })?;
-    if !candidate_canonical.starts_with(expected_canonical) {
-        return validation_error(
-            ValidationErrorKind::CandidatePath,
-            format!("candidate escapes its changeset root: {}", path.display()),
-        );
-    }
-    let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
-        ValidationError::io(
-            &format!("failed to inspect candidate {}", candidate.display()),
-            error,
-        )
-    })?;
-    if !metadata.file_type().is_file() {
-        return validation_error(
-            ValidationErrorKind::CandidatePath,
-            format!("candidate is not a regular file: {}", path.display()),
-        );
-    }
-    Ok(())
+    read_regular_path(root, path, ValidationErrorKind::CandidatePath).map(|_| ())
 }
 
-fn validate_operations(
+fn validate_operations_in(
     project: &Project,
+    root: &Dir,
     changeset_id: &EntityId,
     operations: &[FileOperation],
+    base_entries: &BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<(), ValidationError> {
     if operations.is_empty() {
         return validation_error(
@@ -832,30 +892,55 @@ fn validate_operations(
     }
     validate_reserved_targets(operations)?;
     let mut targets = HashSet::new();
-    let mut affected_entities = HashSet::new();
+    let mut existing_aliases = BTreeMap::new();
+    for path in base_entries.keys() {
+        let alias = path_alias_key(path)?;
+        if existing_aliases.insert(alias, path).is_some() {
+            return validation_error(
+                ValidationErrorKind::InvalidOperation,
+                "canon contains colliding path aliases",
+            );
+        }
+    }
     for operation in operations {
-        validate_target_path(&project.root, &operation.path)?;
+        validate_target_path_in(root, &operation.path)?;
         let alias = path_alias_key(&operation.path)?;
-        if !targets.insert(alias) {
+        if !targets.insert(alias.clone()) {
             return validation_error(
                 ValidationErrorKind::InvalidOperation,
                 format!("duplicate target path: {}", operation.path.display()),
             );
         }
-        let target = project.root.join(&operation.path);
+        if operation.affected_entities.is_empty() {
+            return validation_error(
+                ValidationErrorKind::InvalidOperation,
+                "every operation requires an affected entity ID",
+            );
+        }
+        let mut affected_entities = HashSet::new();
         for entity in &operation.affected_entities {
             if !is_known_entity_id(entity.as_str())
                 || !affected_entities.insert(entity.as_str().to_owned())
             {
                 return validation_error(
                     ValidationErrorKind::InvalidOperation,
-                    "affected entity IDs must be valid and unique",
+                    "affected entity IDs must be valid and unique within each operation",
                 );
             }
         }
+        if alias == "project.toml"
+            && (operation.affected_entities.len() != 1
+                || operation.affected_entities[0] != project.config.work_id)
+        {
+            return validation_error(
+                ValidationErrorKind::InvalidOperation,
+                "project.toml must affect only the immutable work ID",
+            );
+        }
+        let existing = existing_aliases.get(&alias).copied();
         match operation.kind {
             OperationKind::Create => {
-                if target.exists()
+                if existing.is_some()
                     || operation.before_sha256.is_some()
                     || operation.after_sha256.is_none()
                     || operation.candidate_path.is_none()
@@ -867,7 +952,8 @@ fn validate_operations(
                 }
             }
             OperationKind::Replace => {
-                if operation.before_sha256.is_none()
+                if existing != Some(&operation.path)
+                    || operation.before_sha256.is_none()
                     || operation.after_sha256.is_none()
                     || operation.candidate_path.is_none()
                     || operation.before_sha256 == operation.after_sha256
@@ -879,7 +965,8 @@ fn validate_operations(
                 }
             }
             OperationKind::Delete => {
-                if operation.before_sha256.is_none()
+                if existing != Some(&operation.path)
+                    || operation.before_sha256.is_none()
                     || operation.after_sha256.is_some()
                     || operation.candidate_path.is_some()
                     || is_required_project_path(&operation.path)?
@@ -892,7 +979,12 @@ fn validate_operations(
             }
         }
         if let Some(expected) = &operation.before_sha256 {
-            let bytes = read_regular_file(&target, ValidationErrorKind::HashMismatch)?;
+            let bytes = base_entries.get(&operation.path).ok_or_else(|| {
+                ValidationError::new(
+                    ValidationErrorKind::HashMismatch,
+                    format!("canon file is missing: {}", operation.path.display()),
+                )
+            })?;
             if sha256_bytes(&bytes) != *expected {
                 return validation_error(
                     ValidationErrorKind::HashMismatch,
@@ -901,11 +993,9 @@ fn validate_operations(
             }
         }
         if let Some(candidate_path) = &operation.candidate_path {
-            validate_candidate_path(project, changeset_id, candidate_path)?;
-            let bytes = read_regular_file(
-                &project.root.join(candidate_path),
-                ValidationErrorKind::CandidatePath,
-            )?;
+            validate_candidate_path_in(root, changeset_id, candidate_path)?;
+            let bytes =
+                read_regular_path(root, candidate_path, ValidationErrorKind::CandidatePath)?;
             if operation.after_sha256.as_deref() != Some(sha256_bytes(&bytes).as_str()) {
                 return validation_error(
                     ValidationErrorKind::HashMismatch,
@@ -927,6 +1017,7 @@ fn validate_reserved_targets(operations: &[FileOperation]) -> Result<(), Validat
 fn validate_projected_schema(
     project: &Project,
     change: &Changeset,
+    base_entries: &BTreeMap<PathBuf, Vec<u8>>,
     entries: &BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<(), ValidationError> {
     let config_bytes = entries.get(Path::new("project.toml")).ok_or_else(|| {
@@ -944,50 +1035,64 @@ fn validate_projected_schema(
             format!("project.toml is invalid: {error}"),
         )
     })?;
-    if config.format_version != 1 || !is_prefixed_uuid(config.work_id.as_str(), EntityKind::Work) {
+    if config.format_version != 1
+        || !is_prefixed_uuid(config.work_id.as_str(), EntityKind::Work)
+        || config.work_id != project.config.work_id
+    {
         return validation_error(
             ValidationErrorKind::Schema,
-            "project.toml has an unsupported format or work ID",
+            "project.toml has an unsupported format or changed work ID",
         );
     }
 
-    for operation in &change.operations {
-        if !path_alias_key(&operation.path)?.ends_with(".md") {
+    let mut semantic_ids = HashSet::new();
+    for (path, bytes) in entries {
+        if !is_artifact_markdown(path)? {
             continue;
         }
-        if matches!(
-            operation.kind,
-            OperationKind::Replace | OperationKind::Delete
-        ) {
-            validate_markdown_schema(
-                &fs::read(project.root.join(&operation.path)).map_err(|error| {
-                    ValidationError::io("failed to read changed canon Markdown", error)
-                })?,
-                &operation.path,
-            )?;
+        let semantic_id = markdown_semantic_id(bytes, path)?;
+        if !semantic_ids.insert(semantic_id.to_owned()) {
+            return validation_error(
+                ValidationErrorKind::Schema,
+                format!("duplicate Markdown semantic ID at {}", path.display()),
+            );
         }
-        if matches!(
-            operation.kind,
-            OperationKind::Create | OperationKind::Replace
-        ) {
-            validate_markdown_schema(
-                entries.get(&operation.path).ok_or_else(|| {
-                    ValidationError::new(
-                        ValidationErrorKind::Schema,
-                        format!(
-                            "projected Markdown is missing: {}",
-                            operation.path.display()
-                        ),
-                    )
-                })?,
-                &operation.path,
-            )?;
+    }
+    for operation in &change.operations {
+        if operation.kind != OperationKind::Replace || !is_artifact_markdown(&operation.path)? {
+            continue;
+        }
+        let before = base_entries.get(&operation.path).ok_or_else(|| {
+            ValidationError::new(
+                ValidationErrorKind::Schema,
+                format!("base Markdown is missing: {}", operation.path.display()),
+            )
+        })?;
+        let after = entries.get(&operation.path).ok_or_else(|| {
+            ValidationError::new(
+                ValidationErrorKind::Schema,
+                format!(
+                    "projected Markdown is missing: {}",
+                    operation.path.display()
+                ),
+            )
+        })?;
+        if markdown_semantic_id(before, &operation.path)?
+            != markdown_semantic_id(after, &operation.path)?
+        {
+            return validation_error(
+                ValidationErrorKind::Schema,
+                format!(
+                    "replace operation changes Markdown semantic ID: {}",
+                    operation.path.display()
+                ),
+            );
         }
     }
     Ok(())
 }
 
-fn validate_markdown_schema(bytes: &[u8], path: &Path) -> Result<(), ValidationError> {
+fn markdown_semantic_id(bytes: &[u8], path: &Path) -> Result<String, ValidationError> {
     let artifact = parse_markdown(bytes).map_err(|error| {
         ValidationError::new(
             ValidationErrorKind::Schema,
@@ -1010,35 +1115,44 @@ fn validate_markdown_schema(bytes: &[u8], path: &Path) -> Result<(), ValidationE
             format!("Markdown {} has an invalid semantic ID", path.display()),
         );
     }
-    Ok(())
+    Ok(id.to_owned())
 }
 
-fn collect_canon_files(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>, ValidationError> {
+fn is_artifact_markdown(path: &Path) -> Result<bool, ValidationError> {
+    let key = path_alias_key(path)?;
+    Ok(key == "資料/manifest.md"
+        || ["前提/", "箱書き/", "本文/", "メモ/"]
+            .iter()
+            .any(|prefix| key.starts_with(prefix) && key.ends_with(".md")))
+}
+
+fn collect_canon_files_in(root: &Dir) -> Result<BTreeMap<PathBuf, Vec<u8>>, ValidationError> {
     let mut files = BTreeMap::new();
-    collect_directory(root, Path::new(""), &mut files)?;
+    collect_directory_in(root, Path::new(""), &mut files)?;
     Ok(files)
 }
 
-fn collect_directory(
-    root: &Path,
+fn collect_directory_in(
+    directory: &Dir,
     relative: &Path,
     files: &mut BTreeMap<PathBuf, Vec<u8>>,
 ) -> Result<(), ValidationError> {
-    let directory = root.join(relative);
-    let mut entries = fs::read_dir(&directory)
+    let mut entries = directory
+        .entries()
         .map_err(|error| {
-            ValidationError::io(&format!("failed to read {}", directory.display()), error)
+            ValidationError::io(&format!("failed to read {}", relative.display()), error)
         })?
-        .collect::<Result<Vec<_>, _>>()
+        .collect::<io::Result<Vec<_>>>()
         .map_err(|error| {
             ValidationError::io(
-                &format!("failed to enumerate {}", directory.display()),
+                &format!("failed to enumerate {}", relative.display()),
                 error,
             )
         })?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        let child_relative = relative.join(entry.file_name());
+        let name = entry.file_name();
+        let child_relative = relative.join(&name);
         let segments = path_segments(&child_relative, ValidationErrorKind::InvalidPath)?;
         if is_git_path(&segments) || is_runtime_path(&segments) || is_local_settings_path(&segments)
         {
@@ -1046,7 +1160,7 @@ fn collect_directory(
         }
         let file_type = entry.file_type().map_err(|error| {
             ValidationError::io(
-                &format!("failed to inspect {}", entry.path().display()),
+                &format!("failed to inspect {}", child_relative.display()),
                 error,
             )
         })?;
@@ -1057,13 +1171,19 @@ fn collect_directory(
             );
         }
         if file_type.is_dir() {
-            collect_directory(root, &child_relative, files)?;
+            let child = open_dir_no_follow_io(directory, &name).map_err(|error| {
+                ValidationError::io(
+                    &format!("failed to open {}", child_relative.display()),
+                    error,
+                )
+            })?;
+            collect_directory_in(&child, &child_relative, files)?;
         } else if file_type.is_file() {
             files.insert(
                 child_relative,
-                fs::read(entry.path()).map_err(|error| {
+                read_regular_at_io(directory, &name).map_err(|error| {
                     ValidationError::io(
-                        &format!("failed to read {}", entry.path().display()),
+                        &format!("failed to read {}", relative.join(&name).display()),
                         error,
                     )
                 })?,
@@ -1134,88 +1254,163 @@ fn path_segments(path: &Path, kind: ValidationErrorKind) -> Result<Vec<&str>, Va
     Ok(segments)
 }
 
-fn reject_symlink_components(
-    root: &Path,
-    relative: &Path,
+pub(crate) struct PinnedPath {
+    pub(crate) parent: Dir,
+    pub(crate) leaf: OsString,
+    pub(crate) display: PathBuf,
+}
+
+pub(crate) fn open_project_root_io(root: &Path) -> io::Result<Dir> {
+    let root = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "root path contains NUL"))?;
+    // SAFETY: The NUL-terminated path remains valid for the call, and a successful descriptor is
+    // transferred exactly once to File.
+    let descriptor = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: libc::open returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    Ok(Dir::from_std_file(file))
+}
+
+pub(crate) fn open_project_root(root: &Path) -> Result<Dir, ValidationError> {
+    open_project_root_io(root).map_err(|error| {
+        ValidationError::io(
+            &format!("project root is not a real directory: {}", root.display()),
+            error,
+        )
+    })
+}
+
+pub(crate) fn open_dir_no_follow_io(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
+    let anchor = parent.try_clone()?.into_std_file();
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL"))?;
+    // SAFETY: The directory descriptor and NUL-terminated leaf name remain valid for the call.
+    let descriptor = unsafe {
+        libc::openat(
+            anchor.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: libc::openat returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    Ok(Dir::from_std_file(file))
+}
+
+pub(crate) fn open_pinned_path_io(root: &Dir, relative: &Path) -> io::Result<PinnedPath> {
+    if relative.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed path must be relative",
+        ));
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed path is empty",
+        ));
+    }
+    let mut parent = root.try_clone()?;
+    for component in &components[..components.len() - 1] {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed path has an unsafe component",
+            ));
+        };
+        parent = open_dir_no_follow_io(&parent, name)?;
+    }
+    let Component::Normal(leaf) = components[components.len() - 1] else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed path has an unsafe leaf",
+        ));
+    };
+    Ok(PinnedPath {
+        parent,
+        leaf: leaf.to_os_string(),
+        display: relative.to_path_buf(),
+    })
+}
+
+pub(crate) fn read_regular_at_io(dir: &Dir, name: &OsStr) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = dir.open_with(name, &options)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed entry is not a regular file",
+        ));
+    }
+    let identity = (before.dev(), before.ino());
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if identity != (after.dev(), after.ino()) {
+        return Err(io::Error::other(
+            "managed file identity changed while reading",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_regular_path(
+    root: &Dir,
+    path: &Path,
     kind: ValidationErrorKind,
-) -> Result<(), ValidationError> {
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return validation_error(
-                    kind,
-                    format!("path contains a symlink: {}", relative.display()),
-                );
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+) -> Result<Vec<u8>, ValidationError> {
+    let pinned = open_pinned_path_io(root, path).map_err(|error| {
+        ValidationError::new(
+            kind,
+            format!(
+                "failed to open {} without symlinks: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    read_regular_at_io(&pinned.parent, &pinned.leaf).map_err(|error| {
+        ValidationError::new(
+            kind,
+            format!("failed to read regular file {}: {error}", path.display()),
+        )
+    })
+}
+
+fn try_open_directory_chain(root: &Dir, names: &[&OsStr]) -> Result<Option<Dir>, ValidationError> {
+    let mut directory = root
+        .try_clone()
+        .map_err(|error| ValidationError::io("failed to clone project root", error))?;
+    for name in names {
+        match open_dir_no_follow_io(&directory, name) {
+            Ok(child) => directory = child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(ValidationError::io(
-                    &format!("failed to inspect {}", current.display()),
+                    &format!("failed to open directory {}", name.to_string_lossy()),
                     error,
                 ));
             }
         }
     }
-    Ok(())
+    Ok(Some(directory))
 }
 
-fn ensure_within_root(
-    project_root: &Path,
-    relative: &Path,
-    kind: ValidationErrorKind,
-) -> Result<(), ValidationError> {
-    let root = fs::canonicalize(project_root).map_err(|error| {
-        ValidationError::io(
-            &format!("failed to canonicalize {}", project_root.display()),
-            error,
-        )
-    })?;
-    let absolute = project_root.join(relative);
-    let existing = if absolute.exists() {
-        absolute.clone()
-    } else {
-        absolute.parent().unwrap_or(project_root).to_path_buf()
-    };
-    let canonical = fs::canonicalize(&existing).map_err(|error| {
-        ValidationError::io(
-            &format!("failed to canonicalize {}", existing.display()),
-            error,
-        )
-    })?;
-    if !canonical.starts_with(root) {
-        return validation_error(
-            kind,
-            format!("path escapes project root: {}", relative.display()),
-        );
-    }
-    if !existing.is_dir() && !absolute.exists() {
-        return validation_error(
-            kind,
-            format!("target parent is not a directory: {}", existing.display()),
-        );
-    }
-    Ok(())
-}
-
-fn read_regular_file(path: &Path, kind: ValidationErrorKind) -> Result<Vec<u8>, ValidationError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        ValidationError::io(&format!("failed to inspect {}", path.display()), error)
-    })?;
-    if !metadata.file_type().is_file() {
-        return validation_error(kind, format!("not a regular file: {}", path.display()));
-    }
-    fs::read(path)
-        .map_err(|error| ValidationError::io(&format!("failed to read {}", path.display()), error))
-}
-
-fn read_utf8(path: PathBuf, label: &str) -> Result<String, ValidationError> {
-    let bytes = fs::read(&path).map_err(|error| {
-        ValidationError::io(&format!("failed to read {label} {}", path.display()), error)
-    })?;
-    String::from_utf8(bytes).map_err(|error| {
+fn read_utf8_bytes(bytes: &[u8], path: &Path, label: &str) -> Result<String, ValidationError> {
+    String::from_utf8(bytes.to_vec()).map_err(|error| {
         ValidationError::new(
             ValidationErrorKind::InvalidOperation,
             format!("{label} {} is not UTF-8: {error}", path.display()),
