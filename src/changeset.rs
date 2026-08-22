@@ -1345,16 +1345,7 @@ pub(crate) fn open_pinned_path_io(root: &Dir, relative: &Path) -> io::Result<Pin
     })
 }
 
-pub(crate) struct RegularFileSnapshot {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) device: u64,
-    pub(crate) inode: u64,
-}
-
-pub(crate) fn read_regular_snapshot_at_io(
-    dir: &Dir,
-    name: &OsStr,
-) -> io::Result<RegularFileSnapshot> {
+pub(crate) fn read_regular_at_io(dir: &Dir, name: &OsStr) -> io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true).custom_flags(libc::O_NOFOLLOW);
     let mut file = dir.open_with(name, &options)?;
@@ -1374,15 +1365,7 @@ pub(crate) fn read_regular_snapshot_at_io(
             "managed file identity changed while reading",
         ));
     }
-    Ok(RegularFileSnapshot {
-        bytes,
-        device: identity.0,
-        inode: identity.1,
-    })
-}
-
-pub(crate) fn read_regular_at_io(dir: &Dir, name: &OsStr) -> io::Result<Vec<u8>> {
-    Ok(read_regular_snapshot_at_io(dir, name)?.bytes)
+    Ok(bytes)
 }
 
 fn read_regular_path(

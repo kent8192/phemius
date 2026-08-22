@@ -9,9 +9,9 @@ use phemius::{
     },
     domain::{EntityKind, prefixed_uuid},
     journal::{
-        RecoveryOutcome, TestInterruption, TestRecoveryInterruption, apply_changeset,
+        ManualResolutionRequired, RecoveryOutcome, TestInterruption, apply_changeset,
         apply_changeset_for_test, apply_changeset_with_test_hook, recover_pending,
-        recover_pending_for_test, recover_pending_with_root_test_hook,
+        recover_pending_with_root_test_hook,
     },
     project::{Project, ProjectConfig},
 };
@@ -36,6 +36,18 @@ fn stale_and_incomplete_changesets_cannot_be_approved() {
             kind
         );
     }
+}
+
+#[test]
+fn validation_failure_before_prepared_leaves_canon_untouched() {
+    let fixture = ApplyFixture::new();
+    let before = fixture.read_canon();
+    let mut stale = fixture.change.clone();
+    stale.state = ChangesetState::Stale;
+
+    assert!(apply_changeset(&fixture.project, &stale).is_err());
+    assert_eq!(fixture.read_canon(), before);
+    assert!(!fixture.transaction_path().exists());
 }
 
 #[test]
@@ -115,7 +127,7 @@ fn create_replace_delete_apply_as_one_changeset() {
 }
 
 #[test]
-fn successful_and_rolled_back_transactions_retain_append_only_evidence() {
+fn successful_and_prepared_transactions_retain_append_only_evidence() {
     let committed = ApplyFixture::new();
     apply_changeset(&committed.project, &committed.change).unwrap();
     let committed_transaction = committed.transaction_path();
@@ -132,30 +144,31 @@ fn successful_and_rolled_back_transactions_retain_append_only_evidence() {
     assert_eq!(recover_pending(&committed.root).unwrap().kept_committed, 1);
     assert!(committed_transaction.is_dir());
 
-    let rolled_back = ApplyFixture::new();
+    let prepared = ApplyFixture::new();
     apply_changeset_for_test(
-        &rolled_back.project,
-        &rolled_back.change,
+        &prepared.project,
+        &prepared.change,
         TestInterruption::AfterFirstRename,
     )
     .unwrap_err();
-    assert_eq!(recover_pending(&rolled_back.root).unwrap().rolled_back, 1);
-    let rolled_back_transaction = rolled_back.transaction_path();
-    assert!(
-        rolled_back_transaction
-            .join("journal.prepared.json")
-            .is_file()
+    let observed = prepared.read_canon();
+    assert_manual_resolution(
+        recover_pending(&prepared.root).unwrap_err(),
+        &prepared.change,
     );
+    let prepared_transaction = prepared.transaction_path();
+    assert!(prepared_transaction.join("journal.prepared.json").is_file());
     assert!(
-        rolled_back_transaction
+        !prepared_transaction
             .join("journal.rolled-back.json")
-            .is_file()
+            .exists()
     );
-    assert_eq!(
-        recover_pending(&rolled_back.root).unwrap(),
-        RecoveryOutcome::default()
+    assert_manual_resolution(
+        recover_pending(&prepared.root).unwrap_err(),
+        &prepared.change,
     );
-    assert!(rolled_back_transaction.is_dir());
+    assert_eq!(prepared.read_canon(), observed);
+    assert!(prepared_transaction.is_dir());
 }
 
 #[test]
@@ -700,9 +713,8 @@ fn project_toml_operation_uses_the_immutable_work_id() {
 }
 
 #[test]
-fn interrupted_apply_recovers_the_complete_old_state() {
+fn interrupted_apply_requires_manual_resolution_without_changing_observed_canon() {
     let fixture = ApplyFixture::new();
-    let before = fixture.read_canon();
 
     assert!(
         apply_changeset_for_test(
@@ -712,8 +724,34 @@ fn interrupted_apply_recovers_the_complete_old_state() {
         )
         .is_err()
     );
-    assert_eq!(recover_pending(&fixture.root).unwrap().rolled_back, 1);
-    assert_eq!(fixture.read_canon(), before);
+    let observed = fixture.read_canon();
+
+    let recovery = recover_pending(&fixture.root).unwrap_err();
+    let manual = recovery
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("Prepared recovery must return a typed manual-resolution error");
+    assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+    assert_eq!(fixture.read_canon(), observed);
+    assert!(
+        fixture
+            .transaction_path()
+            .join("journal.prepared.json")
+            .is_file()
+    );
+    assert!(
+        !fixture
+            .transaction_path()
+            .join("journal.rolled-back.json")
+            .exists()
+    );
+
+    let next_apply = apply_changeset(&fixture.project, &fixture.change).unwrap_err();
+    assert!(
+        next_apply
+            .downcast_ref::<ManualResolutionRequired>()
+            .is_some()
+    );
+    assert_eq!(fixture.read_canon(), observed);
 }
 
 #[test]
@@ -732,10 +770,7 @@ fn committed_journal_recovery_keeps_the_new_state() {
 
     assert_eq!(
         recover_pending(&fixture.root).unwrap(),
-        RecoveryOutcome {
-            rolled_back: 0,
-            kept_committed: 1,
-        }
+        RecoveryOutcome { kept_committed: 1 }
     );
     assert_eq!(canon_root_hash(&fixture.project).unwrap(), expected);
 }
@@ -766,7 +801,7 @@ fn committed_recovery_does_not_require_rollback_images() {
 }
 
 #[test]
-fn every_apply_boundary_recovers_idempotently() {
+fn every_prepared_apply_boundary_requires_manual_resolution_without_mutation() {
     for point in [
         TestInterruption::AfterReplacePreserve,
         TestInterruption::AfterReplaceInstall,
@@ -774,13 +809,17 @@ fn every_apply_boundary_recovers_idempotently() {
         TestInterruption::AfterApprovalInstall,
     ] {
         let fixture = ApplyFixture::new();
-        let before = fixture.read_canon();
         assert!(apply_changeset_for_test(&fixture.project, &fixture.change, point).is_err());
-        assert_eq!(recover_pending(&fixture.root).unwrap().rolled_back, 1);
-        assert_eq!(fixture.read_canon(), before);
-        assert_eq!(
-            recover_pending(&fixture.root).unwrap(),
-            RecoveryOutcome::default()
+        let observed = fixture.read_canon();
+        assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
+        assert_eq!(fixture.read_canon(), observed);
+        assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
+        assert_eq!(fixture.read_canon(), observed);
+        assert!(
+            !fixture
+                .transaction_path()
+                .join("journal.rolled-back.json")
+                .exists()
         );
     }
 }
@@ -853,7 +892,7 @@ fn unknown_entries_and_multiple_pending_transactions_fail_closed() {
 }
 
 #[test]
-fn approval_rollback_quarantine_never_unlinks_an_external_replacement() {
+fn prepared_recovery_never_changes_an_external_approval_replacement() {
     let fixture = ApplyFixture::new();
     apply_changeset_for_test(
         &fixture.project,
@@ -861,17 +900,18 @@ fn approval_rollback_quarantine_never_unlinks_an_external_replacement() {
         TestInterruption::AfterApprovalInstall,
     )
     .unwrap_err();
-    recover_pending_for_test(
-        &fixture.root,
-        TestRecoveryInterruption::AfterFirstQuarantine,
-    )
-    .unwrap_err();
     fs::write(fixture.approval_path(), b"external approval replacement").unwrap();
 
-    assert!(recover_pending(&fixture.root).is_err());
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
     assert_eq!(
         fs::read(fixture.approval_path()).unwrap(),
         b"external approval replacement"
+    );
+    assert!(
+        !fixture
+            .transaction_path()
+            .join("approval-quarantine")
+            .exists()
     );
 }
 
@@ -880,10 +920,8 @@ fn approval_rollback_quarantine_never_unlinks_an_external_replacement() {
 fn prepared_capabilities_cannot_be_redirected_by_parent_symlink_swaps() {
     let fixture = ApplyFixture::new();
 
-    assert!(
-        apply_changeset_with_test_hook(&fixture.project, &fixture.change, swap_managed_parents)
-            .is_err()
-    );
+    let apply =
+        apply_changeset_with_test_hook(&fixture.project, &fixture.change, swap_managed_parents);
     assert!(
         fs::read_dir(fixture.outside.join("本文"))
             .unwrap()
@@ -904,8 +942,10 @@ fn prepared_capabilities_cannot_be_redirected_by_parent_symlink_swaps() {
     );
 
     restore_managed_parents(&fixture.project);
-    assert_eq!(recover_pending(&fixture.root).unwrap().rolled_back, 1);
-    assert_eq!(fixture.read_canon()[0], None);
+    assert_manual_resolution(apply.unwrap_err(), &fixture.change);
+    let observed = fixture.read_canon();
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
+    assert_eq!(fixture.read_canon(), observed);
 }
 
 #[cfg(unix)]
@@ -939,7 +979,10 @@ fn externally_deleted_old_files_are_not_recreated_by_apply_or_recovery() {
         let fixture = ApplyFixture::new();
         let target = fixture.root.join(target);
 
-        assert!(apply_changeset_with_test_hook(&fixture.project, &fixture.change, hook).is_err());
+        assert_manual_resolution(
+            apply_changeset_with_test_hook(&fixture.project, &fixture.change, hook).unwrap_err(),
+            &fixture.change,
+        );
         assert!(!target.exists());
         assert!(
             fixture
@@ -949,7 +992,7 @@ fn externally_deleted_old_files_are_not_recreated_by_apply_or_recovery() {
         );
         let observed_partial_state = fixture.read_canon();
 
-        assert!(recover_pending(&fixture.root).is_err());
+        assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
         assert!(!target.exists());
         assert_eq!(fixture.read_canon(), observed_partial_state);
         assert!(fixture.transaction_path().is_dir());
@@ -979,7 +1022,7 @@ fn restore_named_file_does_not_authorize_recreating_an_absent_target() {
 }
 
 #[test]
-fn externally_deleted_installed_replace_is_not_rolled_back() {
+fn externally_deleted_installed_replace_requires_manual_resolution() {
     let fixture = ApplyFixture::new();
     let target = fixture.root.join("本文/replace.md");
     apply_changeset_for_test(
@@ -990,7 +1033,7 @@ fn externally_deleted_installed_replace_is_not_rolled_back() {
     .unwrap_err();
     fs::remove_file(&target).unwrap();
 
-    assert!(recover_pending(&fixture.root).is_err());
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
     assert!(!target.exists());
     assert!(fixture.transaction_path().is_dir());
 }
@@ -1015,49 +1058,45 @@ fn same_bytes_on_a_different_inode_are_not_treated_as_an_owned_install() {
     let external_inode = fs::metadata(&target).unwrap().ino();
     assert_ne!(external_inode, installed_inode);
 
-    assert!(recover_pending(&fixture.root).is_err());
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
     assert_eq!(fs::metadata(&target).unwrap().ino(), external_inode);
     assert_eq!(fs::read(&target).unwrap(), installed);
     assert!(fixture.transaction_path().is_dir());
 }
 
 #[test]
-fn mismatched_quarantine_is_retained_instead_of_restored_live() {
+fn prepared_recovery_never_creates_quarantine_evidence() {
     let fixture = ApplyFixture::new();
-    let target = fixture.root.join("本文/create.md");
     apply_changeset_for_test(
         &fixture.project,
         &fixture.change,
         TestInterruption::AfterFirstRename,
     )
     .unwrap_err();
+    let observed = fixture.read_canon();
 
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
+    assert_eq!(fixture.read_canon(), observed);
+    assert!(!fixture.transaction_path().join("quarantine-0000").exists());
     assert!(
-        recover_pending_for_test(
-            &fixture.root,
-            TestRecoveryInterruption::CorruptFirstQuarantineBeforeValidation,
-        )
-        .is_err()
+        !fixture
+            .transaction_path()
+            .join("approval-quarantine")
+            .exists()
     );
-    assert!(!target.exists());
-    assert_eq!(
-        fs::read(fixture.transaction_path().join("quarantine-0000")).unwrap(),
-        b"external quarantine replacement"
-    );
-    assert!(fixture.transaction_path().is_dir());
 }
 
 #[cfg(unix)]
 #[test]
 fn recovery_keeps_using_the_pinned_root_after_the_project_path_is_swapped() {
     let fixture = ApplyFixture::new();
-    let before = fixture.read_canon();
     apply_changeset_for_test(
         &fixture.project,
         &fixture.change,
         TestInterruption::AfterFirstRename,
     )
     .unwrap_err();
+    let observed = fixture.read_canon();
 
     let result = recover_pending_with_root_test_hook(&fixture.root, swap_project_root_path);
     assert_eq!(
@@ -1067,13 +1106,19 @@ fn recovery_keeps_using_the_pinned_root_after_the_project_path_is_swapped() {
     assert!(!fixture.root.join("本文/create.md").exists());
     restore_project_root(&fixture.root);
 
-    assert_eq!(result.unwrap().rolled_back, 1);
-    assert_eq!(fixture.read_canon(), before);
+    assert_manual_resolution(result.unwrap_err(), &fixture.change);
+    assert_eq!(fixture.read_canon(), observed);
     assert!(
         fixture
             .transaction_path()
-            .join("journal.rolled-back.json")
+            .join("journal.prepared.json")
             .is_file()
+    );
+    assert!(
+        !fixture
+            .transaction_path()
+            .join("journal.rolled-back.json")
+            .exists()
     );
 }
 
@@ -1139,7 +1184,7 @@ fn retained_committed_journal_must_match_its_approval_record() {
 }
 
 #[test]
-fn rollback_quarantines_before_hashing_and_never_unlinks_a_replacement() {
+fn prepared_recovery_never_renames_an_external_live_replacement() {
     let fixture = ApplyFixture::new();
     assert!(
         apply_changeset_for_test(
@@ -1149,20 +1194,15 @@ fn rollback_quarantines_before_hashing_and_never_unlinks_a_replacement() {
         )
         .is_err()
     );
-    assert!(
-        recover_pending_for_test(
-            &fixture.root,
-            TestRecoveryInterruption::AfterFirstQuarantine,
-        )
-        .is_err()
-    );
     fs::write(fixture.root.join("本文/create.md"), b"external replacement").unwrap();
+    let observed = fixture.read_canon();
 
-    assert!(recover_pending(&fixture.root).is_err());
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
     assert_eq!(
         fs::read(fixture.root.join("本文/create.md")).unwrap(),
         b"external replacement"
     );
+    assert_eq!(fixture.read_canon(), observed);
     assert!(
         fixture
             .root
@@ -1170,6 +1210,7 @@ fn rollback_quarantines_before_hashing_and_never_unlinks_a_replacement() {
             .join(fixture.change.id.as_str())
             .exists()
     );
+    assert!(!fixture.transaction_path().join("quarantine-0000").exists());
 }
 
 #[test]
@@ -1415,6 +1456,13 @@ fn refresh_change(project: &Project, change: &mut Changeset) {
     change.content_result_hash = content_result_hash(project, change).unwrap();
     change.validation_hash = Some(calculate_validation_hash(change));
     change.result_root_hash = projected_root_hash(project, change).unwrap();
+}
+
+fn assert_manual_resolution(error: anyhow::Error, change: &Changeset) {
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("Prepared transaction must require manual resolution");
+    assert_eq!(manual.changeset_id(), change.id.as_str());
 }
 
 fn rebase_and_refresh(project: &Project, change: &mut Changeset) {
