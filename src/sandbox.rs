@@ -13,6 +13,8 @@ use tokio::{
     time::{Instant, timeout},
 };
 
+use crate::tools::{AgentRole, Tool};
+
 /// The approval policy for one shell request.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ApprovalMode {
@@ -139,6 +141,11 @@ pub struct ShellOutcome {
 /// A fail-closed shell decision or execution failure.
 #[derive(Debug)]
 pub enum ShellError {
+    /// The role does not have the fixed shell capability.
+    ToolDenied {
+        /// The role whose shell call was rejected.
+        role: AgentRole,
+    },
     /// A controller must request the displayed approval or sandbox choice.
     ChoiceRequired {
         /// The unresolved decision.
@@ -155,6 +162,7 @@ pub enum ShellError {
 impl fmt::Display for ShellError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ToolDenied { role } => write!(formatter, "role {role:?} may not invoke shell"),
             Self::ChoiceRequired { reason, .. } => {
                 write!(formatter, "user choice required: {reason:?}")
             }
@@ -188,7 +196,10 @@ pub enum ChoiceReason {
 }
 
 /// Runs a bounded child process, or returns a typed choice without launching it.
-pub async fn run_shell(request: ShellRequest) -> Result<ShellOutcome, ShellError> {
+pub async fn run_shell(role: AgentRole, request: ShellRequest) -> Result<ShellOutcome, ShellError> {
+    if !Tool::for_role(role).contains(&Tool::Shell) {
+        return Err(ShellError::ToolDenied { role });
+    }
     let workspace = request
         .workspace
         .canonicalize()
@@ -216,7 +227,9 @@ pub async fn run_shell(request: ShellRequest) -> Result<ShellOutcome, ShellError
         }
         ApprovalMode::Allowlist | ApprovalMode::Never => {}
     }
-    if request.sandbox == SandboxMode::None && !request.trusted_unrestricted {
+    if request.sandbox == SandboxMode::None
+        && (request.approval != ApprovalMode::Never || !request.trusted_unrestricted)
+    {
         return Err(ShellError::ChoiceRequired {
             reason: ChoiceReason::UntrustedUnrestricted,
             executable: Some(executable),
@@ -256,7 +269,12 @@ pub async fn run_shell(request: ShellRequest) -> Result<ShellOutcome, ShellError
             ShellError::Execution(error)
         }
     })?;
-    capture_child(child, request.time_limit, request.output_limit).await
+    capture_child(
+        ChildGroupGuard { child, armed: true },
+        request.time_limit,
+        request.output_limit,
+    )
+    .await
 }
 
 fn resolve_executable(program: &Path) -> Result<PathBuf, ShellError> {
@@ -340,15 +358,17 @@ fn seatbelt_profile(workspace: &Path) -> Result<String, ShellError> {
 }
 
 async fn capture_child(
-    mut child: Child,
+    mut child: ChildGroupGuard,
     time_limit: Duration,
     output_limit: usize,
 ) -> Result<ShellOutcome, ShellError> {
     let mut stdout = child
+        .child
         .stdout
         .take()
         .ok_or_else(|| ShellError::Invalid("child stdout was not captured".into()))?;
     let mut stderr = child
+        .child
         .stderr
         .take()
         .ok_or_else(|| ShellError::Invalid("child stderr was not captured".into()))?;
@@ -364,7 +384,8 @@ async fn capture_child(
     while stdout_open || stderr_open || status.is_none() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            terminate_group(&mut child).await?;
+            terminate_group(&mut child.child).await?;
+            child.armed = false;
             return Err(ShellError::Invalid("shell time limit exceeded".into()));
         }
         tokio::select! {
@@ -376,18 +397,21 @@ async fn capture_child(
                 0 => stderr_open = false,
                 n => stderr_bytes.extend_from_slice(&stderr_chunk[..n]),
             },
-            waited = child.wait(), if status.is_none() => status = Some(waited?),
+            waited = child.child.wait(), if status.is_none() => status = Some(waited?),
             _ = tokio::time::sleep(remaining) => {
-                terminate_group(&mut child).await?;
+                terminate_group(&mut child.child).await?;
+                child.armed = false;
                 return Err(ShellError::Invalid("shell time limit exceeded".into()));
             }
         }
         if stdout_bytes.len().saturating_add(stderr_bytes.len()) > output_limit {
-            terminate_group(&mut child).await?;
+            terminate_group(&mut child.child).await?;
+            child.armed = false;
             return Err(ShellError::Invalid("shell output limit exceeded".into()));
         }
     }
     let status = status.expect("loop waits for child completion");
+    child.armed = false;
     Ok(ShellOutcome {
         stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
@@ -399,14 +423,52 @@ async fn terminate_group(child: &mut Child) -> Result<(), ShellError> {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // The child is its own process-group leader, so negative PID terminates descendants too.
-        let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        if result != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(ShellError::Execution(error));
+        signal_group(pid, libc::SIGTERM)?;
+    }
+    match timeout(Duration::from_millis(250), child.wait()).await {
+        Ok(result) => result.map_err(ShellError::Execution).map(|_| ()),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                signal_group(pid, libc::SIGKILL)?;
             }
+            timeout(Duration::from_secs(2), child.wait())
+                .await
+                .map_err(|_| ShellError::Invalid("child process did not terminate".into()))?
+                .map_err(ShellError::Execution)
+                .map(|_| ())
         }
     }
-    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+}
+
+#[cfg(unix)]
+fn signal_group(pid: u32, signal: i32) -> Result<(), ShellError> {
+    let result = unsafe { libc::kill(-(pid as i32), signal) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(ShellError::Execution(error));
+        }
+    }
     Ok(())
+}
+
+struct ChildGroupGuard {
+    child: Child,
+    armed: bool,
+}
+
+impl Drop for ChildGroupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            // Drop executes during cancellation, when async waiting is unavailable.
+            let _ = signal_group(pid, libc::SIGTERM);
+            let _ = signal_group(pid, libc::SIGKILL);
+        }
+        let _ = self.child.start_kill();
+    }
 }

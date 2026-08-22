@@ -1,9 +1,10 @@
 //! Metadata-first discovery for project and user skills.
 
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 
@@ -44,6 +45,7 @@ pub struct SkillResource {
 #[derive(Clone, Debug, Default)]
 pub struct SkillCatalog {
     skills: BTreeMap<String, SkillEntry>,
+    body_loads: Cell<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,12 +89,18 @@ impl SkillCatalog {
         self.skills.get(name).map(|entry| &entry.metadata)
     }
 
+    /// Returns how many selected skill bodies this catalog has attempted to load.
+    pub fn body_load_count(&self) -> usize {
+        self.body_loads.get()
+    }
+
     /// Loads one explicitly selected skill body and its receipt hash.
     pub fn load(&self, name: &str) -> Result<LoadedSkill> {
         let entry = self
             .skills
             .get(name)
             .with_context(|| format!("unknown skill {name}"))?;
+        self.body_loads.set(self.body_loads.get().saturating_add(1));
         let bytes = read_regular(&entry.path)?;
         let body = String::from_utf8(bytes.clone()).context("SKILL.md must be valid UTF-8")?;
         Ok(LoadedSkill {
@@ -202,12 +210,12 @@ fn skill_paths(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn read_metadata(path: &Path) -> Result<SkillMetadata> {
-    let file = File::open(path)
+    let mut file = File::open(path)
         .with_context(|| format!("failed to open skill metadata {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
+    let mut line = Vec::new();
+    read_metadata_line(&mut file, &mut line)?;
     ensure!(
-        reader.read_line(&mut line)? > 0 && line.trim_end() == "---",
+        line.as_slice() == b"---\n" || line.as_slice() == b"---\r\n",
         "SKILL.md metadata must begin with ---"
     );
     let mut name = None;
@@ -215,12 +223,14 @@ fn read_metadata(path: &Path) -> Result<SkillMetadata> {
     loop {
         line.clear();
         ensure!(
-            reader.read_line(&mut line)? > 0,
+            read_metadata_line(&mut file, &mut line)?,
             "SKILL.md metadata is not terminated"
         );
-        if line.trim_end() == "---" {
+        if line.as_slice() == b"---\n" || line.as_slice() == b"---\r\n" || line.as_slice() == b"---"
+        {
             break;
         }
+        let line = std::str::from_utf8(&line).context("SKILL.md metadata must be valid UTF-8")?;
         let Some((key, value)) = line.trim_end().split_once(':') else {
             bail!("invalid SKILL.md metadata line");
         };
@@ -237,6 +247,22 @@ fn read_metadata(path: &Path) -> Result<SkillMetadata> {
         name,
         description: description.context("SKILL.md metadata requires description")?,
     })
+}
+
+fn read_metadata_line(file: &mut File, line: &mut Vec<u8>) -> Result<bool> {
+    let mut byte = [0_u8; 1];
+    loop {
+        match file.read(&mut byte)? {
+            0 => return Ok(!line.is_empty()),
+            1 => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    return Ok(true);
+                }
+            }
+            _ => unreachable!("single-byte read cannot fill more than one byte"),
+        }
+    }
 }
 
 fn secure_resource_path(root: &Path, relative: &Path) -> Result<PathBuf> {

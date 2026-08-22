@@ -2,14 +2,18 @@
 
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    ffi::OsStr,
+    fmt,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::Command,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use cap_std::{ambient_authority, fs::Dir};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions, OpenOptionsExt},
+};
 use serde::{Deserialize, Serialize};
 
 const MAX_VISIBLE_TOKENS: usize = 10_000;
@@ -107,6 +111,38 @@ pub enum AgentRole {
     Coordinator,
 }
 
+/// A role attempted to invoke a tool outside its fixed capability set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolAccessError {
+    role: AgentRole,
+    tool: Tool,
+}
+
+impl ToolAccessError {
+    /// Returns the denied role.
+    pub const fn role(self) -> AgentRole {
+        self.role
+    }
+
+    /// Returns the denied tool.
+    pub const fn tool(self) -> Tool {
+        self.tool
+    }
+}
+
+impl fmt::Display for ToolAccessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "role {:?} may not invoke {}",
+            self.role,
+            self.tool.name()
+        )
+    }
+}
+
+impl std::error::Error for ToolAccessError {}
+
 /// A request for one fixed tool operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolRequest {
@@ -163,13 +199,14 @@ pub struct ToolResult {
 /// Holds a bounded workspace capability and invocation-local artifacts.
 pub struct ToolExecutor {
     root: PathBuf,
-    _capability_root: Dir,
+    capability_root: Dir,
+    role: AgentRole,
     artifacts: ArtifactStore,
 }
 
 impl ToolExecutor {
     /// Opens a candidate workspace once and keeps that capability for the invocation.
-    pub fn new(candidate_workspace: &Path) -> Result<Self> {
+    pub fn new(candidate_workspace: &Path, role: AgentRole) -> Result<Self> {
         let root = candidate_workspace.canonicalize().with_context(|| {
             format!(
                 "failed to resolve candidate workspace {}",
@@ -181,13 +218,15 @@ impl ToolExecutor {
             .context("failed to open candidate workspace capability")?;
         Ok(Self {
             root,
-            _capability_root: capability_root,
+            capability_root,
+            role,
             artifacts: ArtifactStore::default(),
         })
     }
 
     /// Executes one non-shell fixed tool request.
     pub fn execute(&mut self, request: ToolRequest) -> Result<ToolResult> {
+        self.require_tool(request.tool())?;
         self.artifacts.note_call()?;
         let bytes = match request {
             ToolRequest::ReadFile { path } | ToolRequest::Import { path } => {
@@ -231,17 +270,20 @@ impl ToolExecutor {
     }
 
     fn read_file(&self, relative: &Path) -> Result<Vec<u8>> {
-        let path = self.safe_existing_file(relative)?;
+        let (parent, leaf) = self.open_parent(relative, false)?;
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW);
         }
-        let mut file = options
-            .open(&path)
+        let mut file = parent
+            .open_with(&leaf, &options)
             .with_context(|| format!("failed to read {}", relative.display()))?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "tool input must be a regular file"
+        );
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         Ok(bytes)
@@ -253,9 +295,8 @@ impl ToolExecutor {
             contents.len() as u64 <= MAX_RESULT_BYTES,
             "candidate content exceeds 100 MiB"
         );
-        let path = self.root.join(relative);
-        validate_parents(&self.root, relative, true)?;
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
+        let (parent, leaf) = self.open_parent(relative, true)?;
+        if let Ok(metadata) = parent.symlink_metadata(&leaf) {
             ensure!(
                 metadata.file_type().is_file(),
                 "candidate target is not a regular file"
@@ -269,49 +310,31 @@ impl ToolExecutor {
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW);
         }
-        let mut file = options
-            .open(&path)
+        let mut file = parent
+            .open_with(&leaf, &options)
             .with_context(|| format!("failed to open candidate {}", relative.display()))?;
         file.write_all(contents)?;
         file.sync_data()?;
         Ok(())
     }
 
-    fn safe_existing_file(&self, relative: &Path) -> Result<PathBuf> {
-        validate_relative(relative)?;
-        validate_parents(&self.root, relative, false)?;
-        let path = self.root.join(relative);
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", relative.display()))?;
-        ensure!(
-            metadata.file_type().is_file(),
-            "tool input must be a regular file"
-        );
-        ensure!(
-            !metadata.file_type().is_symlink(),
-            "tool input must not be a symlink"
-        );
-        Ok(path)
-    }
-
     fn search_files(&self, query: &str) -> Result<String> {
         ensure!(!query.is_empty(), "search query must not be empty");
         let mut matches = Vec::new();
-        self.search_directory(&self.root, Path::new(""), query, &mut matches)?;
+        self.search_directory(&self.capability_root, Path::new(""), query, &mut matches)?;
         Ok(matches.join("\n"))
     }
 
     fn search_directory(
         &self,
-        directory: &Path,
+        directory: &Dir,
         relative: &Path,
         query: &str,
         matches: &mut Vec<String>,
     ) -> Result<()> {
-        for entry in fs::read_dir(directory)? {
+        for entry in directory.read_dir(".")? {
             let entry = entry?;
             let file_type = entry.file_type()?;
             let name = entry.file_name();
@@ -320,7 +343,8 @@ impl ToolExecutor {
                 continue;
             }
             if file_type.is_dir() {
-                self.search_directory(&entry.path(), &child_relative, query, matches)?;
+                let child = open_dir_no_follow(directory, &name)?;
+                self.search_directory(&child, &child_relative, query, matches)?;
             } else if file_type.is_file() {
                 let bytes = self.read_file(&child_relative)?;
                 if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -352,6 +376,42 @@ impl ToolExecutor {
             .context("failed to execute read-only git")?;
         ensure!(output.status.success(), "read-only git query failed");
         Ok(output.stdout)
+    }
+
+    fn require_tool(&self, tool: Tool) -> Result<()> {
+        if Tool::for_role(self.role).contains(&tool) {
+            Ok(())
+        } else {
+            Err(ToolAccessError {
+                role: self.role,
+                tool,
+            }
+            .into())
+        }
+    }
+
+    fn open_parent(&self, relative: &Path, create_missing: bool) -> Result<(Dir, PathBuf)> {
+        validate_relative(relative)?;
+        let mut directory = self.capability_root.try_clone()?;
+        let mut components = relative.components().peekable();
+        let leaf = loop {
+            let Component::Normal(component) = components.next().expect("validated non-empty path")
+            else {
+                unreachable!("validate_relative rejects non-normal components");
+            };
+            if components.peek().is_none() {
+                break PathBuf::from(component);
+            }
+            directory = match open_dir_no_follow(&directory, component) {
+                Ok(child) => child,
+                Err(error) if create_missing && error.kind() == std::io::ErrorKind::NotFound => {
+                    directory.create_dir(component)?;
+                    open_dir_no_follow(&directory, component)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+        };
+        Ok((directory, leaf))
     }
 }
 
@@ -481,29 +541,16 @@ fn validate_relative(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_parents(root: &Path, relative: &Path, create_missing: bool) -> Result<()> {
-    let mut current = root.to_path_buf();
-    for component in relative
-        .components()
-        .take(relative.components().count().saturating_sub(1))
-    {
-        let Component::Normal(name) = component else {
-            bail!("unsafe tool path: {}", relative.display());
-        };
-        current.push(name);
-        if current.exists() {
-            let metadata = fs::symlink_metadata(&current)?;
-            ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "tool path has a symlink or non-directory parent"
-            );
-        } else if create_missing {
-            fs::create_dir(&current)?;
-        } else {
-            bail!("tool path parent does not exist");
-        }
+fn open_dir_no_follow(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let file = parent.open_with(Path::new(name), &options)?;
+    if !file.metadata()?.is_dir() {
+        return Err(std::io::Error::other("tool path parent is not a directory"));
     }
-    Ok(())
+    Ok(Dir::from_std_file(file.into_std()))
 }
 
 fn is_forbidden_component(component: &std::ffi::OsStr) -> bool {

@@ -1,12 +1,14 @@
 use std::{
     fs,
+    os::unix::fs::symlink,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use phemius::{
     sandbox::{ApprovalMode, ChoiceReason, SandboxMode, ShellError, ShellRequest, run_shell},
     skills::{SkillCatalog, load_hierarchical_instructions},
-    tools::{AgentRole, Tool, ToolExecutor, ToolRequest},
+    tools::{AgentRole, Tool, ToolAccessError, ToolExecutor, ToolRequest},
 };
 use rstest::rstest;
 
@@ -38,12 +40,15 @@ fn startup_skill_discovery_reads_metadata_but_not_body_or_references() {
     let fixture = SkillFixture::new();
     let catalog = SkillCatalog::discover(fixture.roots()).unwrap();
     assert_eq!(catalog.get("voice").unwrap().description, "Voice rules");
+    assert_eq!(catalog.body_load_count(), 0);
     assert!(catalog.load("voice").is_err());
+    assert_eq!(catalog.body_load_count(), 1);
 }
 
 #[tokio::test]
 async fn child_environment_never_contains_openrouter_key() {
     let outcome = run_shell(
+        AgentRole::Author,
         ShellRequest::program("/usr/bin/env")
             .with_approval(ApprovalMode::Never)
             .with_sandbox(SandboxMode::None)
@@ -57,6 +62,7 @@ async fn child_environment_never_contains_openrouter_key() {
 #[tokio::test]
 async fn seatbelt_request_runs_with_the_same_cleared_environment() {
     let outcome = run_shell(
+        AgentRole::Author,
         ShellRequest::program("/usr/bin/env")
             .with_approval(ApprovalMode::Never)
             .with_sandbox(SandboxMode::Seatbelt),
@@ -69,7 +75,7 @@ async fn seatbelt_request_runs_with_the_same_cleared_environment() {
 
 #[tokio::test]
 async fn default_shell_request_returns_a_typed_approval_choice() {
-    let error = run_shell(ShellRequest::program("/usr/bin/env"))
+    let error = run_shell(AgentRole::Author, ShellRequest::program("/usr/bin/env"))
         .await
         .unwrap_err();
     assert!(matches!(
@@ -84,7 +90,7 @@ async fn default_shell_request_returns_a_typed_approval_choice() {
 #[rstest]
 fn capability_file_tools_reject_workspace_escapes() {
     let root = TestDirectory::new("tool-root");
-    let mut tools = ToolExecutor::new(root.path()).unwrap();
+    let mut tools = ToolExecutor::new(root.path(), AgentRole::Author).unwrap();
     for path in [
         PathBuf::from(".git/config"),
         PathBuf::from("../outside"),
@@ -99,6 +105,114 @@ fn capability_file_tools_reject_workspace_escapes() {
                 .is_err()
         );
     }
+}
+
+#[rstest]
+fn critic_directly_cannot_mutate_candidates() {
+    let root = TestDirectory::new("critic-tools");
+    let mut tools = ToolExecutor::new(root.path(), AgentRole::ConsistencyCritic).unwrap();
+    let error = tools
+        .execute(ToolRequest::EditCandidate {
+            path: PathBuf::from("draft.md"),
+            contents: b"forbidden".to_vec(),
+        })
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ToolAccessError>().unwrap().tool(),
+        Tool::EditCandidate
+    );
+    assert!(!root.path().join("draft.md").exists());
+}
+
+#[tokio::test]
+async fn critic_directly_cannot_launch_a_shell() {
+    let error = run_shell(
+        AgentRole::ConsistencyCritic,
+        ShellRequest::program("/usr/bin/env")
+            .with_approval(ApprovalMode::Never)
+            .with_sandbox(SandboxMode::None)
+            .trusted_unrestricted(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ShellError::ToolDenied { .. }));
+}
+
+#[tokio::test]
+async fn allowlist_cannot_request_an_unrestricted_shell() {
+    let error = run_shell(
+        AgentRole::Author,
+        ShellRequest::program("/usr/bin/env")
+            .with_approval(ApprovalMode::Allowlist)
+            .allow_executable("/usr/bin/env")
+            .with_sandbox(SandboxMode::None)
+            .trusted_unrestricted(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ShellError::ChoiceRequired {
+            reason: ChoiceReason::UntrustedUnrestricted,
+            ..
+        }
+    ));
+}
+
+#[rstest]
+fn pinned_capability_rejects_a_parent_symlink_swap() {
+    let root = TestDirectory::new("pinned-capability");
+    let outside = TestDirectory::new("outside");
+    fs::create_dir(root.path().join("safe")).unwrap();
+    fs::write(root.path().join("safe/input.txt"), "inside").unwrap();
+    fs::write(outside.path().join("input.txt"), "outside").unwrap();
+    let mut tools = ToolExecutor::new(root.path(), AgentRole::Author).unwrap();
+    fs::remove_dir_all(root.path().join("safe")).unwrap();
+    symlink(outside.path(), root.path().join("safe")).unwrap();
+    assert!(
+        tools
+            .execute(ToolRequest::ReadFile {
+                path: PathBuf::from("safe/input.txt"),
+            })
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_shell_execution_terminates_its_process_group() {
+    let root = TestDirectory::new("cancel-shell");
+    let pid_path = root.path().join("child.pid");
+    let command = format!("echo $$ > {}; sleep 30", pid_path.display());
+    let handle = tokio::spawn(run_shell(
+        AgentRole::Author,
+        ShellRequest::shell(command)
+            .in_workspace(root.path())
+            .with_approval(ApprovalMode::Never)
+            .with_sandbox(SandboxMode::None)
+            .trusted_unrestricted()
+            .with_time_limit(Duration::from_secs(60)),
+    ));
+    for _ in 0..50 {
+        if pid_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pid: i32 = fs::read_to_string(&pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    handle.abort();
+    let _ = handle.await;
+    for _ in 0..50 {
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        if !alive {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("cancelled child process group remained alive");
 }
 
 #[rstest]
