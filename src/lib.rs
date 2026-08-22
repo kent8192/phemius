@@ -22,6 +22,8 @@ pub mod openrouter;
 pub mod plot;
 /// Parses project artifacts and initializes the canonical project tree.
 pub mod project;
+/// Provides the human-facing, in-memory REPL authority boundary.
+pub mod repl;
 /// Runs explicitly approved, fail-closed sandboxed shell commands.
 pub mod sandbox;
 /// Persists append-only session evidence and derived checkpoints.
@@ -32,3 +34,5 @@ pub mod skills;
 pub mod sources;
 /// Defines the fixed, bounded tool catalog and capability-root file access.
 pub mod tools;
+/// Coordinates reviewed chapter generation, findings, corrections, and continuous runs.
+pub mod workflow;

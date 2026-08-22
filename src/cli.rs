@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::project::{InitAnswers, initialize_project};
+use crate::repl::{Repl, ReplOutcome};
 
 #[derive(Parser, Debug)]
 #[command(name = "phemius", version)]
@@ -146,12 +147,25 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 pub async fn run_with_input(cli: Cli, input: &mut impl BufRead) -> Result<()> {
-    if let Some(TopLevelCommand::Init { path }) = cli.command {
+    if let Some(TopLevelCommand::Init { path }) = &cli.command {
         let mut title = String::new();
         input
             .read_line(&mut title)
             .context("failed to read project title")?;
-        initialize_project(&path, &InitAnswers::minimal(title.trim()))?;
+        initialize_project(path, &InitAnswers::minimal(title.trim()))?;
+    } else if cli.command.is_none() {
+        let mut repl = Repl::new();
+        for line in input.lines() {
+            let line = line.context("failed to read REPL input")?;
+            match repl.handle_async(&line).await? {
+                ReplOutcome::Quit => break,
+                ReplOutcome::Continue => {}
+                ReplOutcome::Message(message)
+                | ReplOutcome::AgentText(message)
+                | ReplOutcome::AwaitingConfirmation(message)
+                | ReplOutcome::Error(message) => println!("{message}"),
+            }
+        }
     }
     Ok(())
 }
