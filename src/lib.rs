@@ -14,6 +14,10 @@ pub mod cost;
 pub mod domain;
 /// Records append-only durable runtime evidence.
 pub mod journal;
+/// Defines concrete model backends and validates returned tool calls.
+pub mod model;
+/// Streams strict OpenRouter chat completions without fallback or retry.
+pub mod openrouter;
 /// Validates the part, chapter, scene, and box story hierarchy.
 pub mod plot;
 /// Parses project artifacts and initializes the canonical project tree.
