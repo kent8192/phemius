@@ -334,7 +334,7 @@ impl Drop for StagingDirectory {
     }
 }
 
-fn rename_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
     let from = CString::new(from.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
     let to = CString::new(to.as_os_str().as_bytes())
