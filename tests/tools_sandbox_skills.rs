@@ -108,6 +108,23 @@ fn capability_file_tools_reject_workspace_escapes() {
 }
 
 #[rstest]
+fn oversized_file_tool_input_stops_before_artifact_retention() {
+    let root = TestDirectory::new("oversized-tool-input");
+    let path = root.path().join("oversized.bin");
+    fs::File::create(&path)
+        .unwrap()
+        .set_len(100 * 1024 * 1024 + 1)
+        .unwrap();
+    let mut tools = ToolExecutor::new(root.path(), AgentRole::Author).unwrap();
+    let error = tools
+        .execute(ToolRequest::ReadFile {
+            path: PathBuf::from("oversized.bin"),
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("tool input exceeds 100 MiB"));
+}
+
+#[rstest]
 fn critic_directly_cannot_mutate_candidates() {
     let root = TestDirectory::new("critic-tools");
     let mut tools = ToolExecutor::new(root.path(), AgentRole::ConsistencyCritic).unwrap();

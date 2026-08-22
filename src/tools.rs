@@ -6,7 +6,12 @@ use std::{
     fmt,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -20,6 +25,7 @@ const MAX_VISIBLE_TOKENS: usize = 10_000;
 const MAX_RESULT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_CALLS: u64 = 64;
+const MAX_GIT_STDERR_BYTES: u64 = 64 * 1024;
 
 /// A fixed tool name. The declaration order is part of the model protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -284,9 +290,7 @@ impl ToolExecutor {
             file.metadata()?.is_file(),
             "tool input must be a regular file"
         );
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        read_bounded(&mut file, MAX_RESULT_BYTES, "tool input")
     }
 
     fn write_candidate(&self, relative: &Path, contents: &[u8]) -> Result<()> {
@@ -322,9 +326,9 @@ impl ToolExecutor {
 
     fn search_files(&self, query: &str) -> Result<String> {
         ensure!(!query.is_empty(), "search query must not be empty");
-        let mut matches = Vec::new();
-        self.search_directory(&self.capability_root, Path::new(""), query, &mut matches)?;
-        Ok(matches.join("\n"))
+        let mut output = String::new();
+        self.search_directory(&self.capability_root, Path::new(""), query, &mut output)?;
+        Ok(output)
     }
 
     fn search_directory(
@@ -332,7 +336,7 @@ impl ToolExecutor {
         directory: &Dir,
         relative: &Path,
         query: &str,
-        matches: &mut Vec<String>,
+        output: &mut String,
     ) -> Result<()> {
         for entry in directory.read_dir(".")? {
             let entry = entry?;
@@ -344,18 +348,19 @@ impl ToolExecutor {
             }
             if file_type.is_dir() {
                 let child = open_dir_no_follow(directory, &name)?;
-                self.search_directory(&child, &child_relative, query, matches)?;
+                self.search_directory(&child, &child_relative, query, output)?;
             } else if file_type.is_file() {
                 let bytes = self.read_file(&child_relative)?;
                 if let Ok(text) = std::str::from_utf8(&bytes) {
                     for (line_number, line) in text.lines().enumerate() {
                         if line.contains(query) {
-                            matches.push(format!(
+                            let record = format!(
                                 "{}:{}:{}",
                                 child_relative.display(),
                                 line_number + 1,
                                 line
-                            ));
+                            );
+                            append_search_result(output, &record, MAX_RESULT_BYTES as usize)?;
                         }
                     }
                 }
@@ -365,17 +370,48 @@ impl ToolExecutor {
     }
 
     fn git<const N: usize>(&self, args: [&str; N]) -> Result<Vec<u8>> {
-        let output = Command::new("/usr/bin/git")
+        let mut child = Command::new("/usr/bin/git")
             .arg("-C")
             .arg(&self.root)
             .args(args)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("LC_ALL", "C")
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .context("failed to execute read-only git")?;
-        ensure!(output.status.success(), "read-only git query failed");
-        Ok(output.stdout)
+        let pid = child.id();
+        let overflow = Arc::new(AtomicBool::new(false));
+        let stdout = child.stdout.take().context("git stdout was not captured")?;
+        let stderr = child.stderr.take().context("git stderr was not captured")?;
+        let stdout_handle = bounded_git_reader(
+            stdout,
+            MAX_RESULT_BYTES,
+            "git stdout",
+            pid,
+            overflow.clone(),
+        );
+        let stderr_handle = bounded_git_reader(
+            stderr,
+            MAX_GIT_STDERR_BYTES,
+            "git stderr",
+            pid,
+            overflow.clone(),
+        );
+        let status = child.wait().context("failed to wait for read-only git")?;
+        let stdout = stdout_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("git stdout reader panicked"))??;
+        let _stderr = stderr_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("git stderr reader panicked"))??;
+        ensure!(
+            !overflow.load(Ordering::Acquire),
+            "git output exceeds its configured bound"
+        );
+        ensure!(status.success(), "read-only git query failed");
+        Ok(stdout)
     }
 
     fn require_tool(&self, tool: Tool) -> Result<()> {
@@ -553,6 +589,88 @@ fn open_dir_no_follow(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
     Ok(Dir::from_std_file(file.into_std()))
 }
 
+fn read_bounded(reader: &mut impl Read, limit: u64, label: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {label}"))?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        let next = bytes
+            .len()
+            .checked_add(read)
+            .context("bounded read length overflow")?;
+        ensure!(next as u64 <= limit, "{label} exceeds 100 MiB");
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+}
+
+fn append_search_result(output: &mut String, record: &str, limit: usize) -> Result<()> {
+    let separator = usize::from(!output.is_empty());
+    ensure!(
+        output
+            .len()
+            .saturating_add(separator)
+            .saturating_add(record.len())
+            <= limit,
+        "search result exceeds 100 MiB"
+    );
+    if separator == 1 {
+        output.push('\n');
+    }
+    output.push_str(record);
+    Ok(())
+}
+
+fn bounded_git_reader<R>(
+    mut reader: R,
+    limit: u64,
+    label: &'static str,
+    pid: u32,
+    overflow: Arc<AtomicBool>,
+) -> thread::JoinHandle<Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let result = read_bounded(&mut reader, limit, label);
+        if result.is_err() && !overflow.swap(true, Ordering::AcqRel) {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+        result
+    })
+}
+
 fn is_forbidden_component(component: &std::ffi::OsStr) -> bool {
     component == ".git"
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use rstest::rstest;
+
+    use super::{append_search_result, read_bounded};
+
+    #[rstest]
+    fn bounded_reader_rejects_the_first_byte_after_its_limit() {
+        let mut input = Cursor::new(b"12345".to_vec());
+        let error = read_bounded(&mut input, 4, "tool input").unwrap_err();
+        assert_eq!(error.to_string(), "tool input exceeds 100 MiB");
+    }
+
+    #[rstest]
+    fn search_result_limit_rejects_before_appending() {
+        let mut output = String::from("1234");
+        let error = append_search_result(&mut output, "5", 4).unwrap_err();
+        assert_eq!(error.to_string(), "search result exceeds 100 MiB");
+        assert_eq!(output, "1234");
+    }
 }
