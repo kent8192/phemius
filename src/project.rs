@@ -227,13 +227,20 @@ impl StagingDirectory {
             "refusing to overwrite non-empty project directory: {}",
             root.display()
         );
-        let parent = root
+        let staging_root = if root.exists() {
+            fs::canonicalize(root).with_context(|| {
+                format!("failed to canonicalize project root {}", root.display())
+            })?
+        } else {
+            root.to_path_buf()
+        };
+        let parent = staging_root
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create project parent {}", parent.display()))?;
-        let name = root
+        let name = staging_root
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("phemius");
@@ -249,12 +256,65 @@ impl StagingDirectory {
 
     fn persist(self, root: &Path) -> Result<()> {
         if root.exists() {
-            fs::remove_dir(root).with_context(|| {
-                format!("failed to remove empty project root {}", root.display())
-            })?;
+            return self.move_contents_into(root);
         }
         fs::rename(&self.path, root)
             .with_context(|| format!("failed to finalize project root {}", root.display()))
+    }
+
+    fn move_contents_into(&self, root: &Path) -> Result<()> {
+        let entries = fs::read_dir(&self.path)
+            .with_context(|| format!("failed to read staging directory {}", self.path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| {
+                format!(
+                    "failed to enumerate staging directory {}",
+                    self.path.display()
+                )
+            })?;
+        let mut moved = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let target = root.join(entry.file_name());
+            if let Err(error) = fs::rename(entry.path(), &target) {
+                return match self.rollback(&moved) {
+                    Ok(()) => Err(error).with_context(|| {
+                        format!(
+                            "failed to initialize existing project root {}",
+                            root.display()
+                        )
+                    }),
+                    Err(rollback) => Err(rollback).context(format!(
+                        "failed to initialize existing project root {} after move error: {error}",
+                        root.display()
+                    )),
+                };
+            }
+            moved.push(target);
+        }
+        fs::remove_dir(&self.path).with_context(|| {
+            format!(
+                "failed to remove empty staging directory {}",
+                self.path.display()
+            )
+        })
+    }
+
+    fn rollback(&self, moved: &[PathBuf]) -> Result<()> {
+        let mut failure = None;
+        for target in moved.iter().rev() {
+            let source = self
+                .path
+                .join(target.file_name().expect("moved path has a file name"));
+            if let Err(error) = fs::rename(target, source) {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error).context("failed to roll back project initialization");
+        }
+        Ok(())
     }
 }
 

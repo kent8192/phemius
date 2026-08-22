@@ -1,4 +1,9 @@
-use std::{fs, io::Cursor, path::PathBuf};
+use std::{
+    fs,
+    io::{Cursor, Write},
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 use clap::Parser;
 use phemius::{
@@ -120,4 +125,52 @@ async fn init_rejects_an_empty_title_without_creating_a_project() {
 
     assert!(run_with_input(cli, &mut Cursor::new(" \n")).await.is_err());
     assert!(!root.exists());
+}
+
+#[test]
+fn binary_initializes_the_current_directory_without_replacing_it() {
+    let root = TestDir::new("current-directory");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_phemius"))
+        .args(["init", "."])
+        .current_dir(root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all("作品名\n".as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.path().join("project.toml").is_file());
+    assert!(root.path().join("前提/作品.md").is_file());
+}
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("phemius-{label}-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).unwrap();
+    }
 }
