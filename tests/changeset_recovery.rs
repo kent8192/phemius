@@ -927,6 +927,35 @@ fn apply_keeps_using_the_pinned_root_after_the_project_path_is_swapped() {
     assert!(fixture.transaction_path().is_dir());
 }
 
+#[test]
+fn externally_deleted_old_files_are_not_recreated_by_apply_or_recovery() {
+    for (hook, target) in [
+        (
+            delete_replace_after_prepared as fn(&Project),
+            "本文/replace.md",
+        ),
+        (delete_delete_after_prepared, "本文/delete.md"),
+    ] {
+        let fixture = ApplyFixture::new();
+        let target = fixture.root.join(target);
+
+        assert!(apply_changeset_with_test_hook(&fixture.project, &fixture.change, hook).is_err());
+        assert!(!target.exists());
+        assert!(
+            fixture
+                .transaction_path()
+                .join("journal.prepared.json")
+                .is_file()
+        );
+        let observed_partial_state = fixture.read_canon();
+
+        assert!(recover_pending(&fixture.root).is_err());
+        assert!(!target.exists());
+        assert_eq!(fixture.read_canon(), observed_partial_state);
+        assert!(fixture.transaction_path().is_dir());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn recovery_keeps_using_the_pinned_root_after_the_project_path_is_swapped() {
@@ -1325,6 +1354,14 @@ fn approval_validation_hash(record: &ApprovalRecord) -> String {
         })
         .unwrap(),
     )
+}
+
+fn delete_replace_after_prepared(project: &Project) {
+    fs::remove_file(project.root.join("本文/replace.md")).unwrap();
+}
+
+fn delete_delete_after_prepared(project: &Project) {
+    fs::remove_file(project.root.join("本文/delete.md")).unwrap();
 }
 
 #[cfg(unix)]

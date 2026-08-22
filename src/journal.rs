@@ -784,16 +784,10 @@ fn restore_before(
     interruption: Option<TestRecoveryInterruption>,
     quarantined: &mut usize,
 ) -> Result<()> {
-    match maybe_hash(target)? {
+    let current = maybe_hash(target)?;
+    match current.as_deref() {
         Some(actual) if actual == before => return Ok(()),
-        Some(actual) if after == Some(actual.as_str()) => quarantine_created(
-            target,
-            &transaction.dir,
-            OsStr::new(&format!("quarantine-{index:04}")),
-            &actual,
-            interruption,
-            quarantined,
-        )?,
+        Some(actual) if after == Some(actual) => {}
         Some(_) => {
             bail!(
                 "refusing to overwrite externally changed target {}",
@@ -805,33 +799,35 @@ fn restore_before(
 
     let old = OsString::from(format!("old-live-{index:04}"));
     let restore = OsString::from(format!("restore-{index:04}"));
-    let source = if exists_at(&transaction.dir, &old)? {
-        ensure_hash_at(
+    let old_exists = exists_at(&transaction.dir, &old)?;
+    let restore_exists = exists_at(&transaction.dir, &restore)?;
+    ensure!(
+        old_exists || restore_exists,
+        "refusing to restore {} without Phemius-owned move evidence",
+        target.display.display()
+    );
+    ensure!(
+        !(old_exists && restore_exists),
+        "ambiguous restore evidence for {}",
+        target.display.display()
+    );
+    let source = if old_exists { &old } else { &restore };
+    ensure_hash_at(
+        &transaction.dir,
+        source,
+        Some(before),
+        "owned restore evidence changed",
+    )?;
+    if let Some(actual) = current {
+        quarantine_created(
+            target,
             &transaction.dir,
-            &old,
-            Some(before),
-            "preserved canon changed",
+            OsStr::new(&format!("quarantine-{index:04}")),
+            &actual,
+            interruption,
+            quarantined,
         )?;
-        &old
-    } else {
-        if !exists_at(&transaction.dir, &restore)? {
-            let before_bytes =
-                read_regular_at(&transaction.dir, OsStr::new(&format!("before-{index:04}")))?;
-            ensure!(
-                sha256_bytes(&before_bytes) == before,
-                "before image changed"
-            );
-            write_new_synced(&transaction.dir, &restore, &before_bytes)?;
-            sync_dir(&transaction.dir)?;
-        }
-        ensure_hash_at(
-            &transaction.dir,
-            &restore,
-            Some(before),
-            "restore image changed",
-        )?;
-        &restore
-    };
+    }
     rename_no_replace(&transaction.dir, source, &target.parent, &target.leaf)
         .with_context(|| format!("failed to restore {}", target.display.display()))?;
     sync_dir(&transaction.dir)?;
