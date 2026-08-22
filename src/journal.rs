@@ -108,6 +108,16 @@ impl ManualResolutionRequired {
         }
     }
 
+    fn committed_approval(changeset_id: &str, source: anyhow::Error) -> Self {
+        Self {
+            changeset_id: changeset_id.to_owned(),
+            evidence_path: Some(
+                PathBuf::from(".phemius/records/approvals").join(format!("{changeset_id}.json")),
+            ),
+            source: Some(source),
+        }
+    }
+
     fn approval_evidence(error: ValidationError) -> Self {
         let changeset_id = error
             .approval_evidence_id()
@@ -471,7 +481,7 @@ fn recover_pending_locked(root: &Dir, runtime: &Dir) -> Result<RecoveryOutcome> 
     for transaction in &transactions {
         if transaction.journal.state == JournalState::Committed {
             if let Err(error) = verify_committed_approval(transaction) {
-                return Err(ManualResolutionRequired::after_error(
+                return Err(ManualResolutionRequired::committed_approval(
                     &transaction.journal.changeset_id,
                     error,
                 )
@@ -819,7 +829,6 @@ pub(crate) fn validate_committed_receipt_in(
 }
 
 fn verify_current_committed_head(root: &Dir, transactions: &[Transaction]) -> Result<()> {
-    require_retained_receipts_for_approval_files(root, transactions)?;
     let head = match approval_chain_head_in(root) {
         Ok(head) => head,
         Err(error) => return Err(ManualResolutionRequired::approval_evidence(error).into()),
@@ -831,10 +840,14 @@ fn verify_current_committed_head(root: &Dir, transactions: &[Transaction]) -> Re
         transaction.journal.state == JournalState::Committed
             && transaction.journal.changeset_id == head_id.as_str()
     }) else {
-        return Err(anyhow!(
-            "approval chain head {} has no retained committed receipt",
-            head_id.as_str()
-        ));
+        return Err(ManualResolutionRequired::committed_approval(
+            head_id.as_str(),
+            anyhow!(
+                "approval chain head {} has no retained committed receipt",
+                head_id.as_str()
+            ),
+        )
+        .into());
     };
     ensure!(
         head.journal.chapter_order == head_order,
@@ -844,46 +857,6 @@ fn verify_current_committed_head(root: &Dir, transactions: &[Transaction]) -> Re
         canon_root_hash_in(root)? == head.journal.result_root_hash,
         "current committed canon root changed"
     );
-    Ok(())
-}
-
-fn require_retained_receipts_for_approval_files(
-    root: &Dir,
-    transactions: &[Transaction],
-) -> Result<()> {
-    let Some(directory) = approval_directory(root, false)? else {
-        return Ok(());
-    };
-    for entry in directory
-        .entries()
-        .context("failed to enumerate approval records")?
-    {
-        let entry = entry.context("failed to read approval record entry")?;
-        if !entry
-            .file_type()
-            .context("failed to inspect approval record")?
-            .is_file()
-        {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
-            continue;
-        };
-        if !is_prefixed_uuid(id, EntityKind::Changeset) {
-            continue;
-        }
-        if !transactions.iter().any(|transaction| {
-            transaction.journal.state == JournalState::Committed
-                && transaction.journal.changeset_id == id
-        }) {
-            return Err(ManualResolutionRequired::after_error(
-                id,
-                anyhow!("approval record has no retained committed receipt"),
-            )
-            .into());
-        }
-    }
     Ok(())
 }
 

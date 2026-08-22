@@ -278,7 +278,11 @@ fn unexpected_approval_evidence_is_a_typed_manual_conflict() {
     let manual = error
         .downcast_ref::<ManualResolutionRequired>()
         .expect("approval evidence conflict must require manual resolution");
-    assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+    assert_eq!(manual.changeset_id(), "unknown-approval-evidence");
+    assert_eq!(
+        manual.evidence_path(),
+        Some(Path::new(".phemius/records/approvals/wrong-name.json"))
+    );
     assert!(
         std::error::Error::source(manual)
             .unwrap()
@@ -289,16 +293,17 @@ fn unexpected_approval_evidence_is_a_typed_manual_conflict() {
     assert_eq!(fs::read(&unexpected).unwrap(), approval_bytes);
 
     let followup = fixture.followup_change("unexpected-approval-evidence");
-    assert_manual_resolution(
-        apply_changeset(&fixture.project, &followup).unwrap_err(),
-        &fixture.change,
-    );
+    let error = apply_changeset(&fixture.project, &followup).unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("approval evidence conflict must block the next apply");
+    assert_eq!(manual.changeset_id(), "unknown-approval-evidence");
     assert_eq!(fixture.read_canon(), observed);
     assert!(unexpected.is_file());
 }
 
 #[test]
-fn approval_conflict_identifies_offending_record_not_latest_head() {
+fn approval_conflict_identifies_offending_path_not_unvalidated_body_or_latest_head() {
     let fixture = ApplyFixture::new();
     apply_changeset(&fixture.project, &fixture.change).unwrap();
     let second = fixture.followup_change("second-approved-chapter");
@@ -316,7 +321,8 @@ fn approval_conflict_identifies_offending_record_not_latest_head() {
     let manual = error
         .downcast_ref::<ManualResolutionRequired>()
         .expect("approval evidence conflict must require manual resolution");
-    assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+    assert_eq!(manual.changeset_id(), "unknown-approval-evidence");
+    assert_ne!(manual.changeset_id(), fixture.change.id.as_str());
     assert_ne!(manual.changeset_id(), second.id.as_str());
     assert_eq!(
         manual.evidence_path(),
@@ -325,6 +331,105 @@ fn approval_conflict_identifies_offending_record_not_latest_head() {
     assert_eq!(fixture.read_canon(), observed);
     assert_eq!(canon_root_hash(&fixture.project).unwrap(), observed_root);
     assert!(unexpected.is_file());
+}
+
+#[test]
+fn malformed_valid_named_approval_is_reported_before_missing_receipt() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    let invalid_id = prefixed_uuid(EntityKind::Changeset);
+    let relative =
+        PathBuf::from(".phemius/records/approvals").join(format!("{}.json", invalid_id.as_str()));
+    let approval = fixture.root.join(&relative);
+    fs::write(&approval, b"not json").unwrap();
+    let observed_root = canon_root_hash(&fixture.project).unwrap();
+
+    let error = recover_pending(&fixture.root).unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("malformed approval evidence must require manual resolution");
+    assert_eq!(manual.changeset_id(), invalid_id.as_str());
+    assert_eq!(manual.evidence_path(), Some(relative.as_path()));
+    let source = std::error::Error::source(manual).unwrap().to_string();
+    assert!(source.contains("invalid approval record"));
+    assert!(!source.contains("no retained committed receipt"));
+    assert_eq!(canon_root_hash(&fixture.project).unwrap(), observed_root);
+    assert_eq!(fs::read(approval).unwrap(), b"not json");
+}
+
+#[test]
+fn traversal_approval_body_id_is_never_exposed() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    let filename_id = prefixed_uuid(EntityKind::Changeset);
+    let relative =
+        PathBuf::from(".phemius/records/approvals").join(format!("{}.json", filename_id.as_str()));
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.approval_path()).unwrap()).unwrap();
+    record["changeset_id"] = serde_json::Value::String("../../evil".into());
+    fs::write(
+        fixture.root.join(&relative),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    let observed_root = canon_root_hash(&fixture.project).unwrap();
+
+    let error = recover_pending(&fixture.root).unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("mismatched approval evidence must require manual resolution");
+    assert_eq!(manual.changeset_id(), filename_id.as_str());
+    assert_eq!(manual.evidence_path(), Some(relative.as_path()));
+    assert!(!manual.to_string().contains("../../evil"));
+    assert_eq!(canon_root_hash(&fixture.project).unwrap(), observed_root);
+}
+
+#[test]
+fn mismatched_valid_approval_body_uses_the_validated_filename_id() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    let filename_id = prefixed_uuid(EntityKind::Changeset);
+    let relative =
+        PathBuf::from(".phemius/records/approvals").join(format!("{}.json", filename_id.as_str()));
+    fs::copy(fixture.approval_path(), fixture.root.join(&relative)).unwrap();
+    let observed_root = canon_root_hash(&fixture.project).unwrap();
+
+    let error = recover_pending(&fixture.root).unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("mismatched approval evidence must require manual resolution");
+    assert_eq!(manual.changeset_id(), filename_id.as_str());
+    assert_ne!(manual.changeset_id(), fixture.change.id.as_str());
+    assert_eq!(manual.evidence_path(), Some(relative.as_path()));
+    assert_eq!(canon_root_hash(&fixture.project).unwrap(), observed_root);
+}
+
+#[test]
+fn corrupt_canonical_approval_reports_its_validated_receipt_path() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    fs::write(fixture.approval_path(), b"corrupt canonical approval").unwrap();
+    let observed_root = canon_root_hash(&fixture.project).unwrap();
+    let relative = PathBuf::from(".phemius/records/approvals")
+        .join(format!("{}.json", fixture.change.id.as_str()));
+
+    let error = recover_pending(&fixture.root).unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("committed approval mismatch must require manual resolution");
+    assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+    assert_eq!(manual.evidence_path(), Some(relative.as_path()));
+    assert!(
+        std::error::Error::source(manual)
+            .unwrap()
+            .to_string()
+            .contains("committed approval record changed")
+    );
+    assert_eq!(canon_root_hash(&fixture.project).unwrap(), observed_root);
+    assert_eq!(
+        fs::read(fixture.approval_path()).unwrap(),
+        b"corrupt canonical approval"
+    );
 }
 
 #[test]

@@ -749,7 +749,7 @@ fn scan_approval_records_in(root: &Dir) -> Result<Vec<ScannedApproval>, Validati
                 ValidationErrorKind::DependencyHash,
                 format!("invalid approval proof: {}", path.display()),
             )
-            .with_approval_evidence(&path, Some(record.changeset_id.as_str())));
+            .with_approval_evidence(&path, filename_id.as_deref()));
         }
         let sha256 = sha256_bytes(&bytes);
         crate::journal::validate_committed_receipt_in(root, &record, &sha256).map_err(|error| {
