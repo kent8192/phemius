@@ -1,6 +1,9 @@
 //! Concrete model request, response, and deterministic evaluation types.
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 use regex::Regex;
 use serde_json::{Value, json};
@@ -192,6 +195,7 @@ pub struct ModelResponse {
 #[derive(Clone, Debug)]
 pub struct ScriptedModel {
     responses: VecDeque<ModelResult<ModelResponse>>,
+    shared_responses: Option<Arc<Mutex<VecDeque<ModelResult<ModelResponse>>>>>,
 }
 
 impl ScriptedModel {
@@ -199,14 +203,35 @@ impl ScriptedModel {
     pub fn new(responses: impl IntoIterator<Item = ModelResult<ModelResponse>>) -> Self {
         Self {
             responses: responses.into_iter().collect(),
+            shared_responses: None,
+        }
+    }
+
+    /// Creates a scripted backend whose clones consume one shared response queue.
+    ///
+    /// This mode is intended for bounded concurrent workflow tests: each critic clone observes
+    /// the next deterministic response instead of replaying a private queue from its first item.
+    pub fn shared(responses: impl IntoIterator<Item = ModelResult<ModelResponse>>) -> Self {
+        Self {
+            responses: VecDeque::new(),
+            shared_responses: Some(Arc::new(Mutex::new(responses.into_iter().collect()))),
         }
     }
 
     fn complete(&mut self, request: &ModelRequest) -> ModelResult<ModelResponse> {
-        let response = self
-            .responses
-            .pop_front()
-            .ok_or_else(|| ModelFailure::stopped("scripted model has no remaining response"))??;
+        let response = if let Some(responses) = &self.shared_responses {
+            responses
+                .lock()
+                .map_err(|_| ModelFailure::stopped("scripted response queue is poisoned"))?
+                .pop_front()
+                .ok_or_else(|| {
+                    ModelFailure::stopped("scripted model has no remaining response")
+                })??
+        } else {
+            self.responses.pop_front().ok_or_else(|| {
+                ModelFailure::stopped("scripted model has no remaining response")
+            })??
+        };
         request.validate_tool_calls(&response.tool_calls)?;
         Ok(response)
     }

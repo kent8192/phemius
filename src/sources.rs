@@ -417,6 +417,42 @@ impl fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
+    /// Reconstructs a snapshot from its durable raw and extracted-content artifacts.
+    ///
+    /// The raw bytes anchor the manifest's source hash while the UTF-8 content bytes are the
+    /// bounded representation handed to the context compiler.  Keeping both hashes here makes
+    /// artifact loading equivalent to the original ingestion path.
+    pub fn from_artifacts(
+        kind: SourceKind,
+        raw_bytes: impl AsRef<[u8]>,
+        content_bytes: impl AsRef<[u8]>,
+        secret: bool,
+        web: Option<WebSnapshotMetadata>,
+    ) -> Result<Self, SourceError> {
+        let raw_bytes = raw_bytes.as_ref().to_vec();
+        let content = std::str::from_utf8(content_bytes.as_ref())
+            .map_err(|error| {
+                SourceError::new(
+                    SourceErrorKind::InvalidUtf8,
+                    format!("snapshot content must be UTF-8: {error}"),
+                )
+            })?
+            .to_owned();
+        if secret {
+            return Err(SourceError::new(
+                SourceErrorKind::InvalidManifest,
+                "secret snapshots cannot be reconstructed from durable artifacts",
+            ));
+        }
+        if kind != SourceKind::Web && web.is_some() {
+            return Err(SourceError::new(
+                SourceErrorKind::InvalidManifest,
+                "non-web snapshots cannot carry web metadata",
+            ));
+        }
+        Ok(Self::from_content(kind, raw_bytes, content, secret, web))
+    }
+
     pub fn from_text(
         kind: SourceKind,
         bytes: impl AsRef<[u8]>,

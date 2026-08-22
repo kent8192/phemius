@@ -247,7 +247,27 @@ impl Repl {
                         Ok(outcome)
                     }
                 } else {
-                    Ok(ReplOutcome::Message("no ambiguous request is pending".into()))
+                    let Some(controller) = self.controller.as_mut() else {
+                        return Ok(ReplOutcome::Message(
+                            "no ambiguous request or durable project checkpoint is pending".into(),
+                        ));
+                    };
+                    if self.mode == ReplMode::Consult {
+                        return Ok(ReplOutcome::ReadOnly(
+                            "consult mode: latest checkpoint is available only as read-only status".into(),
+                        ));
+                    }
+                    match controller.resume_checkpoint() {
+                        Ok(Some(checkpoint)) => Ok(ReplOutcome::Message(format!(
+                            "resumed latest checkpoint at event offset {} (cost {} microdollars)",
+                            checkpoint.last_event_offset,
+                            checkpoint.cost.as_u64()
+                        ))),
+                        Ok(None) => Ok(ReplOutcome::Message(
+                            "no durable project checkpoint is pending".into(),
+                        )),
+                        Err(error) => Ok(ReplOutcome::Error(error.to_string())),
+                    }
                 }
             }
             ReplCommand::Clean => {

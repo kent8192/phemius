@@ -6,12 +6,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions, OpenOptionsExt as CapOpenOptionsExt};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,16 +26,18 @@ use crate::{
         canon_root_hash, content_result_hash, projected_root_hash, sha256_bytes,
     },
     cli::ReplMode,
+    context::{ContextCompiler, ContextReceipt, ContextRequest},
     copycheck::{AllowedSource, CopyPolicy, scan_near_copy},
     cost::{BudgetLedger, MicroDollars},
-    domain::{EntityKind, prefixed_uuid},
+    domain::{EntityId, EntityKind, prefixed_uuid},
     model::{
         ModelBackend, ModelFailureClass, ModelMessage, ModelRequest, ModelResponse, ModelResult,
         ScriptedModel,
     },
     plot::{StoryStructure, builtin_framework, validate_structure},
     project::Project,
-    sources::ManifestDocument,
+    session::{Checkpoint, ContextEpoch, SessionEvent, SessionJournal},
+    sources::{ManifestDocument, Snapshot},
     tools::{AgentRole as ToolRole, Tool},
 };
 
@@ -433,6 +436,8 @@ pub struct ChapterRun {
     pub provisional_canon_hashes: Vec<(String, String)>,
     /// Redacted context receipt hash.
     pub context_receipt_hash: String,
+    /// Complete non-secret source coverage receipt used for this candidate.
+    pub context_receipt: Option<ContextReceipt>,
     /// Candidate prose retained outside canon.
     pub candidate_text: String,
     /// Preflight evidence.
@@ -492,6 +497,8 @@ pub struct RunController {
     strict_backend_errors: bool,
     provisional_canon: BTreeMap<String, String>,
     run_id: String,
+    session: Option<SessionJournal>,
+    checkpoint_path: Option<PathBuf>,
 }
 
 impl RunController {
@@ -537,6 +544,8 @@ impl RunController {
             strict_backend_errors: true,
             provisional_canon: BTreeMap::new(),
             run_id: prefixed_uuid(EntityKind::Run).as_str().into(),
+            session: None,
+            checkpoint_path: None,
         }
     }
 
@@ -699,6 +708,125 @@ impl RunController {
         self.cost_status
     }
 
+    /// Opens the project-local append-only session journal and cost ledger on first use.
+    ///
+    /// The lazy open keeps fixture controllers in-memory while production project controllers
+    /// retain crash-safe session and reservation evidence under `.phemius/records`.
+    fn ensure_durable_session(&mut self) -> Result<()> {
+        let Some(project) = self.project.as_ref() else {
+            return Ok(());
+        };
+        if self.session.is_some() {
+            return Ok(());
+        }
+        let session_relative = PathBuf::from(".phemius/records/sessions").join(&self.run_id);
+        ensure_managed_directory(project, &session_relative)?;
+        let records = project.root.join(&session_relative);
+        let journal_path = records.join("session.jsonl");
+        let session = if journal_path.exists() {
+            SessionJournal::open(&journal_path)?
+        } else {
+            SessionJournal::create(&journal_path)?
+        };
+        let cost_path = records.join("cost.jsonl");
+        self.cost_ledger = BudgetLedger::open(&cost_path)?;
+        self.checkpoint_path = Some(records.join("checkpoint.json"));
+        self.session = Some(session);
+        Ok(())
+    }
+
+    fn append_session_event(&mut self, event: SessionEvent) -> Result<()> {
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        session.append(event)
+    }
+
+    fn checkpoint(&mut self, context_hash: &str) -> Result<()> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(());
+        };
+        let Some(path) = self.checkpoint_path.as_ref() else {
+            return Ok(());
+        };
+        let checkpoint = Checkpoint::from_journal(
+            session,
+            vec![ContextEpoch {
+                model: self.model(AgentRole::Writer).into(),
+                checkpoint_hash: context_hash.into(),
+            }],
+            self.provisional_canon.values().cloned().collect(),
+            Vec::new(),
+            self.corrections
+                .iter()
+                .filter_map(|rule| EntityId::from_validated(rule.id.clone()))
+                .collect(),
+            self.findings
+                .values()
+                .filter(|finding| {
+                    finding.kind.is_blocking() && finding.disposition == FindingDisposition::Open
+                })
+                .filter_map(|finding| EntityId::from_validated(finding.id.clone()))
+                .collect(),
+            self.chapter_runs
+                .values()
+                .filter(|run| run.state == ChapterState::NeedsRevalidation)
+                .map(|run| run.changeset.id.clone())
+                .collect(),
+            self.cost_status.run,
+        )?;
+        session.write_checkpoint(path, &checkpoint)
+    }
+
+    /// Reads the latest anchored project checkpoint without resending any model request.
+    pub fn resume_checkpoint(&mut self) -> Result<Option<Checkpoint>> {
+        if self.session.is_none() {
+            self.attach_latest_session()?;
+        }
+        self.ensure_durable_session()?;
+        let Some(session) = self.session.as_ref() else {
+            return Ok(None);
+        };
+        let Some(path) = self.checkpoint_path.as_ref() else {
+            return Ok(None);
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        session.read_checkpoint(path).map(Some)
+    }
+
+    fn attach_latest_session(&mut self) -> Result<()> {
+        let Some(project) = self.project.as_ref() else {
+            return Ok(());
+        };
+        let root = project.root.join(".phemius/records/sessions");
+        let mut candidates = fs::read_dir(&root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|file_type| file_type.is_dir())
+                    .map(|_| entry.path())
+            })
+            .filter(|path| path.join("checkpoint.json").is_file())
+            .collect::<Vec<_>>();
+        candidates.sort();
+        let Some(session_dir) = candidates.pop() else {
+            return Ok(());
+        };
+        let journal_path = session_dir.join("session.jsonl");
+        let cost_path = session_dir.join("cost.jsonl");
+        self.session = Some(SessionJournal::open(&journal_path)?);
+        self.cost_ledger = BudgetLedger::open(&cost_path)?;
+        self.checkpoint_path = Some(session_dir.join("checkpoint.json"));
+        Ok(())
+    }
+
     /// Adds a trusted typed finding to a chapter's current candidate.
     pub fn add_finding(
         &mut self,
@@ -810,7 +938,58 @@ impl RunController {
         for finding in &mut run.findings {
             finding.disposition = FindingDisposition::Open;
         }
-        self.provisional_canon.insert(chapter_id.into(), hash);
+        let candidate_operations = run
+            .changeset
+            .operations
+            .iter()
+            .filter_map(|operation| operation.candidate_path.clone())
+            .collect::<Vec<_>>();
+        let project = self.project.clone();
+        let candidate_text = run.candidate_text.clone();
+        let mut candidate_hash = hash;
+        if let Some(project) = project {
+            let mut updated_hashes = BTreeMap::new();
+            for candidate_path in candidate_operations {
+                let current = read_project_file(&project, &candidate_path)?;
+                let revised = if candidate_path
+                    .file_name()
+                    .is_some_and(|name| name == "manuscript.md")
+                {
+                    replace_candidate_body(current, &candidate_text)
+                } else {
+                    append_candidate(current, &candidate_text)
+                };
+                write_replaced_project_file(&project, &candidate_path, &revised)?;
+                updated_hashes.insert(candidate_path, sha256_bytes(&revised));
+            }
+            let run = self
+                .chapter_runs
+                .get_mut(chapter_id)
+                .expect("candidate was checked above");
+            for operation in &mut run.changeset.operations {
+                if let Some(candidate_path) = operation.candidate_path.as_ref()
+                    && let Some(after_sha256) = updated_hashes.get(candidate_path)
+                {
+                    operation.after_sha256 = Some(after_sha256.clone());
+                }
+            }
+            let recalculated = self
+                .chapter_runs
+                .get(chapter_id)
+                .map(|candidate| calculate_candidate_hash(&project, &candidate.changeset))
+                .transpose()
+                .map_err(anyhow::Error::new)?;
+            if let Some(recalculated) = recalculated {
+                let run = self
+                    .chapter_runs
+                    .get_mut(chapter_id)
+                    .expect("candidate was checked above");
+                run.changeset.candidate_hash = recalculated;
+                candidate_hash = run.changeset.candidate_hash.clone();
+            }
+        }
+        self.provisional_canon
+            .insert(chapter_id.into(), candidate_hash);
         self.note_upstream_edit(chapter_id)?;
         self.refresh_chapter_states();
         Ok(())
@@ -1039,14 +1218,22 @@ impl RunController {
             })?;
         let chapter = self.chapters.get_mut(chapter_id).expect("checked above");
         chapter.state = ChapterState::Approved;
-        let run = self
-            .chapter_runs
-            .get_mut(chapter_id)
-            .expect("checked above");
-        run.state = ChapterState::Approved;
-        run.changeset = change;
-        run.changeset.state = ChangesetState::Approved;
-        self.note_upstream_edit(chapter_id)?;
+        let (changeset_id, context_hash) = {
+            let run = self
+                .chapter_runs
+                .get_mut(chapter_id)
+                .expect("checked above");
+            run.state = ChapterState::Approved;
+            run.changeset = change;
+            run.changeset.state = ChangesetState::Approved;
+            (run.changeset.id.clone(), run.context_receipt_hash.clone())
+        };
+        self.ensure_durable_session()?;
+        self.append_session_event(SessionEvent::ChangesetStateChanged {
+            id: changeset_id,
+            state: ChangesetState::Approved,
+        })?;
+        self.checkpoint(&context_hash)?;
         Ok(())
     }
 
@@ -1093,6 +1280,32 @@ impl RunController {
                         .any(|chapter| chapter.id == chapter_id),
                     "chapter {chapter_id} is not present in the approved story structure"
                 );
+                let chapter_scene_ids = structure
+                    .scenes
+                    .iter()
+                    .filter(|scene| scene.chapter_id == chapter_id)
+                    .map(|scene| scene.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                ensure!(
+                    !chapter_scene_ids.is_empty(),
+                    "chapter {chapter_id} has no approved scenes"
+                );
+                for scene_id in &chapter_scene_ids {
+                    ensure!(
+                        structure
+                            .boxes
+                            .iter()
+                            .any(|box_| box_.scene_id == *scene_id),
+                        "scene {scene_id} has no approved box link"
+                    );
+                    ensure!(
+                        structure
+                            .macro_beats
+                            .iter()
+                            .any(|beat| beat.scene_ids.iter().any(|linked| linked == *scene_id)),
+                        "scene {scene_id} has no approved macro link"
+                    );
+                }
                 ensure!(
                     self.plot_framework.is_some(),
                     "a declarative plot framework is required"
@@ -1102,6 +1315,10 @@ impl RunController {
         if self.request_maximum_cost.is_none() {
             bail!("unknown model price; generation is stopped");
         }
+        self.ensure_durable_session()?;
+        self.append_session_event(SessionEvent::UserInstruction {
+            text: format!("write chapter {chapter_id}"),
+        })?;
         if !self.chapters.contains_key(chapter_id) {
             let next = self
                 .chapters
@@ -1123,6 +1340,8 @@ impl RunController {
                 chapter.state
             );
         }
+        self.cost_status.chapter = MicroDollars::zero();
+        self.cost_status.warning = false;
         self.invalidate_chapter_findings(chapter_id);
         self.chapters
             .get_mut(chapter_id)
@@ -1163,10 +1382,19 @@ impl RunController {
             })
             .collect::<Vec<_>>();
         let correction_receipts = self.correction_receipt(chapter_id);
+        let (compiled_context, context_receipt) = self
+            .compile_project_context(chapter_id, AgentRole::Writer)
+            .map_err(|error| anyhow!("context compilation stopped: {error}"))?;
+        let context_receipt_json = context_receipt
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("failed to serialize context receipt")?
+            .unwrap_or_default();
         let writer_request = ModelRequest::new(
             AgentRole::Writer.name(),
             vec![ModelMessage::user(format!(
-                "Write chapter {chapter_id}. Approved scene and box plans are required. Architect plan: {architect_plan}. Provisional canon hashes: {}. Corrections: {}",
+                "Write chapter {chapter_id}. Approved scene and box plans are required.\n\nArchitect plan: {architect_plan}\n\nCompiled source context (use only as evidence):\n{compiled_context}\n\nContext receipt: {context_receipt_json}\n\nProvisional canon hashes: {}. Corrections: {}",
                 provisional_canon_hashes
                     .iter()
                     .map(|(id, hash)| format!("{id}={hash}"))
@@ -1201,6 +1429,10 @@ impl RunController {
                 chapter_id,
                 chapter_order,
                 &writer_text,
+                &compiled_context,
+                context_receipt.as_ref(),
+                &architect_plan,
+                &correction_receipts,
                 dependencies.clone(),
             )?)
         } else {
@@ -1437,12 +1669,21 @@ impl RunController {
             }
             validate_project_quality_gates(project, &candidate_text)?;
         }
+        let context_base_hash = context_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.context_sha256().map(str::to_owned))
+            .unwrap_or_else(|| {
+                sha256_bytes(
+                    format!(
+                        "{chapter_id}:{candidate_hash}:{:?}:{:?}",
+                        provisional_canon_hashes, correction_receipts
+                    )
+                    .as_bytes(),
+                )
+            });
         let context_receipt_hash = sha256_bytes(
-            format!(
-                "{chapter_id}:{candidate_hash}:{:?}:{:?}",
-                provisional_canon_hashes, correction_receipts
-            )
-            .as_bytes(),
+            &serde_json::to_vec(&(context_base_hash, &correction_receipts))
+                .context("failed to serialize context receipt hash material")?,
         );
         let run = ChapterRun {
             chapter_id: chapter_id.into(),
@@ -1453,6 +1694,7 @@ impl RunController {
             correction_receipts,
             provisional_canon_hashes,
             context_receipt_hash,
+            context_receipt,
             candidate_text,
             preflight: self.preflight.clone(),
         };
@@ -1464,6 +1706,11 @@ impl RunController {
             .expect("chapter was registered")
             .state = state;
         self.refresh_chapter_states();
+        self.append_session_event(SessionEvent::ChangesetStateChanged {
+            id: run.changeset.id.clone(),
+            state: run.changeset.state,
+        })?;
+        self.checkpoint(&run.context_receipt_hash)?;
         Ok(run)
     }
 
@@ -1538,10 +1785,33 @@ impl RunController {
         let maximum = self
             .request_maximum_cost
             .ok_or_else(|| anyhow!("unknown model price; generation is stopped"))?;
+        let chapter_after = self
+            .cost_status
+            .chapter
+            .as_u64()
+            .checked_add(maximum.as_u64())
+            .ok_or_else(|| anyhow!("chapter cost arithmetic overflow"))?;
+        let run_after = self
+            .cost_status
+            .run
+            .as_u64()
+            .checked_add(maximum.as_u64())
+            .ok_or_else(|| anyhow!("run cost arithmetic overflow"))?;
+        ensure!(
+            chapter_after <= 10_000_000,
+            "chapter budget hard stop at $10 before model reservation"
+        );
+        ensure!(
+            run_after <= 120_000_000,
+            "continuous run budget hard stop at $120 before model reservation"
+        );
         let reservation = self.cost_ledger.reserve(chapter_id, maximum)?;
+        self.cost_ledger.retain_ambiguous(&reservation)?;
         self.cost_status.chapter = self.cost_status.chapter.checked_add_for_work(maximum)?;
         self.cost_status.run = self.cost_status.run.checked_add_for_work(maximum)?;
         self.cost_status.warning |= reservation.warning_required;
+        // ModelResponse carries no metered usage.  Leave the maximum reservation held in the
+        // durable ledger rather than settling optimistically; reconciliation can settle it later.
         Ok(())
     }
 
@@ -1603,6 +1873,73 @@ impl RunController {
         Ok(previous.into_iter().collect())
     }
 
+    fn compile_project_context(
+        &self,
+        chapter_id: &str,
+        role: AgentRole,
+    ) -> Result<(String, Option<ContextReceipt>)> {
+        let Some(project) = self.project.as_ref() else {
+            return Ok((String::new(), None));
+        };
+        let Some(target) = EntityId::from_validated(chapter_id.to_owned()) else {
+            // Fixture project runs may use human-readable chapter labels. Production projects
+            // use validated chapter IDs and therefore receive the complete source projection.
+            return Ok((String::new(), None));
+        };
+        let manifest_bytes = read_project_file(project, Path::new("資料/manifest.md"))?;
+        let manifest = ManifestDocument::parse(&manifest_bytes)
+            .map_err(|error| anyhow!("source manifest validation failed: {error}"))?;
+        let mut snapshots = Vec::new();
+        for entry in manifest.manifest().entries() {
+            if entry.snapshot.ephemeral {
+                continue;
+            }
+            let raw_path = entry.snapshot.raw_artifact.as_deref().ok_or_else(|| {
+                anyhow!("source {} has no raw artifact", entry.source_id.as_str())
+            })?;
+            let content_path = entry.snapshot.content_artifact.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "source {} has no content artifact",
+                    entry.source_id.as_str()
+                )
+            })?;
+            let Some(raw) = read_project_file_optional(project, raw_path)? else {
+                continue;
+            };
+            let Some(content) = read_project_file_optional(project, content_path)? else {
+                continue;
+            };
+            snapshots.push(
+                Snapshot::from_artifacts(entry.kind, raw, content, false, entry.web.clone())
+                    .map_err(|error| {
+                        anyhow!(
+                            "source {} snapshot is invalid: {error}",
+                            entry.source_id.as_str()
+                        )
+                    })?,
+            );
+        }
+        let mut compiler = ContextCompiler::new(manifest.manifest().clone(), snapshots)
+            .map_err(|error| anyhow!("source manifest cannot compile: {error}"))?;
+        if let Some(structure) = self.structure.clone() {
+            compiler = compiler.with_structure(structure);
+        }
+        let request = ContextRequest {
+            target,
+            role: role.name().into(),
+            budget_tokens: 1_000_000,
+            requested_output_tokens: 20_000,
+        };
+        let compiled = compiler
+            .compile(&request)
+            .map_err(|error| anyhow!("{}", error))?;
+        let transmitted = compiler
+            .handoff(compiled)
+            .map_err(|error| anyhow!("context handoff stopped: {error}"))?;
+        let (text, receipt) = transmitted.into_parts();
+        Ok((text, Some(receipt)))
+    }
+
     fn refresh_chapter_states(&mut self) {
         let mut state_updates = Vec::new();
         for run in self.chapter_runs.values_mut() {
@@ -1645,7 +1982,7 @@ fn correction_applies(rule: &CorrectionRule, chapter_id: &str, controller: &RunC
                 && let Some(target_chapter) = controller.chapter_opt(&scene.chapter_id)
                 && let Some(chapter) = controller.chapter_opt(chapter_id)
             {
-                target_chapter.order >= chapter.order
+                chapter.order >= target_chapter.order
             } else {
                 target.starts_with("scene_") || target.starts_with("box_")
             }
@@ -1851,20 +2188,16 @@ fn prepare_project_change(
     chapter_id: &str,
     chapter_order: u32,
     writer_text: &str,
+    compiled_context: &str,
+    context_receipt: Option<&ContextReceipt>,
+    architect_plan: &str,
+    correction_receipts: &[CorrectionReceipt],
     dependencies: Vec<ChangesetDependency>,
 ) -> Result<PreparedChange> {
     let base_root_hash = canon_root_hash(project).map_err(anyhow::Error::new)?;
-    let candidate_root = project
-        .root
-        .join(".phemius/runtime/candidates")
-        .join(changeset_id.as_str());
-    fs::create_dir_all(&candidate_root).with_context(|| {
-        format!(
-            "failed to create candidate directory {}",
-            candidate_root.display()
-        )
-    })?;
-    sync_directory(&candidate_root)?;
+    let candidate_root = PathBuf::from(".phemius/runtime/candidates").join(changeset_id.as_str());
+    ensure_managed_directory(project, &candidate_root)?;
+    sync_managed_directory(project, &candidate_root)?;
 
     let chapter_entity = prefixed_uuid(EntityKind::Chapter);
     let mut operations = Vec::new();
@@ -1873,23 +2206,11 @@ fn prepare_project_change(
                             candidate: Vec<u8>,
                             entity: crate::domain::EntityId|
      -> Result<()> {
-        let target_absolute = project.root.join(&target);
-        let existing = match fs::symlink_metadata(&target_absolute) {
-            Ok(metadata) => {
-                ensure!(
-                    metadata.is_file(),
-                    "canon target is not a regular file: {}",
-                    target.display()
-                );
-                Some(fs::read(&target_absolute)?)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(anyhow!(error)),
-        };
+        let existing = read_project_file_optional(project, &target)?;
         let candidate_relative = PathBuf::from(".phemius/runtime/candidates")
             .join(changeset_id.as_str())
             .join(file_name);
-        write_new_synced(&project.root.join(&candidate_relative), &candidate)?;
+        write_new_project_file(project, &candidate_relative, &candidate)?;
         let (kind, before_sha256) = match existing {
             Some(bytes) => (OperationKind::Replace, Some(sha256_bytes(&bytes))),
             None => (OperationKind::Create, None),
@@ -1906,13 +2227,9 @@ fn prepare_project_change(
     };
 
     let manuscript_target = PathBuf::from(format!("本文/{chapter_id}.md"));
-    let manuscript_absolute = project.root.join(&manuscript_target);
-    let manuscript = match fs::read(&manuscript_absolute) {
-        Ok(bytes) => append_candidate(bytes, writer_text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            format!("---\nid: {}\n---\n{}", chapter_entity.as_str(), writer_text).into_bytes()
-        }
-        Err(error) => return Err(anyhow!(error)),
+    let manuscript = match read_project_file_optional(project, &manuscript_target)? {
+        Some(bytes) => append_candidate(bytes, writer_text),
+        None => format!("---\nid: {}\n---\n{}", chapter_entity.as_str(), writer_text).into_bytes(),
     };
     add_artifact(
         manuscript_target,
@@ -1934,7 +2251,7 @@ fn prepare_project_change(
         ),
     ] {
         let target_path = PathBuf::from(target);
-        let base = fs::read(project.root.join(&target_path))
+        let base = read_project_file(project, &target_path)
             .with_context(|| format!("required canon artifact is missing: {target}"))?;
         add_artifact(
             target_path,
@@ -1944,20 +2261,45 @@ fn prepare_project_change(
         )?;
     }
 
-    for (file_name, suffix) in [
-        ("context.md", "context receipt"),
-        ("critique.md", "critic summary"),
-        ("basis.md", "generation basis"),
+    let character_entity = prefixed_uuid(EntityKind::Character);
+    add_artifact(
+        PathBuf::from(format!(
+            "前提/キャラクター設定/{}.md",
+            character_entity.as_str()
+        )),
+        "character.md",
+        format!(
+            "---\nid: {}\n---\n# character\n\nGenerated character state for {chapter_id}.\n",
+            character_entity.as_str()
+        )
+        .into_bytes(),
+        character_entity,
+    )?;
+
+    for (file_name, suffix, body) in [
+        (
+            "context.md",
+            "context receipt",
+            format!(
+                "{}\n\n# compiled context\n{}\n\n# correction receipts\n{}",
+                context_receipt
+                    .map(|receipt| serde_json::to_string(receipt))
+                    .transpose()
+                    .context("failed to serialize context receipt")?
+                    .unwrap_or_default(),
+                compiled_context,
+                serde_json::to_string(correction_receipts)
+                    .context("failed to serialize correction receipts")?
+            ),
+        ),
+        ("critique.md", "critic summary", "critics pending".into()),
+        ("basis.md", "generation basis", architect_plan.to_owned()),
     ] {
         let entity = prefixed_uuid(EntityKind::Rule);
         add_artifact(
             PathBuf::from(format!("メモ/{chapter_id}-{file_name}")),
             file_name,
-            format!(
-                "---\nid: {}\n---\n# {suffix}\n\n{writer_text}\n",
-                entity.as_str()
-            )
-            .into_bytes(),
+            format!("---\nid: {}\n---\n# {suffix}\n\n{body}\n", entity.as_str(),).into_bytes(),
             entity,
         )?;
     }
@@ -1982,7 +2324,7 @@ fn prepare_project_change(
         content_result_hash(project, &change).map_err(anyhow::Error::new)?;
     change.validation_hash = Some(calculate_validation_hash(&change));
     change.result_root_hash = projected_root_hash(project, &change).map_err(anyhow::Error::new)?;
-    sync_directory(&candidate_root)?;
+    sync_managed_directory(project, &candidate_root)?;
     Ok(PreparedChange {
         operations: change.operations,
         base_root_hash: change.base_root_hash,
@@ -2005,22 +2347,19 @@ fn update_project_change(
         let Some(candidate_path) = operation.candidate_path.as_ref() else {
             continue;
         };
-        let absolute = project.root.join(candidate_path);
-        let current = fs::read(&absolute)
-            .with_context(|| format!("failed to read candidate {}", absolute.display()))?;
+        let current = read_project_file(project, candidate_path)
+            .with_context(|| format!("failed to read candidate {}", candidate_path.display()))?;
         let revised = if operation.path.to_string_lossy().starts_with("本文/") {
             replace_candidate_body(current, candidate_text)
         } else {
             append_candidate(current, candidate_text)
         };
-        write_replaced_synced(&absolute, &revised)?;
+        write_replaced_project_file(project, candidate_path, &revised)?;
         operation.after_sha256 = Some(sha256_bytes(&revised));
     }
-    sync_directory(
-        &project
-            .root
-            .join(".phemius/runtime/candidates")
-            .join(changeset_id.as_str()),
+    sync_managed_directory(
+        project,
+        &PathBuf::from(".phemius/runtime/candidates").join(changeset_id.as_str()),
     )?;
 
     let mut change = Changeset {
@@ -2074,35 +2413,116 @@ fn replace_candidate_body(base: Vec<u8>, candidate_text: &str) -> Vec<u8> {
     candidate_text.as_bytes().to_vec()
 }
 
-fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to create candidate {}", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("failed to write candidate {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync candidate {}", path.display()))?;
-    Ok(())
+fn read_project_file(project: &Project, relative: &Path) -> Result<Vec<u8>> {
+    let root = crate::changeset::open_project_root_io(&project.root)
+        .with_context(|| format!("failed to open project root {}", project.root.display()))?;
+    let pinned = crate::changeset::open_pinned_path_io(&root, relative)
+        .with_context(|| format!("failed to open managed path {}", relative.display()))?;
+    crate::changeset::read_regular_at_io(&pinned.parent, &pinned.leaf)
+        .with_context(|| format!("failed to read managed path {}", relative.display()))
 }
 
-fn write_replaced_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).truncate(true);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to rewrite candidate {}", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("failed to write revised candidate {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync revised candidate {}", path.display()))?;
-    Ok(())
+fn read_project_file_optional(project: &Project, relative: &Path) -> Result<Option<Vec<u8>>> {
+    match read_project_file(project, relative) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("failed to open directory {}", path.display()))?
+fn ensure_managed_directory(project: &Project, relative: &Path) -> Result<()> {
+    ensure!(
+        !relative.is_absolute(),
+        "managed directory must be relative"
+    );
+    let root = crate::changeset::open_project_root_io(&project.root)
+        .with_context(|| format!("failed to open project root {}", project.root.display()))?;
+    let mut current = root;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("managed directory contains an unsafe path component");
+        };
+        let next = match crate::changeset::open_dir_no_follow_io(&current, name) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match current.create_dir(name) {
+                    Ok(()) => sync_cap_directory(&current)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(anyhow!(error)),
+                }
+                crate::changeset::open_dir_no_follow_io(&current, name)?
+            }
+            Err(error) => return Err(anyhow!(error)),
+        };
+        current = next;
+    }
+    sync_cap_directory(&current)
+}
+
+fn write_new_project_file(project: &Project, relative: &Path, bytes: &[u8]) -> Result<()> {
+    let root = crate::changeset::open_project_root_io(&project.root)
+        .with_context(|| format!("failed to open project root {}", project.root.display()))?;
+    let pinned = crate::changeset::open_pinned_path_io(&root, relative)
+        .with_context(|| format!("failed to open managed path {}", relative.display()))?;
+    let mut options = CapOpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut file = pinned
+        .parent
+        .open_with(&pinned.leaf, &options)
+        .with_context(|| format!("failed to create managed path {}", relative.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write managed path {}", relative.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync managed path {}", relative.display()))
+}
+
+fn write_replaced_project_file(project: &Project, relative: &Path, bytes: &[u8]) -> Result<()> {
+    let root = crate::changeset::open_project_root_io(&project.root)
+        .with_context(|| format!("failed to open project root {}", project.root.display()))?;
+    let pinned = crate::changeset::open_pinned_path_io(&root, relative)
+        .with_context(|| format!("failed to open managed path {}", relative.display()))?;
+    let mut options = CapOpenOptions::new();
+    options
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut file = pinned
+        .parent
+        .open_with(&pinned.leaf, &options)
+        .with_context(|| format!("failed to rewrite managed path {}", relative.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write managed path {}", relative.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync managed path {}", relative.display()))
+}
+
+fn sync_managed_directory(project: &Project, relative: &Path) -> Result<()> {
+    let root = crate::changeset::open_project_root_io(&project.root)
+        .with_context(|| format!("failed to open project root {}", project.root.display()))?;
+    let mut current = root;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("managed directory contains an unsafe path component");
+        };
+        current = crate::changeset::open_dir_no_follow_io(&current, name)?;
+    }
+    sync_cap_directory(&current)
+}
+
+fn sync_cap_directory(directory: &Dir) -> Result<()> {
+    directory
+        .try_clone()
+        .map_err(anyhow::Error::new)?
+        .into_std_file()
         .sync_all()
-        .with_context(|| format!("failed to sync directory {}", path.display()))
+        .map_err(anyhow::Error::new)
 }

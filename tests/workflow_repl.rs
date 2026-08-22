@@ -2,10 +2,12 @@ use std::{fs, path::PathBuf};
 
 use phemius::{
     changeset::{approval_record_path, validate_changeset},
+    context::CoverageDisposition,
     domain::{EntityKind, prefixed_uuid},
     model::{ModelFailure, ModelResponse, ScriptedModel},
     project::{InitAnswers, initialize_project},
     repl::{Repl, ReplOutcome, RoutedInput, route_input},
+    sources::{ManifestDocument, Snapshot, SourceEntry, SourceKind, SourceScope, SourceTier},
     workflow::{
         AgentRole, AgentSpec, ChapterState, Finding, FindingDisposition, FindingKind, RunController,
     },
@@ -37,6 +39,41 @@ async fn chapter_pipeline_runs_writer_then_three_critics_at_most_then_reviser() 
     );
     assert!(result.changeset.state.is_approvable());
     assert_eq!(result.trace.roles.first(), Some(&AgentRole::StoryArchitect));
+}
+
+#[tokio::test]
+async fn shared_scripted_backend_consumes_distinct_writer_and_critic_responses() {
+    let responses = [
+        "architect plan",
+        "draft",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-1",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-2",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-3",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-4",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-5",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-6",
+    ]
+    .into_iter()
+    .map(|text| {
+        Ok(ModelResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+        })
+    });
+    let run = RunController::fixture(ScriptedModel::shared(responses))
+        .write_chapter("chapter_1")
+        .await
+        .unwrap();
+    assert_eq!(run.trace.writer_calls, 1);
+    assert_eq!(run.trace.critic_calls, 6);
+    assert_eq!(run.findings.len(), 6);
+    for index in 1..=6 {
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.message.ends_with(&format!("critic-{index}")))
+        );
+    }
 }
 
 #[tokio::test]
@@ -110,6 +147,10 @@ async fn false_positive_resolution_is_trusted_and_candidate_edits_invalidate_fin
     assert_eq!(
         run.finding(&finding.id).unwrap().disposition,
         FindingDisposition::Open
+    );
+    assert!(
+        run.resolve_false_positive(&finding.id, "stale finding")
+            .is_err()
     );
 }
 
@@ -193,6 +234,113 @@ async fn approval_is_human_only_and_follows_changeset_order() {
     run.approve_chapter_trusted_for_test(first.changeset.id.as_str())
         .unwrap();
     assert_eq!(run.chapter("chapter_1").state, ChapterState::Approved);
+    assert!(!matches!(
+        run.chapter("chapter_2").state,
+        ChapterState::Stale | ChapterState::NeedsRevalidation
+    ));
+}
+
+#[tokio::test]
+async fn project_context_receipt_covers_manifest_and_is_saved_with_changeset() {
+    let directory = TestDir::new("workflow-context");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let snapshot = Snapshot::from_text(SourceKind::Markdown, "世界観の必須資料", false).unwrap();
+    let artifact = snapshot.candidate_artifacts().into_iter().next().unwrap();
+    let artifact_path = directory.path().join(artifact.path());
+    fs::write(&artifact_path, artifact.bytes()).unwrap();
+    let source = SourceEntry::from_snapshot(
+        prefixed_uuid(EntityKind::Source),
+        SourceScope::Work,
+        SourceTier::RequiredRaw,
+        &snapshot,
+    );
+    let manifest_path = directory.path().join("資料/manifest.md");
+    let mut document = ManifestDocument::parse(&fs::read(&manifest_path).unwrap()).unwrap();
+    document.manifest_mut().entries.push(source);
+    fs::write(&manifest_path, document.render().unwrap()).unwrap();
+
+    let chapter_id = prefixed_uuid(EntityKind::Chapter);
+    let mut controller = RunController::fixture_with_project(project, ScriptedModel::new([]));
+    let run = controller.write_chapter(chapter_id.as_str()).await.unwrap();
+    let context_operation = run
+        .changeset
+        .operations
+        .iter()
+        .find(|operation| operation.path.to_string_lossy().contains("context.md"))
+        .unwrap();
+    let context_path = directory
+        .path()
+        .join(context_operation.candidate_path.as_ref().unwrap());
+    let context = String::from_utf8(fs::read(context_path).unwrap()).unwrap();
+    assert!(context.contains("世界観の必須資料"));
+    assert!(context.contains("raw"));
+    assert_eq!(
+        run.context_receipt
+            .as_ref()
+            .unwrap()
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.disposition())
+            .collect::<Vec<_>>(),
+        vec![CoverageDisposition::Raw]
+    );
+}
+
+#[tokio::test]
+async fn project_repl_resume_reads_the_latest_durable_checkpoint() {
+    let directory = TestDir::new("workflow-resume");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let chapter_id = prefixed_uuid(EntityKind::Chapter);
+    let mut controller = RunController::fixture_with_project(project, ScriptedModel::new([]));
+    controller.write_chapter(chapter_id.as_str()).await.unwrap();
+    let mut repl = Repl::with_controller(controller);
+    let outcome = repl.handle("/resume").unwrap();
+    assert!(
+        matches!(outcome, ReplOutcome::Message(message) if message.contains("resumed latest checkpoint"))
+    );
+}
+
+#[tokio::test]
+async fn a_new_project_controller_resumes_the_latest_session_directory() {
+    let directory = TestDir::new("workflow-resume-reopen");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let chapter_id = prefixed_uuid(EntityKind::Chapter);
+    {
+        let mut first =
+            RunController::fixture_with_project(project.clone(), ScriptedModel::new([]));
+        first.write_chapter(chapter_id.as_str()).await.unwrap();
+    }
+    let mut reopened = RunController::fixture_with_project(project, ScriptedModel::new([]));
+    assert!(reopened.resume_checkpoint().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn structure_preflight_requires_scene_box_and_macro_links() {
+    let directory = TestDir::new("workflow-links");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let part = prefixed_uuid(EntityKind::Part);
+    let chapter = prefixed_uuid(EntityKind::Chapter);
+    let scene = prefixed_uuid(EntityKind::Scene);
+    let structure = phemius::plot::StoryStructure {
+        parts: vec![phemius::plot::StoryPart::new(part.as_str(), 1)],
+        chapters: vec![phemius::plot::StoryChapter::new(
+            chapter.as_str(),
+            part.as_str(),
+            1,
+        )],
+        scenes: vec![phemius::plot::StoryScene::new(
+            scene.as_str(),
+            chapter.as_str(),
+            1,
+        )],
+        boxes: Vec::new(),
+        macro_beats: Vec::new(),
+    };
+    let mut controller = RunController::with_project(project, ScriptedModel::new([]).into());
+    controller.set_preflight(true, true, true);
+    controller.set_structure(structure).unwrap();
+    controller.set_plot_framework("three-act").unwrap();
+    assert!(controller.write_chapter(chapter.as_str()).await.is_err());
 }
 
 #[tokio::test]
@@ -243,6 +391,20 @@ async fn revision_cycles_are_bounded_and_ambiguous_requests_are_not_retried() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("ambiguous"));
+}
+
+#[tokio::test]
+async fn cost_warning_and_chapter_hard_gate_are_checked_before_reservation() {
+    let mut controller = RunController::fixture(ScriptedModel::new([]));
+    controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(1_000_001)));
+    controller.write_chapter("chapter_1").await.unwrap();
+    assert!(controller.cost_status().warning);
+    assert!(controller.cost_status().chapter.as_u64() > 5_000_000);
+
+    let mut gated = RunController::fixture(ScriptedModel::new([]));
+    gated.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(3_000_001)));
+    let error = gated.write_chapter("chapter_1").await.unwrap_err();
+    assert!(error.to_string().contains("$10"));
 }
 
 #[test]
@@ -330,6 +492,12 @@ async fn project_approval_validates_applies_and_leaves_durable_proof() {
     let mut controller = RunController::fixture_with_project(project.clone(), backend);
     let run = controller.write_chapter(chapter_id.as_str()).await.unwrap();
     validate_changeset(&project, &run.changeset).unwrap();
+    assert!(run.changeset.operations.iter().any(|operation| {
+        operation
+            .path
+            .to_string_lossy()
+            .starts_with("前提/キャラクター設定/")
+    }));
     let changeset_id = run.changeset.id.clone();
 
     controller
