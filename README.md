@@ -43,3 +43,12 @@ assert!(findings.is_empty());
 The default policy blocks contiguous matches of 80 CJK graphemes or 40 words,
 and 85% 8-gram overlap in a 160-grapheme or 80-word window. Explicit declared
 source ranges are the only exemption mechanism.
+
+## Bounded tools and skills
+
+The model tool catalog is fixed and role-scoped. File operations remain below a
+candidate workspace, complete outputs are retained by SHA-256, and model-visible
+output is bounded. Shell execution defaults to human approval plus macOS
+Seatbelt; it clears inherited environment variables and never falls back to an
+unrestricted child process. Skills load frontmatter metadata at startup, then
+load only the explicitly selected `SKILL.md` and requested relative resources.

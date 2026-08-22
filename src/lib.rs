@@ -22,7 +22,13 @@ pub mod openrouter;
 pub mod plot;
 /// Parses project artifacts and initializes the canonical project tree.
 pub mod project;
+/// Runs explicitly approved, fail-closed sandboxed shell commands.
+pub mod sandbox;
 /// Persists append-only session evidence and derived checkpoints.
 pub mod session;
+/// Discovers skill metadata before loading selected guidance.
+pub mod skills;
 /// Ingests source material and validates manifest-bound snapshots.
 pub mod sources;
+/// Defines the fixed, bounded tool catalog and capability-root file access.
+pub mod tools;
