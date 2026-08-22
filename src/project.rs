@@ -1,6 +1,8 @@
 use std::{
+    ffi::CString,
     fs::{self, OpenOptions},
     io::Write,
+    os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
 };
 
@@ -217,7 +219,7 @@ pub fn initialize_project(root: &Path, answers: &InitAnswers) -> Result<Project>
 }
 
 struct StagingDirectory {
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 impl StagingDirectory {
@@ -247,35 +249,42 @@ impl StagingDirectory {
         let path = parent.join(format!(".{name}.phemius-staging-{}", uuid::Uuid::now_v7()));
         fs::create_dir(&path)
             .with_context(|| format!("failed to create staging directory {}", path.display()))?;
-        Ok(Self { path })
+        Ok(Self { path: Some(path) })
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        self.path.as_deref().expect("staging directory is armed")
     }
 
-    fn persist(self, root: &Path) -> Result<()> {
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+
+    fn persist(mut self, root: &Path) -> Result<()> {
         if root.exists() {
-            return self.move_contents_into(root);
+            self.move_contents_into(root)?;
+        } else {
+            rename_without_replacing(self.path(), root)
+                .with_context(|| format!("failed to finalize project root {}", root.display()))?;
         }
-        fs::rename(&self.path, root)
-            .with_context(|| format!("failed to finalize project root {}", root.display()))
+        self.disarm();
+        Ok(())
     }
 
-    fn move_contents_into(&self, root: &Path) -> Result<()> {
-        let entries = fs::read_dir(&self.path)
-            .with_context(|| format!("failed to read staging directory {}", self.path.display()))?
+    fn move_contents_into(&mut self, root: &Path) -> Result<()> {
+        let entries = fs::read_dir(self.path())
+            .with_context(|| format!("failed to read staging directory {}", self.path().display()))?
             .collect::<std::io::Result<Vec<_>>>()
             .with_context(|| {
                 format!(
                     "failed to enumerate staging directory {}",
-                    self.path.display()
+                    self.path().display()
                 )
             })?;
         let mut moved = Vec::with_capacity(entries.len());
         for entry in entries {
             let target = root.join(entry.file_name());
-            if let Err(error) = fs::rename(entry.path(), &target) {
+            if let Err(error) = rename_without_replacing(&entry.path(), &target) {
                 return match self.rollback(&moved) {
                     Ok(()) => Err(error).with_context(|| {
                         format!(
@@ -283,29 +292,28 @@ impl StagingDirectory {
                             root.display()
                         )
                     }),
-                    Err(rollback) => Err(rollback).context(format!(
-                        "failed to initialize existing project root {} after move error: {error}",
-                        root.display()
-                    )),
+                    Err(rollback) => {
+                        self.disarm();
+                        Err(rollback).context(format!(
+                            "failed to initialize existing project root {} after move error: {error}",
+                            root.display()
+                        ))
+                    }
                 };
             }
             moved.push(target);
         }
-        fs::remove_dir(&self.path).with_context(|| {
-            format!(
-                "failed to remove empty staging directory {}",
-                self.path.display()
-            )
-        })
+        let _ = fs::remove_dir(self.path());
+        Ok(())
     }
 
     fn rollback(&self, moved: &[PathBuf]) -> Result<()> {
         let mut failure = None;
         for target in moved.iter().rev() {
             let source = self
-                .path
+                .path()
                 .join(target.file_name().expect("moved path has a file name"));
-            if let Err(error) = fs::rename(target, source) {
+            if let Err(error) = rename_without_replacing(target, &source) {
                 if failure.is_none() {
                     failure = Some(error);
                 }
@@ -320,7 +328,23 @@ impl StagingDirectory {
 
 impl Drop for StagingDirectory {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn rename_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: Both pointers are valid NUL-terminated paths for the duration of the call.
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -386,4 +410,25 @@ fn line(bytes: &[u8], start: usize) -> Option<(&[u8], usize)> {
 fn delimiter_line(line: &[u8]) -> bool {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     line == b"---"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_replace_rename_preserves_an_existing_destination() {
+        let root = std::env::temp_dir().join(format!("phemius-rename-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, "candidate").unwrap();
+        fs::write(&destination, "existing").unwrap();
+
+        assert!(rename_without_replacing(&source, &destination).is_err());
+        assert_eq!(fs::read(&source).unwrap(), b"candidate");
+        assert_eq!(fs::read(&destination).unwrap(), b"existing");
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }

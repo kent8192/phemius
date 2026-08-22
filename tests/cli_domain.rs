@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{Cursor, Write},
+    os::unix::fs::MetadataExt,
     path::PathBuf,
     process::{Command, Stdio},
 };
@@ -130,6 +131,7 @@ async fn init_rejects_an_empty_title_without_creating_a_project() {
 #[test]
 fn binary_initializes_the_current_directory_without_replacing_it() {
     let root = TestDir::new("current-directory");
+    let inode = fs::metadata(root.path()).unwrap().ino();
     let mut child = Command::new(env!("CARGO_BIN_EXE_phemius"))
         .args(["init", "."])
         .current_dir(root.path())
@@ -153,6 +155,7 @@ fn binary_initializes_the_current_directory_without_replacing_it() {
     );
     assert!(root.path().join("project.toml").is_file());
     assert!(root.path().join("前提/作品.md").is_file());
+    assert_eq!(fs::metadata(root.path()).unwrap().ino(), inode);
 }
 
 struct TestDir(PathBuf);

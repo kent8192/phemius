@@ -1325,6 +1325,7 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "htmd",
+ "libc",
  "pdf-extract",
  "process-wrap",
  "reqwest",
