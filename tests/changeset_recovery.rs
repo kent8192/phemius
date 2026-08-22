@@ -956,6 +956,97 @@ fn externally_deleted_old_files_are_not_recreated_by_apply_or_recovery() {
     }
 }
 
+#[test]
+fn restore_named_file_does_not_authorize_recreating_an_absent_target() {
+    let fixture = ApplyFixture::new();
+    let target = fixture.root.join("本文/replace.md");
+
+    assert!(
+        apply_changeset_with_test_hook(
+            &fixture.project,
+            &fixture.change,
+            inject_restore_and_delete_replace,
+        )
+        .is_err()
+    );
+    assert!(!target.exists());
+    assert!(fixture.transaction_path().join("restore-0001").is_file());
+    assert!(fixture.transaction_path().is_dir());
+
+    assert!(recover_pending(&fixture.root).is_err());
+    assert!(!target.exists());
+    assert!(fixture.transaction_path().join("restore-0001").is_file());
+}
+
+#[test]
+fn externally_deleted_installed_replace_is_not_rolled_back() {
+    let fixture = ApplyFixture::new();
+    let target = fixture.root.join("本文/replace.md");
+    apply_changeset_for_test(
+        &fixture.project,
+        &fixture.change,
+        TestInterruption::AfterReplaceInstall,
+    )
+    .unwrap_err();
+    fs::remove_file(&target).unwrap();
+
+    assert!(recover_pending(&fixture.root).is_err());
+    assert!(!target.exists());
+    assert!(fixture.transaction_path().is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn same_bytes_on_a_different_inode_are_not_treated_as_an_owned_install() {
+    use std::os::unix::fs::MetadataExt;
+
+    let fixture = ApplyFixture::new();
+    let target = fixture.root.join("本文/replace.md");
+    apply_changeset_for_test(
+        &fixture.project,
+        &fixture.change,
+        TestInterruption::AfterReplaceInstall,
+    )
+    .unwrap_err();
+    let installed = fs::read(&target).unwrap();
+    let installed_inode = fs::metadata(&target).unwrap().ino();
+    fs::rename(&target, fixture.outside.join("phemius-installed-replace")).unwrap();
+    fs::write(&target, &installed).unwrap();
+    let external_inode = fs::metadata(&target).unwrap().ino();
+    assert_ne!(external_inode, installed_inode);
+
+    assert!(recover_pending(&fixture.root).is_err());
+    assert_eq!(fs::metadata(&target).unwrap().ino(), external_inode);
+    assert_eq!(fs::read(&target).unwrap(), installed);
+    assert!(fixture.transaction_path().is_dir());
+}
+
+#[test]
+fn mismatched_quarantine_is_retained_instead_of_restored_live() {
+    let fixture = ApplyFixture::new();
+    let target = fixture.root.join("本文/create.md");
+    apply_changeset_for_test(
+        &fixture.project,
+        &fixture.change,
+        TestInterruption::AfterFirstRename,
+    )
+    .unwrap_err();
+
+    assert!(
+        recover_pending_for_test(
+            &fixture.root,
+            TestRecoveryInterruption::CorruptFirstQuarantineBeforeValidation,
+        )
+        .is_err()
+    );
+    assert!(!target.exists());
+    assert_eq!(
+        fs::read(fixture.transaction_path().join("quarantine-0000")).unwrap(),
+        b"external quarantine replacement"
+    );
+    assert!(fixture.transaction_path().is_dir());
+}
+
 #[cfg(unix)]
 #[test]
 fn recovery_keeps_using_the_pinned_root_after_the_project_path_is_swapped() {
@@ -1362,6 +1453,21 @@ fn delete_replace_after_prepared(project: &Project) {
 
 fn delete_delete_after_prepared(project: &Project) {
     fs::remove_file(project.root.join("本文/delete.md")).unwrap();
+}
+
+fn inject_restore_and_delete_replace(project: &Project) {
+    let transaction = fs::read_dir(project.root.join(".phemius/runtime/journal"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::copy(
+        transaction.join("before-0001"),
+        transaction.join("restore-0001"),
+    )
+    .unwrap();
+    fs::remove_file(project.root.join("本文/replace.md")).unwrap();
 }
 
 #[cfg(unix)]

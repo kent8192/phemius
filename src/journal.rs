@@ -14,7 +14,7 @@ use crate::{
         ApprovalRecord, Changeset, FileOperation, OperationKind, PinnedPath,
         approval_chain_head_in, approval_record_bytes, canon_root_hash_in, open_dir_no_follow_io,
         open_pinned_path_io, open_project_root_io, path_alias_key, read_regular_at_io,
-        sha256_bytes, validate_changeset_in, validate_target_lexical,
+        read_regular_snapshot_at_io, sha256_bytes, validate_changeset_in, validate_target_lexical,
     },
     domain::{EntityKind, is_prefixed_uuid},
     project::Project,
@@ -52,6 +52,35 @@ struct JournalEntry {
     after_sha256: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum OperationPhase {
+    MovedOld,
+    Installed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OperationProgress {
+    operation_index: u32,
+    kind: OperationKind,
+    phase: OperationPhase,
+    sha256: String,
+    identity: FileIdentity,
+}
+
+struct FileSnapshot {
+    sha256: String,
+    identity: FileIdentity,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestInterruption {
     AfterFirstRename,
@@ -67,6 +96,7 @@ pub enum TestInterruption {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestRecoveryInterruption {
     AfterFirstQuarantine,
+    CorruptFirstQuarantineBeforeValidation,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -314,29 +344,38 @@ fn apply_entry(
     let target = &transaction.targets[index];
     match entry.kind {
         OperationKind::Create => ensure!(
-            maybe_hash(target)?.is_none(),
+            maybe_snapshot(target)?.is_none(),
             "create target appeared: {}",
             target.display.display()
         ),
         OperationKind::Replace | OperationKind::Delete => {
-            ensure_hash(target, entry.before_sha256.as_deref(), "canon changed")?;
+            let before = read_snapshot(target)?;
+            ensure_snapshot_hash(
+                &before,
+                entry.before_sha256.as_deref(),
+                "canon changed",
+                &target.display,
+            )?;
             let old = OsString::from(format!("old-live-{index:04}"));
             rename_no_replace(&target.parent, &target.leaf, &transaction.dir, &old)
                 .with_context(|| format!("failed to preserve {}", target.display.display()))?;
             sync_dir(&target.parent)?;
             sync_dir(&transaction.dir)?;
-            if let Err(error) = ensure_hash_at(
-                &transaction.dir,
-                &old,
+            let moved = read_snapshot_at(&transaction.dir, &old)?;
+            ensure_snapshot(
+                &moved,
                 entry.before_sha256.as_deref(),
+                Some(before.identity),
                 "preserved canon raced",
-            ) {
-                if maybe_hash(target)?.is_none() {
-                    let _ = rename_no_replace(&transaction.dir, &old, &target.parent, &target.leaf);
-                    let _ = sync_dir(&target.parent);
-                }
-                return Err(error);
-            }
+                Path::new(&old),
+            )?;
+            persist_operation_progress(
+                &transaction.dir,
+                index,
+                entry,
+                OperationPhase::MovedOld,
+                &moved,
+            )?;
             if (entry.kind == OperationKind::Replace
                 && interruption == Some(TestInterruption::AfterReplacePreserve))
                 || (entry.kind == OperationKind::Delete
@@ -348,14 +387,31 @@ fn apply_entry(
     }
     if entry.after_sha256.is_some() {
         let after = OsString::from(format!("after-{index:04}"));
+        let staged = read_snapshot_at(&transaction.dir, &after)?;
+        ensure_snapshot_hash(
+            &staged,
+            entry.after_sha256.as_deref(),
+            "staged file changed",
+            Path::new(&after),
+        )?;
         rename_no_replace(&transaction.dir, &after, &target.parent, &target.leaf)
             .with_context(|| format!("failed to install {}", target.display.display()))?;
         sync_dir(&transaction.dir)?;
         sync_dir(&target.parent)?;
-        ensure_hash(
-            target,
+        let installed = read_snapshot(target)?;
+        ensure_snapshot(
+            &installed,
             entry.after_sha256.as_deref(),
+            Some(staged.identity),
             "installed file changed",
+            &target.display,
+        )?;
+        persist_operation_progress(
+            &transaction.dir,
+            index,
+            entry,
+            OperationPhase::Installed,
+            &installed,
         )?;
     }
     Ok(())
@@ -589,11 +645,12 @@ fn validate_transaction_entries(dir: &Dir, journal: &ApplyJournal) -> Result<()>
         if entry.before_sha256.is_some() {
             allowed.insert(OsString::from(format!("before-{index:04}")));
             allowed.insert(OsString::from(format!("old-live-{index:04}")));
-            allowed.insert(OsString::from(format!("restore-{index:04}")));
+            allowed.insert(progress_name(index, OperationPhase::MovedOld));
         }
         if entry.after_sha256.is_some() {
             allowed.insert(OsString::from(format!("after-{index:04}")));
             allowed.insert(OsString::from(format!("quarantine-{index:04}")));
+            allowed.insert(progress_name(index, OperationPhase::Installed));
         }
     }
     for entry in dir.entries().context("failed to enumerate transaction")? {
@@ -624,23 +681,40 @@ fn validate_recovery_evidence(transaction: &Transaction) -> Result<()> {
                 Some(before),
                 "before image changed",
             )?;
+            let moved =
+                read_operation_progress(&transaction.dir, index, entry, OperationPhase::MovedOld)?;
             let old = OsString::from(format!("old-live-{index:04}"));
             if exists_at(&transaction.dir, &old)? {
-                ensure_hash_at(
-                    &transaction.dir,
-                    &old,
+                let moved = moved
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("preserved canon has no durable moved-old progress"))?;
+                let snapshot = read_snapshot_at(&transaction.dir, &old)?;
+                ensure_snapshot(
+                    &snapshot,
                     Some(before),
+                    Some(moved.identity),
                     "preserved canon changed",
+                    Path::new(&old),
                 )?;
             }
         }
+        let installed = if entry.after_sha256.is_some() {
+            read_operation_progress(&transaction.dir, index, entry, OperationPhase::Installed)?
+        } else {
+            None
+        };
         let quarantine = OsString::from(format!("quarantine-{index:04}"));
         if exists_at(&transaction.dir, &quarantine)? {
-            ensure_hash_at(
-                &transaction.dir,
-                &quarantine,
+            let installed = installed
+                .as_ref()
+                .ok_or_else(|| anyhow!("quarantined target has no durable installed progress"))?;
+            let snapshot = read_snapshot_at(&transaction.dir, &quarantine)?;
+            ensure_snapshot(
+                &snapshot,
                 entry.after_sha256.as_deref(),
+                Some(installed.identity),
                 "quarantined target changed",
+                Path::new(&quarantine),
             )?;
         }
     }
@@ -665,6 +739,7 @@ fn rollback_prepared(
         &transaction.dir,
         OsStr::new("approval-quarantine"),
         &transaction.journal.approval_record_sha256,
+        None,
         interruption,
         &mut quarantined,
     )?;
@@ -674,17 +749,34 @@ fn rollback_prepared(
         let entry = &transaction.journal.entries[index];
         let target = &transaction.targets[index];
         match &entry.before_sha256 {
-            None => quarantine_created(
-                target,
-                &transaction.dir,
-                OsStr::new(&format!("quarantine-{index:04}")),
-                entry
-                    .after_sha256
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("create operation has no after hash"))?,
-                interruption,
-                &mut quarantined,
-            )?,
+            None => {
+                let installed = read_operation_progress(
+                    &transaction.dir,
+                    index,
+                    entry,
+                    OperationPhase::Installed,
+                )?;
+                if let Some(installed) = installed {
+                    quarantine_created(
+                        target,
+                        &transaction.dir,
+                        OsStr::new(&format!("quarantine-{index:04}")),
+                        entry
+                            .after_sha256
+                            .as_deref()
+                            .ok_or_else(|| anyhow!("create operation has no after hash"))?,
+                        Some(installed.identity),
+                        interruption,
+                        &mut quarantined,
+                    )?;
+                } else {
+                    ensure!(
+                        maybe_snapshot(target)?.is_none(),
+                        "refusing to quarantine an unowned create target {}",
+                        target.display.display()
+                    );
+                }
+            }
             Some(before) => restore_before(
                 transaction,
                 index,
@@ -720,55 +812,65 @@ fn quarantine_created(
     transaction: &Dir,
     quarantine: &OsStr,
     expected: &str,
+    expected_identity: Option<FileIdentity>,
     interruption: Option<TestRecoveryInterruption>,
     quarantined: &mut usize,
 ) -> Result<()> {
     if exists_at(transaction, quarantine)? {
-        ensure_hash_at(
-            transaction,
-            quarantine,
+        let snapshot = read_snapshot_at(transaction, quarantine)?;
+        ensure_snapshot(
+            &snapshot,
             Some(expected),
+            expected_identity,
             "quarantined file changed",
+            Path::new(quarantine),
         )?;
         ensure!(
-            maybe_hash(live)?.is_none(),
+            maybe_snapshot(live)?.is_none(),
             "live file reappeared beside quarantine: {}",
             live.display.display()
         );
         return Ok(());
     }
-    let Some(actual) = maybe_hash(live)? else {
+    let Some(snapshot) = maybe_snapshot(live)? else {
+        ensure!(
+            expected_identity.is_none(),
+            "Phemius-owned installed file is missing: {}",
+            live.display.display()
+        );
         return Ok(());
     };
-    ensure!(
-        actual == expected,
-        "refusing to overwrite externally changed file {}",
-        live.display.display()
-    );
+    ensure_snapshot(
+        &snapshot,
+        Some(expected),
+        expected_identity,
+        "refusing to quarantine externally changed file",
+        &live.display,
+    )?;
     rename_no_replace(&live.parent, &live.leaf, transaction, quarantine)?;
     sync_dir(&live.parent)?;
     sync_dir(transaction)?;
     *quarantined += 1;
+    if *quarantined == 1
+        && interruption == Some(TestRecoveryInterruption::CorruptFirstQuarantineBeforeValidation)
+    {
+        transaction.remove_file(quarantine)?;
+        write_new_synced(transaction, quarantine, b"external quarantine replacement")?;
+        sync_dir(transaction)?;
+    }
     if *quarantined == 1 && interruption == Some(TestRecoveryInterruption::AfterFirstQuarantine) {
         return Err(SimulatedCrash.into());
     }
-    match ensure_hash_at(
-        transaction,
-        quarantine,
+    let quarantined_snapshot = read_snapshot_at(transaction, quarantine)?;
+    ensure_snapshot(
+        &quarantined_snapshot,
         Some(expected),
+        expected_identity,
         "quarantined file raced",
-    ) {
-        Ok(()) => {}
-        Err(error) => {
-            if maybe_hash(live)?.is_none() {
-                let _ = rename_no_replace(transaction, quarantine, &live.parent, &live.leaf);
-                let _ = sync_dir(&live.parent);
-            }
-            return Err(error);
-        }
-    }
+        Path::new(quarantine),
+    )?;
     ensure!(
-        maybe_hash(live)?.is_none(),
+        maybe_snapshot(live)?.is_none(),
         "live file reappeared after quarantine: {}",
         live.display.display()
     );
@@ -784,55 +886,85 @@ fn restore_before(
     interruption: Option<TestRecoveryInterruption>,
     quarantined: &mut usize,
 ) -> Result<()> {
-    let current = maybe_hash(target)?;
-    match current.as_deref() {
-        Some(actual) if actual == before => return Ok(()),
-        Some(actual) if after == Some(actual) => {}
-        Some(_) => {
-            bail!(
-                "refusing to overwrite externally changed target {}",
-                target.display.display()
-            )
-        }
-        None => {}
+    let current = maybe_snapshot(target)?;
+    if current
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.sha256 == before)
+    {
+        return Ok(());
     }
 
+    let entry = &transaction.journal.entries[index];
+    let moved = read_operation_progress(&transaction.dir, index, entry, OperationPhase::MovedOld)?
+        .ok_or_else(|| {
+            anyhow!(
+                "refusing to restore {} without durable moved-old progress",
+                target.display.display()
+            )
+        })?;
     let old = OsString::from(format!("old-live-{index:04}"));
-    let restore = OsString::from(format!("restore-{index:04}"));
-    let old_exists = exists_at(&transaction.dir, &old)?;
-    let restore_exists = exists_at(&transaction.dir, &restore)?;
     ensure!(
-        old_exists || restore_exists,
-        "refusing to restore {} without Phemius-owned move evidence",
+        exists_at(&transaction.dir, &old)?,
+        "Phemius-owned old file is missing for {}",
         target.display.display()
     );
-    ensure!(
-        !(old_exists && restore_exists),
-        "ambiguous restore evidence for {}",
-        target.display.display()
-    );
-    let source = if old_exists { &old } else { &restore };
-    ensure_hash_at(
-        &transaction.dir,
-        source,
+    let old_snapshot = read_snapshot_at(&transaction.dir, &old)?;
+    ensure_snapshot(
+        &old_snapshot,
         Some(before),
+        Some(moved.identity),
         "owned restore evidence changed",
+        Path::new(&old),
     )?;
-    if let Some(actual) = current {
-        quarantine_created(
-            target,
-            &transaction.dir,
-            OsStr::new(&format!("quarantine-{index:04}")),
-            &actual,
-            interruption,
-            quarantined,
-        )?;
+
+    match entry.kind {
+        OperationKind::Replace => {
+            let installed =
+                read_operation_progress(&transaction.dir, index, entry, OperationPhase::Installed)?;
+            if let Some(installed) = installed {
+                quarantine_created(
+                    target,
+                    &transaction.dir,
+                    OsStr::new(&format!("quarantine-{index:04}")),
+                    after.ok_or_else(|| anyhow!("replace operation has no after hash"))?,
+                    Some(installed.identity),
+                    interruption,
+                    quarantined,
+                )?;
+            } else {
+                ensure!(
+                    current.is_none(),
+                    "refusing to overwrite unowned target {}",
+                    target.display.display()
+                );
+                ensure!(
+                    !exists_at(
+                        &transaction.dir,
+                        OsStr::new(&format!("quarantine-{index:04}"))
+                    )?,
+                    "quarantine has no durable installed progress"
+                );
+            }
+        }
+        OperationKind::Delete => ensure!(
+            current.is_none(),
+            "refusing to overwrite externally created delete target {}",
+            target.display.display()
+        ),
+        OperationKind::Create => bail!("create operation cannot restore a before image"),
     }
-    rename_no_replace(&transaction.dir, source, &target.parent, &target.leaf)
+    rename_no_replace(&transaction.dir, &old, &target.parent, &target.leaf)
         .with_context(|| format!("failed to restore {}", target.display.display()))?;
     sync_dir(&transaction.dir)?;
     sync_dir(&target.parent)?;
-    ensure_hash(target, Some(before), "restored target changed")
+    let restored = read_snapshot(target)?;
+    ensure_snapshot(
+        &restored,
+        Some(before),
+        Some(moved.identity),
+        "restored target changed",
+        &target.display,
+    )
 }
 
 fn verify_committed_approval(transaction: &Transaction) -> Result<()> {
@@ -1024,6 +1156,144 @@ fn read_regular_at(dir: &Dir, name: &OsStr) -> Result<Vec<u8>> {
     Ok(read_regular_at_io(dir, name)?)
 }
 
+fn read_snapshot(path: &ManagedPath) -> Result<FileSnapshot> {
+    read_snapshot_at(&path.parent, &path.leaf)
+        .with_context(|| format!("failed to read {}", path.display.display()))
+}
+
+fn read_snapshot_at(dir: &Dir, name: &OsStr) -> Result<FileSnapshot> {
+    let snapshot = read_regular_snapshot_at_io(dir, name)?;
+    Ok(FileSnapshot {
+        sha256: sha256_bytes(&snapshot.bytes),
+        identity: FileIdentity {
+            device: snapshot.device,
+            inode: snapshot.inode,
+        },
+    })
+}
+
+fn maybe_snapshot(path: &ManagedPath) -> Result<Option<FileSnapshot>> {
+    match read_snapshot(path) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(error) if io_kind(&error) == Some(std::io::ErrorKind::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_snapshot_hash(
+    snapshot: &FileSnapshot,
+    expected: Option<&str>,
+    label: &str,
+    display: &Path,
+) -> Result<()> {
+    let expected = expected.ok_or_else(|| anyhow!("{label}: expected hash is missing"))?;
+    ensure!(
+        snapshot.sha256 == expected,
+        "{label}: {}",
+        display.display()
+    );
+    Ok(())
+}
+
+fn ensure_snapshot(
+    snapshot: &FileSnapshot,
+    expected_hash: Option<&str>,
+    expected_identity: Option<FileIdentity>,
+    label: &str,
+    display: &Path,
+) -> Result<()> {
+    ensure_snapshot_hash(snapshot, expected_hash, label, display)?;
+    if let Some(expected) = expected_identity {
+        ensure!(
+            snapshot.identity == expected,
+            "{label}: file identity changed for {}",
+            display.display()
+        );
+    }
+    Ok(())
+}
+
+fn progress_name(index: usize, phase: OperationPhase) -> OsString {
+    let phase = match phase {
+        OperationPhase::MovedOld => "moved-old",
+        OperationPhase::Installed => "installed",
+    };
+    OsString::from(format!("progress-{index:04}-{phase}.json"))
+}
+
+fn expected_progress_hash(entry: &JournalEntry, phase: OperationPhase) -> Result<&str> {
+    let hash = match phase {
+        OperationPhase::MovedOld => entry.before_sha256.as_deref(),
+        OperationPhase::Installed => entry.after_sha256.as_deref(),
+    };
+    hash.ok_or_else(|| anyhow!("operation has no hash for {phase:?} progress"))
+}
+
+fn validate_progress_shape(entry: &JournalEntry, phase: OperationPhase) -> Result<()> {
+    let allowed = matches!(
+        (entry.kind, phase),
+        (
+            OperationKind::Replace | OperationKind::Delete,
+            OperationPhase::MovedOld
+        ) | (
+            OperationKind::Create | OperationKind::Replace,
+            OperationPhase::Installed
+        )
+    );
+    ensure!(allowed, "operation kind cannot enter {phase:?} phase");
+    Ok(())
+}
+
+fn persist_operation_progress(
+    transaction: &Dir,
+    index: usize,
+    entry: &JournalEntry,
+    phase: OperationPhase,
+    snapshot: &FileSnapshot,
+) -> Result<()> {
+    validate_progress_shape(entry, phase)?;
+    let expected = expected_progress_hash(entry, phase)?;
+    ensure!(
+        snapshot.sha256 == expected,
+        "cannot persist progress for changed file"
+    );
+    let progress = OperationProgress {
+        operation_index: u32::try_from(index).context("operation index is too large")?,
+        kind: entry.kind,
+        phase,
+        sha256: snapshot.sha256.clone(),
+        identity: snapshot.identity,
+    };
+    let bytes = serde_json::to_vec(&progress).context("failed to encode operation progress")?;
+    write_new_synced(transaction, &progress_name(index, phase), &bytes)?;
+    sync_dir(transaction)
+}
+
+fn read_operation_progress(
+    transaction: &Dir,
+    index: usize,
+    entry: &JournalEntry,
+    phase: OperationPhase,
+) -> Result<Option<OperationProgress>> {
+    validate_progress_shape(entry, phase)?;
+    let name = progress_name(index, phase);
+    let bytes = match read_regular_at(transaction, &name) {
+        Ok(bytes) => bytes,
+        Err(error) if io_kind(&error) == Some(std::io::ErrorKind::NotFound) => return Ok(None),
+        Err(error) => return Err(error).context("failed to read operation progress"),
+    };
+    let progress: OperationProgress =
+        serde_json::from_slice(&bytes).context("failed to parse operation progress")?;
+    ensure!(
+        progress.operation_index == u32::try_from(index).context("operation index is too large")?
+            && progress.kind == entry.kind
+            && progress.phase == phase
+            && progress.sha256 == expected_progress_hash(entry, phase)?,
+        "operation progress does not match its journal entry"
+    );
+    Ok(Some(progress))
+}
+
 fn maybe_hash(path: &ManagedPath) -> Result<Option<String>> {
     match read_regular(path) {
         Ok(bytes) => Ok(Some(sha256_bytes(&bytes))),
@@ -1041,13 +1311,6 @@ fn exists_at(dir: &Dir, name: &OsStr) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
-}
-
-fn ensure_hash(path: &ManagedPath, expected: Option<&str>, label: &str) -> Result<()> {
-    let expected = expected.ok_or_else(|| anyhow!("{label}: expected hash is missing"))?;
-    let actual = maybe_hash(path)?.ok_or_else(|| anyhow!("{label}: file is missing"))?;
-    ensure!(actual == expected, "{label}: {}", path.display.display());
-    Ok(())
 }
 
 fn ensure_hash_at(dir: &Dir, name: &OsStr, expected: Option<&str>, label: &str) -> Result<()> {
