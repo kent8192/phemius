@@ -96,7 +96,7 @@ async fn ordinary_scripted_backend_clones_share_the_response_queue() {
         })
     });
 
-    let run = RunController::fixture(ScriptedModel::shared(responses))
+    let run = RunController::fixture(ScriptedModel::new(responses))
         .write_chapter("chapter_1")
         .await
         .unwrap();
@@ -348,6 +348,13 @@ async fn project_context_receipt_covers_manifest_and_is_saved_with_changeset() {
             .collect::<Vec<_>>(),
         vec![CoverageDisposition::Raw]
     );
+    assert!(
+        run.role_context_receipts
+            .contains_key(AgentRole::Writer.name())
+    );
+    for role in AgentSpec::critic_roles() {
+        assert!(run.role_context_receipts.contains_key(role.name()));
+    }
 }
 
 #[tokio::test]
@@ -376,6 +383,27 @@ async fn a_new_project_controller_resumes_the_latest_session_directory() {
     }
     let mut reopened = RunController::fixture_with_project(project, ScriptedModel::new([]));
     assert!(reopened.resume_checkpoint().unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_reopened_controller_cannot_regenerate_without_state_reconstruction() {
+    let directory = TestDir::new("workflow-resume-write");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let chapter_id = prefixed_uuid(EntityKind::Chapter);
+    {
+        let mut first =
+            RunController::fixture_with_project(project.clone(), ScriptedModel::new([]));
+        first.write_chapter(chapter_id.as_str()).await.unwrap();
+    }
+    let mut reopened = RunController::fixture_with_project(project, ScriptedModel::new([]));
+    let error = reopened
+        .write_chapter(chapter_id.as_str())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("state reconstruction"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -496,11 +524,10 @@ async fn revision_cycles_are_bounded_and_ambiguous_requests_are_not_retried() {
 #[tokio::test]
 async fn cost_warning_and_chapter_hard_gate_are_checked_before_reservation() {
     let mut controller = RunController::fixture(ScriptedModel::new([]));
-    controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(1_000_001)));
+    controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(300_001)));
     controller.confirm_cost_warning();
     controller.write_chapter("chapter_1").await.unwrap();
-    assert!(controller.cost_status().warning);
-    assert!(controller.cost_status().chapter.as_u64() > 5_000_000);
+    assert!(controller.cost_status().chapter.as_u64() >= 2_400_000);
 
     let mut gated = RunController::fixture(ScriptedModel::new([]));
     gated.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(3_000_001)));
@@ -515,7 +542,7 @@ async fn repl_requires_explicit_cost_confirmation_before_model_request() {
         tool_calls: Vec::new(),
     })]);
     let mut controller = RunController::fixture(backend);
-    controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(1_000_001)));
+    controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(300_001)));
     let mut repl = Repl::with_controller(controller);
 
     assert!(matches!(

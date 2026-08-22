@@ -36,8 +36,13 @@ logs. A production run therefore starts with:
 
 ```sh
 export OPENROUTER_API_KEY='…'
+export PHEMIUS_MAX_REQUEST_MICRODOLLARS=300000
 cargo run --release -- init ./my-novel
 ```
+
+The second variable is a conservative maximum reservation per model call in
+microdollars. If it is missing or invalid, paid generation stops rather than
+guessing a price.
 
 `init` asks for a title and creates the project tree. It does not invent a
 plot, approve a framework, or start a paid request. See

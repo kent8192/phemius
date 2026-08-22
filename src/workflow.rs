@@ -434,10 +434,14 @@ pub struct ChapterRun {
     pub correction_receipts: Vec<CorrectionReceipt>,
     /// Hash-bound, run-local provisional candidates visible to later chapters.
     pub provisional_canon_hashes: Vec<(String, String)>,
+    /// Candidate prose for earlier unapproved chapters in the same continuous run.
+    pub provisional_canon_texts: Vec<(String, String)>,
     /// Redacted context receipt hash.
     pub context_receipt_hash: String,
     /// Complete non-secret source coverage receipt used for this candidate.
     pub context_receipt: Option<ContextReceipt>,
+    /// Role-specific source receipts used by critics and the reviser.
+    pub role_context_receipts: BTreeMap<String, ContextReceipt>,
     /// Candidate prose retained outside canon.
     pub candidate_text: String,
     /// Preflight evidence.
@@ -529,9 +533,11 @@ pub struct RunController {
     plot_framework: Option<String>,
     strict_backend_errors: bool,
     provisional_canon: BTreeMap<String, String>,
+    provisional_canon_texts: BTreeMap<String, String>,
     run_id: String,
     session: Option<SessionJournal>,
     checkpoint_path: Option<PathBuf>,
+    recovery_required: bool,
 }
 
 impl RunController {
@@ -566,7 +572,7 @@ impl RunController {
             max_length: 12_000,
             max_revisions: 2,
             cost_ledger: BudgetLedger::new(MicroDollars::zero(), MicroDollars::zero()),
-            request_maximum_cost: Some(MicroDollars::new(100_000)),
+            request_maximum_cost: None,
             cost_warning_confirmed: false,
             cost_status: CostStatus {
                 chapter: MicroDollars::zero(),
@@ -577,9 +583,11 @@ impl RunController {
             plot_framework: None,
             strict_backend_errors: true,
             provisional_canon: BTreeMap::new(),
+            provisional_canon_texts: BTreeMap::new(),
             run_id: prefixed_uuid(EntityKind::Run).as_str().into(),
             session: None,
             checkpoint_path: None,
+            recovery_required: false,
         }
     }
 
@@ -596,6 +604,7 @@ impl RunController {
         controller.min_length = 0;
         controller.max_length = usize::MAX;
         controller.strict_backend_errors = false;
+        controller.request_maximum_cost = Some(MicroDollars::new(100_000));
         controller.register_chapter("chapter_1", 1, ChapterState::Planned);
         controller
     }
@@ -614,8 +623,18 @@ impl RunController {
     pub fn with_project(project: Project, backend: ModelBackend) -> Self {
         let mut controller = Self::new(backend);
         controller.project = Some(project);
+        controller.load_request_maximum_from_environment();
         controller.load_declared_project_plan();
         controller
+    }
+
+    fn load_request_maximum_from_environment(&mut self) {
+        let Ok(value) = std::env::var("PHEMIUS_MAX_REQUEST_MICRODOLLARS") else {
+            return;
+        };
+        if let Ok(microdollars) = value.parse::<u64>() {
+            self.request_maximum_cost = Some(MicroDollars::new(microdollars));
+        }
     }
 
     fn load_declared_project_plan(&mut self) {
@@ -779,6 +798,31 @@ impl RunController {
         self.cost_status
     }
 
+    /// Records a coordinator instruction through the durable session boundary.
+    ///
+    /// This path never approves canon or launches a model request; executable generation remains
+    /// the explicit `/write` workflow.
+    pub fn record_coordinator_request(&mut self, request: impl Into<String>) -> Result<String> {
+        let request = request.into();
+        ensure!(!request.trim().is_empty(), "coordinator request is empty");
+        if self.project.is_some() && self.session.is_none() {
+            self.attach_latest_session()?;
+        }
+        ensure!(
+            !self.recovery_required,
+            "durable checkpoint requires in-memory state reconstruction; manual resolution is required"
+        );
+        self.ensure_durable_session()?;
+        let hash = sha256_bytes(request.as_bytes());
+        self.append_session_event(SessionEvent::UserInstruction {
+            text: format!("coordinator: {request}"),
+        })?;
+        self.checkpoint(&hash)?;
+        Ok(format!(
+            "coordinator request recorded: {request}; canon unchanged"
+        ))
+    }
+
     /// Opens the project-local append-only session journal and cost ledger on first use.
     ///
     /// The lazy open keeps fixture controllers in-memory while production project controllers
@@ -906,6 +950,7 @@ impl RunController {
         self.session = Some(SessionJournal::open(&journal_path)?);
         self.cost_ledger = BudgetLedger::open(&cost_path)?;
         self.checkpoint_path = Some(checkpoint_path);
+        self.recovery_required = true;
         Ok(())
     }
 
@@ -957,6 +1002,9 @@ impl RunController {
         reason: impl Into<String>,
     ) -> Result<()> {
         let reason = reason.into();
+        let finding_entity = EntityId::from_validated(finding_id.to_owned())
+            .ok_or_else(|| anyhow!("finding ID is invalid: {finding_id}"))?;
+        let reason_hash = sha256_bytes(reason.as_bytes());
         ensure!(
             !reason.trim().is_empty(),
             "false-positive reason is required"
@@ -992,6 +1040,14 @@ impl RunController {
                 .retain(|id| id.as_str() != finding_id);
         }
         self.refresh_chapter_states();
+        if self.project.is_some() {
+            self.ensure_durable_session()?;
+        }
+        self.append_session_event(SessionEvent::FindingResolved {
+            finding_id: finding_entity,
+            reason_hash: reason_hash.clone(),
+        })?;
+        self.checkpoint(&reason_hash)?;
         Ok(())
     }
 
@@ -1066,6 +1122,8 @@ impl RunController {
         }
         self.provisional_canon
             .insert(chapter_id.into(), candidate_hash);
+        self.provisional_canon_texts
+            .insert(chapter_id.into(), candidate_text);
         self.note_upstream_edit(chapter_id)?;
         self.refresh_chapter_states();
         Ok(())
@@ -1199,6 +1257,7 @@ impl RunController {
                 };
             }
             self.provisional_canon.remove(&chapter.id);
+            self.provisional_canon_texts.remove(&chapter.id);
         }
         for descendant_id in descendant_ids {
             self.invalidate_chapter_findings(&descendant_id);
@@ -1406,9 +1465,15 @@ impl RunController {
         let maximum = self
             .request_maximum_cost
             .expect("request maximum was checked above");
+        let maximum_calls = 2usize
+            .saturating_add(AgentSpec::critic_roles().len())
+            .saturating_add(
+                self.max_revisions
+                    .saturating_mul(1usize.saturating_add(AgentSpec::critic_roles().len())),
+            );
         let estimated_cost = maximum
             .as_u64()
-            .checked_mul(9)
+            .checked_mul(maximum_calls as u64)
             .ok_or_else(|| anyhow!("chapter cost arithmetic overflow"))?;
         ensure!(
             estimated_cost <= 10_000_000,
@@ -1425,6 +1490,10 @@ impl RunController {
         if self.project.is_some() && self.session.is_none() {
             self.attach_latest_session()?;
         }
+        ensure!(
+            !self.recovery_required,
+            "durable checkpoint requires in-memory state reconstruction; manual resolution is required"
+        );
         self.ensure_durable_session()?;
         self.append_session_event(SessionEvent::UserInstruction {
             text: format!("write chapter {chapter_id}"),
@@ -1491,10 +1560,24 @@ impl RunController {
                     .map(|hash| (chapter.id.clone(), hash.clone()))
             })
             .collect::<Vec<_>>();
+        let provisional_canon_texts = self
+            .chapters
+            .values()
+            .filter(|chapter| chapter.order < chapter_order)
+            .filter_map(|chapter| {
+                self.provisional_canon_texts
+                    .get(&chapter.id)
+                    .map(|text| (chapter.id.clone(), text.clone()))
+            })
+            .collect::<Vec<_>>();
         let correction_receipts = self.correction_receipt(chapter_id);
         let (compiled_context, context_receipt) = self
             .compile_project_context(chapter_id, AgentRole::Writer)
             .map_err(|error| anyhow!("context compilation stopped: {error}"))?;
+        let mut role_context_receipts = BTreeMap::new();
+        if let Some(receipt) = context_receipt.clone() {
+            role_context_receipts.insert(AgentRole::Writer.name().into(), receipt);
+        }
         let context_receipt_json = context_receipt
             .as_ref()
             .map(serde_json::to_string)
@@ -1504,12 +1587,17 @@ impl RunController {
         let writer_request = ModelRequest::new(
             AgentRole::Writer.name(),
             vec![ModelMessage::user(format!(
-                "Write chapter {chapter_id}. Approved scene and box plans are required.\n\nArchitect plan: {architect_plan}\n\nCompiled source context (use only as evidence):\n{compiled_context}\n\nContext receipt: {context_receipt_json}\n\nProvisional canon hashes: {}. Corrections: {}",
+                "Write chapter {chapter_id}. Approved scene and box plans are required.\n\nArchitect plan: {architect_plan}\n\nCompiled source context (use only as evidence):\n{compiled_context}\n\nContext receipt: {context_receipt_json}\n\nProvisional canon hashes: {}\n\nProvisional canon candidate prose (run-local, not approved canon): {}\n\nCorrections: {}",
                 provisional_canon_hashes
                     .iter()
                     .map(|(id, hash)| format!("{id}={hash}"))
                     .collect::<Vec<_>>()
                     .join(","),
+                provisional_canon_texts
+                    .iter()
+                    .map(|(id, text)| format!("--- {id} ---\n{text}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 correction_receipts
                     .iter()
                     .map(|receipt| receipt.directive.as_str())
@@ -1562,12 +1650,24 @@ impl RunController {
         for role_batch in role_order.chunks(3) {
             let mut specs = Vec::with_capacity(role_batch.len());
             for role in role_batch {
+                let (role_context, role_receipt) = self
+                    .compile_project_context(chapter_id, *role)
+                    .map_err(|error| anyhow!("context compilation stopped: {error}"))?;
+                if let Some(receipt) = role_receipt {
+                    role_context_receipts.insert(role.name().into(), receipt.clone());
+                }
+                let role_receipt_json = role_context_receipts
+                    .get(role.name())
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .context("failed to serialize role context receipt")?
+                    .unwrap_or_default();
                 trace.roles.push(*role);
                 trace.critic_calls += 1;
                 specs.push((
                     *role,
                     format!(
-                        "Review candidate chapter {chapter_id} without editing it.\n\nImmutable candidate:\n{candidate_text}\n\nCompiled source context:\n{compiled_context}\n\nContext receipt:\n{context_receipt_json}\n\nImmutable context facts: provisional canon hashes={provisional_canon_hashes:?}; corrections={correction_receipts:?}. Report typed evidence as FINDING|kind|artifact|start|end|message."
+                        "Review candidate chapter {chapter_id} without editing it.\n\nImmutable candidate:\n{candidate_text}\n\nRole-specific compiled source context:\n{role_context}\n\nRole-specific context receipt:\n{role_receipt_json}\n\nImmutable context facts: provisional canon hashes={provisional_canon_hashes:?}; corrections={correction_receipts:?}. Report typed evidence as FINDING|kind|artifact|start|end|message."
                     ),
                 ));
             }
@@ -1613,8 +1713,20 @@ impl RunController {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            let (reviser_context, reviser_receipt) = self
+                .compile_project_context(chapter_id, AgentRole::Reviser)
+                .map_err(|error| anyhow!("context compilation stopped: {error}"))?;
+            if let Some(receipt) = reviser_receipt {
+                role_context_receipts.insert(AgentRole::Reviser.name().into(), receipt);
+            }
+            let reviser_receipt_json = role_context_receipts
+                .get(AgentRole::Reviser.name())
+                .map(serde_json::to_string)
+                .transpose()
+                .context("failed to serialize reviser context receipt")?
+                .unwrap_or_default();
             let required_facts = format!(
-                "compiled source context:\n{compiled_context}\n\ncontext receipt:\n{context_receipt_json}\n\nprovisional canon hashes={provisional_canon_hashes:?}; correction receipts={correction_receipts:?}"
+                "role-specific compiled source context:\n{reviser_context}\n\nrole-specific context receipt:\n{reviser_receipt_json}\n\nprovisional canon hashes={provisional_canon_hashes:?}; correction receipts={correction_receipts:?}"
             );
             let request = ModelRequest::new(
                 AgentRole::Reviser.name(),
@@ -1653,12 +1765,24 @@ impl RunController {
                     for role_batch in rerun_roles.chunks(3) {
                         let mut specs = Vec::with_capacity(role_batch.len());
                         for role in role_batch {
+                            let (role_context, role_receipt) = self
+                                .compile_project_context(chapter_id, *role)
+                                .map_err(|error| anyhow!("context compilation stopped: {error}"))?;
+                            if let Some(receipt) = role_receipt {
+                                role_context_receipts.insert(role.name().into(), receipt.clone());
+                            }
+                            let role_receipt_json = role_context_receipts
+                                .get(role.name())
+                                .map(serde_json::to_string)
+                                .transpose()
+                                .context("failed to serialize role context receipt")?
+                                .unwrap_or_default();
                             trace.roles.push(*role);
                             trace.critic_calls += 1;
                             specs.push((
                                 *role,
                                 format!(
-                                    "Re-review this revised immutable candidate chapter {chapter_id}; report only current typed evidence as FINDING|kind|artifact|start|end|message.\n\nCandidate:\n{candidate_text}\n\nRequired source context, receipt, and correction directives:\n{required_facts}"
+                                    "Re-review this revised immutable candidate chapter {chapter_id}; report only current typed evidence as FINDING|kind|artifact|start|end|message.\n\nCandidate:\n{candidate_text}\n\nRole-specific source context:\n{role_context}\n\nRole-specific context receipt:\n{role_receipt_json}\n\nCorrection directives:\n{correction_receipts:?}"
                                 ),
                             ));
                         }
@@ -1795,6 +1919,10 @@ impl RunController {
             &serde_json::to_vec(&(context_base_hash, &correction_receipts))
                 .context("failed to serialize context receipt hash material")?,
         );
+        self.provisional_canon
+            .insert(chapter_id.into(), candidate_hash);
+        self.provisional_canon_texts
+            .insert(chapter_id.into(), candidate_text.clone());
         let run = ChapterRun {
             chapter_id: chapter_id.into(),
             changeset,
@@ -1803,13 +1931,13 @@ impl RunController {
             findings,
             correction_receipts,
             provisional_canon_hashes,
+            provisional_canon_texts,
             context_receipt_hash,
             context_receipt,
+            role_context_receipts,
             candidate_text,
             preflight: self.preflight.clone(),
         };
-        self.provisional_canon
-            .insert(chapter_id.into(), candidate_hash);
         self.chapter_runs.insert(chapter_id.into(), run.clone());
         self.chapters
             .get_mut(chapter_id)

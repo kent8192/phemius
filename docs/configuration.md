@@ -11,6 +11,17 @@ The production client reads one variable:
 export OPENROUTER_API_KEY='…'
 ```
 
+Set the trusted per-request reservation maximum in whole microdollars for a
+production CLI session:
+
+```sh
+export PHEMIUS_MAX_REQUEST_MICRODOLLARS=300000
+```
+
+If it is absent or not an integer, paid generation stops with an unknown-price
+error. The controller reserves this maximum before every model call and still
+enforces the `$5`/`$10`/`$120` limits.
+
 The key is read by the trusted HTTP client. It is not passed to Seatbelt
 children and is not serialized into session events, checkpoints, receipts, or
 debug output. The endpoint, provider policy, and context-compression setting
@@ -89,7 +100,10 @@ and stops continuous generation at `$120`. The REPL asks for
 Session evidence is kept in `.phemius/records/sessions/<run-id>/` as
 append-only `session.jsonl` and `cost.jsonl`, with a derived `checkpoint.json`.
 If a session has events but no checkpoint, the next run stops for manual
-resolution. `/resume` reads a checkpoint without resending an API request.
+resolution. `/resume` reads a checkpoint without resending an API request. A
+fresh process does not regenerate from a checkpoint until its in-memory
+workflow state has been reconstructed; this is a deliberate fail-closed
+boundary against duplicate or authority-losing writes.
 
 ## Skills and shell
 

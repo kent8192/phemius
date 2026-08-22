@@ -112,7 +112,17 @@ impl Repl {
         }
         let routed = route_input(input)?;
         match routed {
-            RoutedInput::AgentText(text) => Ok(ReplOutcome::AgentText(text)),
+            RoutedInput::AgentText(text) => {
+                if self.mode == ReplMode::Work
+                    && let Some(controller) = self.controller.as_mut()
+                {
+                    return Ok(match controller.record_coordinator_request(text.clone()) {
+                        Ok(message) => ReplOutcome::Coordinator(message),
+                        Err(error) => ReplOutcome::Error(error.to_string()),
+                    });
+                }
+                Ok(ReplOutcome::AgentText(text))
+            }
             RoutedInput::Command(command) => self.handle_command(command),
         }
     }
@@ -168,13 +178,13 @@ impl Repl {
                 }
                 Ok(ReplOutcome::Message(format!("mode: {}", self.mode.name())))
             }
-            ReplCommand::Plan { .. }
+            command @ (ReplCommand::Plan { .. }
             | ReplCommand::Review { .. }
             | ReplCommand::Revise { .. }
             | ReplCommand::Diff { .. }
             | ReplCommand::Skills
             | ReplCommand::Skill { .. }
-            | ReplCommand::Compact => {
+            | ReplCommand::Compact) => {
                 if self.mode == ReplMode::Consult {
                     Ok(ReplOutcome::ReadOnly(
                         "consult mode: coordinator request is read-only".into(),
@@ -184,10 +194,18 @@ impl Repl {
                         "no writing controller is attached; request was not executed".into(),
                     ))
                 } else {
-                    Ok(ReplOutcome::Coordinator("request accepted for coordinator".into()))
+                    let request = coordinator_request(command);
+                    let controller = self
+                        .controller
+                        .as_mut()
+                        .expect("controller was checked above");
+                    match controller.record_coordinator_request(request) {
+                        Ok(message) => Ok(ReplOutcome::Coordinator(message)),
+                        Err(error) => Ok(ReplOutcome::Error(error.to_string())),
+                    }
                 }
             }
-            | ReplCommand::Write { .. } => {
+            ReplCommand::Write { .. } => {
                 if self.mode == ReplMode::Consult {
                     Ok(ReplOutcome::Error("consult mode is read-only".into()))
                 } else if self.controller.is_none() {
@@ -334,6 +352,19 @@ impl Repl {
             status.run.as_u64(),
             status.warning
         )
+    }
+}
+
+fn coordinator_request(command: ReplCommand) -> String {
+    match command {
+        ReplCommand::Plan { request } => format!("plan {}", request.unwrap_or_default()),
+        ReplCommand::Review { request } => format!("review {}", request.unwrap_or_default()),
+        ReplCommand::Revise { id } => format!("revise {}", id.unwrap_or_default()),
+        ReplCommand::Diff { id } => format!("diff {}", id.unwrap_or_default()),
+        ReplCommand::Skills => "skills".into(),
+        ReplCommand::Skill { name } => format!("skill {name}"),
+        ReplCommand::Compact => "compact".into(),
+        _ => unreachable!("coordinator_request called for a non-coordinator command"),
     }
 }
 

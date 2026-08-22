@@ -192,18 +192,24 @@ pub struct ModelResponse {
 }
 
 /// Deterministic model backend for evaluation and tests only.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ScriptedModel {
     responses: VecDeque<ModelResult<ModelResponse>>,
     shared_responses: Option<Arc<Mutex<VecDeque<ModelResult<ModelResponse>>>>>,
+}
+
+impl Clone for ScriptedModel {
+    fn clone(&self) -> Self {
+        self.shared_clone()
+    }
 }
 
 impl ScriptedModel {
     /// Creates a backend that consumes responses in order.
     pub fn new(responses: impl IntoIterator<Item = ModelResult<ModelResponse>>) -> Self {
         Self {
-            responses: responses.into_iter().collect(),
-            shared_responses: None,
+            responses: VecDeque::new(),
+            shared_responses: Some(Arc::new(Mutex::new(responses.into_iter().collect()))),
         }
     }
 

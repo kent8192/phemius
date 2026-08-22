@@ -232,8 +232,29 @@ async fn trusted_cli_write_then_approve_applies_the_project_changeset() {
             text: String::new(),
             tool_calls: Vec::new(),
         }),
+        Ok(ModelResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+        }),
+        Ok(ModelResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+        }),
+        Ok(ModelResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+        }),
+        Ok(ModelResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+        }),
+        Ok(ModelResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+        }),
     ]);
     let mut controller = RunController::with_project(project.clone(), backend.into());
+    controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(200_000)));
     controller.set_preflight(true, true, true);
     controller.set_structure(structure).unwrap();
     controller.set_plot_framework("hakogaki").unwrap();

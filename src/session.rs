@@ -108,6 +108,13 @@ pub enum SessionEvent {
         /// Hash of the correction directive.
         hash: String,
     },
+    /// A human classified one current finding as a false positive.
+    FindingResolved {
+        /// Stable finding ID.
+        finding_id: EntityId,
+        /// Hash of the human's reason, without retaining free-form review text.
+        reason_hash: String,
+    },
     /// A changeset entered a new typed lifecycle state.
     ChangesetStateChanged {
         /// Stable ID for the changeset.
