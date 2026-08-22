@@ -3,3 +3,5 @@
 /.phemius/runtime/
 /.phemius/local.toml
 .DS_Store
+.env
+*.swp
