@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 
+use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::openrouter::OpenRouterClient;
@@ -231,54 +232,327 @@ impl ModelBackend {
 }
 
 fn validates_schema(schema: &Value, value: &Value) -> bool {
-    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
-        let matches = match expected {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "boolean" => value.is_boolean(),
-            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-            "number" => value.is_number(),
-            "null" => value.is_null(),
-            "string" => value.is_string(),
-            _ => false,
-        };
-        if !matches {
-            return false;
-        }
-    }
-    if let Some(values) = schema.get("enum").and_then(Value::as_array)
-        && !values.contains(value)
+    schema_is_supported(schema) && validates_supported_schema(schema, value)
+}
+
+fn schema_is_supported(schema: &Value) -> bool {
+    let Value::Object(schema) = schema else {
+        return schema.is_boolean();
+    };
+    schema.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "$id"
+                | "$schema"
+                | "additionalProperties"
+                | "allOf"
+                | "anyOf"
+                | "const"
+                | "default"
+                | "deprecated"
+                | "description"
+                | "enum"
+                | "examples"
+                | "exclusiveMaximum"
+                | "exclusiveMinimum"
+                | "maxItems"
+                | "maxLength"
+                | "maxProperties"
+                | "maximum"
+                | "minItems"
+                | "minLength"
+                | "minProperties"
+                | "minimum"
+                | "pattern"
+                | "properties"
+                | "readOnly"
+                | "required"
+                | "title"
+                | "type"
+                | "items"
+        )
+    }) && schema_values_are_supported(schema)
+}
+
+fn schema_values_are_supported(schema: &serde_json::Map<String, Value>) -> bool {
+    if !schema.get("$id").is_none_or(Value::is_string)
+        || !schema.get("$schema").is_none_or(Value::is_string)
+        || !schema.get("title").is_none_or(Value::is_string)
+        || !schema.get("description").is_none_or(Value::is_string)
+        || !schema.get("deprecated").is_none_or(Value::is_boolean)
+        || !schema.get("readOnly").is_none_or(Value::is_boolean)
+        || !valid_type(schema.get("type"))
+        || !valid_enum(schema.get("enum"))
+        || !valid_nonnegative_integer(schema.get("minLength"))
+        || !valid_nonnegative_integer(schema.get("maxLength"))
+        || !schema.get("pattern").is_none_or(|pattern| {
+            pattern
+                .as_str()
+                .is_some_and(|pattern| Regex::new(pattern).is_ok())
+        })
+        || !valid_nonnegative_integer(schema.get("minItems"))
+        || !valid_nonnegative_integer(schema.get("maxItems"))
+        || !valid_nonnegative_integer(schema.get("minProperties"))
+        || !valid_nonnegative_integer(schema.get("maxProperties"))
+        || !valid_number(schema.get("minimum"))
+        || !valid_number(schema.get("maximum"))
+        || !valid_number(schema.get("exclusiveMinimum"))
+        || !valid_number(schema.get("exclusiveMaximum"))
+        || !valid_required(schema.get("required"))
     {
         return false;
     }
+    if let Some(properties) = schema.get("properties") {
+        let Some(properties) = properties.as_object() else {
+            return false;
+        };
+        if !properties.values().all(schema_is_supported) {
+            return false;
+        }
+    }
+    if let Some(items) = schema.get("items")
+        && !schema_is_supported(items)
+    {
+        return false;
+    }
+    if let Some(additional) = schema.get("additionalProperties")
+        && !additional.is_boolean()
+        && !schema_is_supported(additional)
+    {
+        return false;
+    }
+    ["allOf", "anyOf"].into_iter().all(|key| {
+        schema.get(key).is_none_or(|schemas| {
+            schemas.as_array().is_some_and(|schemas| {
+                !schemas.is_empty() && schemas.iter().all(schema_is_supported)
+            })
+        })
+    })
+}
+
+fn valid_type(expected: Option<&Value>) -> bool {
+    expected.is_none_or(|expected| match expected {
+        Value::String(expected) => valid_type_name(expected),
+        Value::Array(expected) => {
+            !expected.is_empty()
+                && expected
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .all(valid_type_name)
+                && expected.iter().all(Value::is_string)
+        }
+        _ => false,
+    })
+}
+
+fn valid_type_name(expected: &str) -> bool {
+    matches!(
+        expected,
+        "object" | "array" | "boolean" | "integer" | "number" | "null" | "string"
+    )
+}
+
+fn valid_enum(values: Option<&Value>) -> bool {
+    values.is_none_or(|values| values.as_array().is_some_and(|values| !values.is_empty()))
+}
+
+fn valid_nonnegative_integer(value: Option<&Value>) -> bool {
+    value.is_none_or(|value| {
+        value
+            .as_u64()
+            .is_some_and(|value| usize::try_from(value).is_ok())
+    })
+}
+
+fn valid_number(value: Option<&Value>) -> bool {
+    value.is_none_or(|value| safe_f64(value).is_some())
+}
+
+fn valid_required(required: Option<&Value>) -> bool {
+    required.is_none_or(|required| {
+        required
+            .as_array()
+            .is_some_and(|required| required.iter().all(Value::is_string))
+    })
+}
+
+fn validates_supported_schema(schema: &Value, value: &Value) -> bool {
+    let Value::Object(schema) = schema else {
+        return schema == &Value::Bool(true);
+    };
+    if !matches_type(schema.get("type"), value)
+        || !matches_enum(schema.get("enum"), value)
+        || !matches_const(schema.get("const"), value)
+        || !matches_all_of(schema.get("allOf"), value)
+        || !matches_any_of(schema.get("anyOf"), value)
+    {
+        return false;
+    }
+    validates_string(schema, value)
+        && validates_array(schema, value)
+        && validates_number(schema, value)
+        && validates_object(schema, value)
+}
+
+fn matches_type(expected: Option<&Value>, value: &Value) -> bool {
+    expected.is_none_or(|expected| match expected {
+        Value::String(expected) => matches_single_type(expected, value),
+        Value::Array(expected) => {
+            !expected.is_empty()
+                && expected.iter().all(Value::is_string)
+                && expected
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|expected| matches_single_type(expected, value))
+        }
+        _ => false,
+    })
+}
+
+fn matches_single_type(expected: &str, value: &Value) -> bool {
+    match expected {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "null" => value.is_null(),
+        "string" => value.is_string(),
+        _ => false,
+    }
+}
+
+fn matches_enum(values: Option<&Value>, value: &Value) -> bool {
+    values.is_none_or(|values| {
+        values
+            .as_array()
+            .is_some_and(|values| !values.is_empty() && values.contains(value))
+    })
+}
+
+fn matches_const(expected: Option<&Value>, value: &Value) -> bool {
+    expected.is_none_or(|expected| expected == value)
+}
+
+fn matches_all_of(schemas: Option<&Value>, value: &Value) -> bool {
+    schemas.is_none_or(|schemas| {
+        schemas
+            .as_array()
+            .is_some_and(|schemas| schemas.iter().all(|schema| validates_schema(schema, value)))
+    })
+}
+
+fn matches_any_of(schemas: Option<&Value>, value: &Value) -> bool {
+    schemas.is_none_or(|schemas| {
+        schemas
+            .as_array()
+            .is_some_and(|schemas| schemas.iter().any(|schema| validates_schema(schema, value)))
+    })
+}
+
+fn validates_string(schema: &serde_json::Map<String, Value>, value: &Value) -> bool {
+    let Some(value) = value.as_str() else {
+        return true;
+    };
+    let length = value.chars().count();
+    minimum(schema.get("minLength"), length)
+        && maximum(schema.get("maxLength"), length)
+        && schema.get("pattern").is_none_or(|pattern| {
+            pattern
+                .as_str()
+                .is_some_and(|pattern| Regex::new(pattern).is_ok_and(|regex| regex.is_match(value)))
+        })
+}
+
+fn validates_array(schema: &serde_json::Map<String, Value>, value: &Value) -> bool {
+    let Some(values) = value.as_array() else {
+        return true;
+    };
+    minimum(schema.get("minItems"), values.len())
+        && maximum(schema.get("maxItems"), values.len())
+        && schema
+            .get("items")
+            .is_none_or(|items| values.iter().all(|value| validates_schema(items, value)))
+}
+
+fn validates_number(schema: &serde_json::Map<String, Value>, value: &Value) -> bool {
+    let Some(value) = safe_f64(value) else {
+        return !value.is_number();
+    };
+    inclusive_bound(schema.get("minimum"), value, f64::ge)
+        && inclusive_bound(schema.get("maximum"), value, f64::le)
+        && exclusive_bound(schema.get("exclusiveMinimum"), value, f64::gt)
+        && exclusive_bound(schema.get("exclusiveMaximum"), value, f64::lt)
+}
+
+fn safe_f64(value: &Value) -> Option<f64> {
+    let number = value.as_number()?;
+    if number
+        .as_i64()
+        .is_some_and(|value| value.unsigned_abs() > (1_u64 << 53))
+        || number.as_u64().is_some_and(|value| value > (1_u64 << 53))
+    {
+        return None;
+    }
+    number.as_f64()
+}
+
+fn inclusive_bound(bound: Option<&Value>, value: f64, compare: fn(&f64, &f64) -> bool) -> bool {
+    bound.is_none_or(|bound| safe_f64(bound).is_some_and(|bound| compare(&value, &bound)))
+}
+
+fn exclusive_bound(bound: Option<&Value>, value: f64, compare: fn(&f64, &f64) -> bool) -> bool {
+    bound.is_none_or(|bound| safe_f64(bound).is_some_and(|bound| compare(&value, &bound)))
+}
+
+fn validates_object(schema: &serde_json::Map<String, Value>, value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return true;
     };
     let properties = schema.get("properties").and_then(Value::as_object);
-    if schema
-        .get("required")
-        .and_then(Value::as_array)
-        .is_some_and(|required| {
+    if !minimum(schema.get("minProperties"), object.len())
+        || !maximum(schema.get("maxProperties"), object.len())
+        || !required_properties_present(schema.get("required"), object)
+    {
+        return false;
+    }
+    object.iter().all(|(name, value)| {
+        match properties.and_then(|properties| properties.get(name)) {
+            Some(property) => validates_schema(property, value),
+            None => schema
+                .get("additionalProperties")
+                .map_or(true, |additional| validates_schema(additional, value)),
+        }
+    })
+}
+
+fn required_properties_present(
+    required: Option<&Value>,
+    object: &serde_json::Map<String, Value>,
+) -> bool {
+    required.is_none_or(|required| {
+        required.as_array().is_some_and(|required| {
             required
                 .iter()
-                .filter_map(Value::as_str)
-                .any(|name| !object.contains_key(name))
+                .all(|name| name.as_str().is_some_and(|name| object.contains_key(name)))
         })
-    {
-        return false;
-    }
-    if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
-        && object
-            .keys()
-            .any(|name| !properties.is_some_and(|properties| properties.contains_key(name)))
-    {
-        return false;
-    }
-    properties.is_none_or(|properties| {
-        object.iter().all(|(name, value)| {
-            properties
-                .get(name)
-                .is_none_or(|property_schema| validates_schema(property_schema, value))
-        })
+    })
+}
+
+fn minimum(bound: Option<&Value>, value: usize) -> bool {
+    bound.is_none_or(|bound| {
+        bound
+            .as_u64()
+            .and_then(|bound| usize::try_from(bound).ok())
+            .is_some_and(|bound| value >= bound)
+    })
+}
+
+fn maximum(bound: Option<&Value>, value: usize) -> bool {
+    bound.is_none_or(|bound| {
+        bound
+            .as_u64()
+            .and_then(|bound| usize::try_from(bound).ok())
+            .is_some_and(|bound| value <= bound)
     })
 }

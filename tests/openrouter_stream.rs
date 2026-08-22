@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
 use phemius::{
     model::{
@@ -20,6 +20,18 @@ fn assembles_split_text_and_indexed_tool_arguments_until_done() {
     let response = parse_sse_events(fixture_sse_with_split_tool_call()).unwrap();
 
     assert_eq!(response.text, "first second");
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].name, "read_file");
+    assert_eq!(
+        response.tool_calls[0].arguments,
+        json!({"path":"前提/作品.md"})
+    );
+}
+
+#[rstest]
+fn assembles_split_tool_name_by_index_until_done() {
+    let response = parse_sse_events(fixture_sse_with_split_tool_name()).unwrap();
+
     assert_eq!(response.tool_calls.len(), 1);
     assert_eq!(response.tool_calls[0].name, "read_file");
     assert_eq!(
@@ -51,6 +63,19 @@ async fn request_disables_router_fallback_and_context_compression() {
     assert_eq!(json["provider"].get("models"), None);
     assert_eq!(json["plugins"][0]["id"], "context-compression");
     assert_eq!(json["plugins"][0]["enabled"], false);
+}
+
+#[rstest]
+#[tokio::test]
+async fn production_client_reads_the_environment_key_at_request_time() {
+    let environment = EnvironmentVariable::set("OPENROUTER_API_KEY", "construction-key");
+    let server = RecordingHttpServer::start(fixture_success_sse()).await;
+    let client = OpenRouterClient::for_test_with_environment(server.url()).unwrap();
+
+    environment.replace("request-key");
+    client.complete(fixture_request()).await.unwrap();
+
+    assert_eq!(server.single_authorization().await, "Bearer request-key");
 }
 
 #[rstest]
@@ -100,6 +125,89 @@ async fn scripted_backend_consumes_one_validated_response_per_call() {
     );
 }
 
+#[rstest]
+#[tokio::test]
+async fn constrained_tool_arguments_reject_invalid_values() {
+    let invalid_arguments = [
+        json!({"path": "x", "sections": [1]}),
+        json!({"path": "前提/作品.md", "sections": []}),
+        json!({"path": "前提/作品.md", "sections": [0]}),
+        json!({"path": "前提/作品.md", "sections": [1, 2, 3]}),
+    ];
+
+    for arguments in invalid_arguments {
+        let response = ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: Some("call_1".into()),
+                name: "read_sections".into(),
+                arguments,
+            }],
+        };
+        let mut backend = ModelBackend::Scripted(ScriptedModel::new([Ok(response)]));
+
+        assert_eq!(
+            backend
+                .complete(constrained_request())
+                .await
+                .unwrap_err()
+                .class(),
+            ModelFailureClass::Stopped
+        );
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn constrained_tool_arguments_accept_valid_combinator_values() {
+    let response = ModelResponse {
+        text: String::new(),
+        tool_calls: vec![ToolCall {
+            id: Some("call_1".into()),
+            name: "read_sections".into(),
+            arguments: json!({"path": "前提/作品.md", "sections": [1, 2]}),
+        }],
+    };
+    let mut backend = ModelBackend::Scripted(ScriptedModel::new([Ok(response.clone())]));
+
+    assert_eq!(
+        backend.complete(constrained_request()).await.unwrap(),
+        response
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn unsupported_tool_schema_constraints_fail_closed() {
+    let response = ModelResponse {
+        text: String::new(),
+        tool_calls: vec![ToolCall {
+            id: Some("call_1".into()),
+            name: "read_uri".into(),
+            arguments: json!({"uri": "https://example.test"}),
+        }],
+    };
+    let request = ModelRequest::new(
+        "writer",
+        vec![ModelMessage::user("Read a URI.")],
+        vec![ToolDefinition {
+            name: "read_uri".into(),
+            description: "Reads a URI.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"uri": {"type": "string", "format": "uri"}},
+                "required": ["uri"],
+            }),
+        }],
+    );
+    let mut backend = ModelBackend::Scripted(ScriptedModel::new([Ok(response)]));
+
+    assert_eq!(
+        backend.complete(request).await.unwrap_err().class(),
+        ModelFailureClass::Stopped
+    );
+}
+
 fn fixture_request() -> ModelRequest {
     ModelRequest::new(
         "writer",
@@ -121,13 +229,45 @@ fn fixture_sse_with_split_tool_call() -> &'static str {
     "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first \",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"前提/\"}}]}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"second\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"作品.md\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n"
 }
 
+fn fixture_sse_with_split_tool_name() -> &'static str {
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_\",\"arguments\":\"{\\\"path\\\":\\\"前提/作品.md\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"file\"}}]}}]}\n\ndata: [DONE]\n\n"
+}
+
 fn fixture_sse_without_done() -> &'static str {
     "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"
 }
 
+fn constrained_request() -> ModelRequest {
+    ModelRequest::new(
+        "writer",
+        vec![ModelMessage::user("Read constrained source sections.")],
+        vec![ToolDefinition {
+            name: "read_sections".into(),
+            description: "Reads bounded source sections.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 4, "pattern": "^前提/"},
+                    "sections": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 2,
+                        "items": {
+                            "allOf": [{"type": "integer", "minimum": 1}, {"maximum": 2}],
+                            "anyOf": [{"const": 1}, {"const": 2}],
+                        },
+                    },
+                },
+                "required": ["path", "sections"],
+                "additionalProperties": false,
+            }),
+        }],
+    )
+}
+
 struct RecordingHttpServer {
     url: String,
-    requests: Arc<Mutex<Vec<Value>>>,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -157,10 +297,15 @@ impl RecordingHttpServer {
                         .unwrap();
                     if request.len() >= header_end + 4 + content_length {
                         let body = &request[header_end + 4..header_end + 4 + content_length];
-                        recorded
-                            .lock()
-                            .await
-                            .push(serde_json::from_slice(body).unwrap());
+                        let authorization = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("authorization: "))
+                            .unwrap_or_default()
+                            .into();
+                        recorded.lock().await.push(RecordedRequest {
+                            body: serde_json::from_slice(body).unwrap(),
+                            authorization,
+                        });
                         break;
                     }
                 }
@@ -190,7 +335,57 @@ impl RecordingHttpServer {
     async fn single_json_request(&self) -> Value {
         let requests = self.requests.lock().await;
         assert_eq!(requests.len(), 1);
-        requests[0].clone()
+        requests[0].body.clone()
+    }
+
+    async fn single_authorization(&self) -> String {
+        let requests = self.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        requests[0].authorization.clone()
+    }
+}
+
+struct RecordedRequest {
+    body: Value,
+    authorization: String,
+}
+
+struct EnvironmentVariable {
+    name: &'static str,
+    original: Option<std::ffi::OsString>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl EnvironmentVariable {
+    fn set(name: &'static str, value: &str) -> Self {
+        let _lock = ENVIRONMENT_LOCK.lock().unwrap();
+        let original = std::env::var_os(name);
+        // SAFETY: the lock serializes this test's environment changes, and Drop restores the value.
+        unsafe { std::env::set_var(name, value) };
+        Self {
+            name,
+            original,
+            _lock,
+        }
+    }
+
+    fn replace(&self, value: &str) {
+        // SAFETY: this guard restores the process environment in Drop after the test completes.
+        unsafe { std::env::set_var(self.name, value) };
+    }
+}
+
+static ENVIRONMENT_LOCK: StdMutex<()> = StdMutex::new(());
+
+impl Drop for EnvironmentVariable {
+    fn drop(&mut self) {
+        // SAFETY: this guard restores the value captured before the test changed it.
+        unsafe {
+            match &self.original {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
     }
 }
 

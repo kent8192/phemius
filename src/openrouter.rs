@@ -18,27 +18,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Trusted OpenRouter configuration. API keys are only loaded by this client.
 pub struct OpenRouterConfig {
     endpoint: String,
-    api_key: String,
 }
 
 impl OpenRouterConfig {
-    /// Loads the API key from the trusted process environment.
-    pub fn from_environment() -> ModelResult<Self> {
-        let api_key = std::env::var("OPENROUTER_API_KEY")
-            .map_err(|_| ModelFailure::stopped("OPENROUTER_API_KEY is not configured"))?;
-        if api_key.is_empty() {
-            return Err(ModelFailure::stopped("OPENROUTER_API_KEY is empty"));
-        }
-        Ok(Self {
+    /// Builds the production endpoint policy without reading credentials.
+    pub fn production() -> Self {
+        Self {
             endpoint: OPENROUTER_COMPLETIONS_URL.into(),
-            api_key,
-        })
+        }
     }
 
-    fn for_test(endpoint: impl Into<String>, api_key: impl Into<String>) -> Self {
+    fn for_test(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
-            api_key: api_key.into(),
         }
     }
 }
@@ -48,7 +40,6 @@ impl fmt::Debug for OpenRouterConfig {
         formatter
             .debug_struct("OpenRouterConfig")
             .field("endpoint", &self.endpoint)
-            .field("api_key", &"REDACTED")
             .finish()
     }
 }
@@ -58,16 +49,47 @@ impl fmt::Debug for OpenRouterConfig {
 pub struct OpenRouterClient {
     client: Client,
     config: std::sync::Arc<OpenRouterConfig>,
+    credentials: CredentialSource,
+}
+
+#[derive(Clone)]
+enum CredentialSource {
+    Environment,
+    TestOnly(String),
+}
+
+impl CredentialSource {
+    fn authorization(&self) -> ModelResult<String> {
+        let api_key = match self {
+            Self::Environment => std::env::var("OPENROUTER_API_KEY")
+                .map_err(|_| ModelFailure::stopped("OPENROUTER_API_KEY is not configured"))?,
+            Self::TestOnly(api_key) => api_key.clone(),
+        };
+        if api_key.is_empty() {
+            return Err(ModelFailure::stopped("OPENROUTER_API_KEY is empty"));
+        }
+        Ok(format!("Bearer {api_key}"))
+    }
 }
 
 impl OpenRouterClient {
-    /// Builds the network client from the trusted environment.
+    /// Builds the network client that reads its trusted environment key at send time.
     pub fn from_environment() -> ModelResult<Self> {
-        Self::new(OpenRouterConfig::from_environment()?)
+        Self::with_credentials(
+            OpenRouterConfig::production(),
+            CredentialSource::Environment,
+        )
     }
 
-    /// Builds one pooled, no-retry client.
+    /// Builds one pooled, no-retry production client.
     pub fn new(config: OpenRouterConfig) -> ModelResult<Self> {
+        Self::with_credentials(config, CredentialSource::Environment)
+    }
+
+    fn with_credentials(
+        config: OpenRouterConfig,
+        credentials: CredentialSource,
+    ) -> ModelResult<Self> {
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
@@ -80,12 +102,26 @@ impl OpenRouterClient {
         Ok(Self {
             client,
             config: std::sync::Arc::new(config),
+            credentials,
         })
     }
 
     /// Builds a local/mock-only client for integration tests.
+    #[doc(hidden)]
     pub fn for_test(endpoint: impl Into<String>, api_key: impl Into<String>) -> ModelResult<Self> {
-        Self::new(OpenRouterConfig::for_test(endpoint, api_key))
+        Self::with_credentials(
+            OpenRouterConfig::for_test(endpoint),
+            CredentialSource::TestOnly(api_key.into()),
+        )
+    }
+
+    /// Builds a local/mock-only endpoint client that retains no production credential.
+    #[doc(hidden)]
+    pub fn for_test_with_environment(endpoint: impl Into<String>) -> ModelResult<Self> {
+        Self::with_credentials(
+            OpenRouterConfig::for_test(endpoint),
+            CredentialSource::Environment,
+        )
     }
 
     /// Streams, aggregates, and validates exactly one OpenRouter completion.
@@ -96,13 +132,15 @@ impl OpenRouterClient {
         if request.messages.is_empty() {
             return Err(ModelFailure::stopped("model request has no messages"));
         }
+        let request_body = request_body(&request);
+        let authorization = self.credentials.authorization()?;
         let response = self
             .client
             .post(&self.config.endpoint)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("Authorization", authorization)
             .header("HTTP-Referer", "https://github.com/kent8192/phemius")
             .header("X-Title", "Phemius")
-            .json(&request_body(&request))
+            .json(&request_body)
             .send()
             .await
             .map_err(|error| {
@@ -291,12 +329,10 @@ impl SseAccumulator {
                             ModelFailure::stopped("OpenRouter function delta is not an object")
                         })?;
                         if let Some(name) = function.get("name") {
-                            tool.name = Some(
-                                name.as_str()
-                                    .ok_or_else(|| {
-                                        ModelFailure::stopped("OpenRouter tool name is not text")
-                                    })?
-                                    .into(),
+                            tool.name.get_or_insert_with(String::new).push_str(
+                                name.as_str().ok_or_else(|| {
+                                    ModelFailure::stopped("OpenRouter tool name is not text")
+                                })?,
                             );
                         }
                         if let Some(arguments) = function.get("arguments") {
