@@ -1,6 +1,9 @@
 pub mod changeset;
 pub mod cli;
+pub mod context;
+pub mod copycheck;
 pub mod domain;
 pub mod journal;
 pub mod plot;
 pub mod project;
+pub mod sources;
