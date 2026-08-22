@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     cli::{ReplCommand, ReplMode, parse_repl_command},
-    workflow::{AgentRole, RunController},
+    workflow::{AgentRole, CostConfirmationRequired, RunController},
 };
 
 /// Input after the authority boundary has classified it.
@@ -124,12 +124,15 @@ impl Repl {
             if self.mode == ReplMode::Consult {
                 return Ok(ReplOutcome::Error("consult mode is read-only".into()));
             }
-            let chapter = request.unwrap_or_else(|| "chapter_1".into());
+            let (chapter, confirmed) = parse_write_request(request)?;
             let Some(controller) = self.controller.as_mut() else {
                 return Ok(ReplOutcome::Error(
                     "no writing controller is attached".into(),
                 ));
             };
+            if confirmed {
+                controller.confirm_cost_warning();
+            }
             match controller.write_chapter(&chapter).await {
                 Ok(run) => Ok(ReplOutcome::Message(format!(
                     "candidate {} is {:?}; use /approve {} after review",
@@ -137,6 +140,12 @@ impl Repl {
                     run.state,
                     run.changeset.id.as_str()
                 ))),
+                Err(error) if error.downcast_ref::<CostConfirmationRequired>().is_some() => {
+                    Ok(ReplOutcome::AwaitingConfirmation(format!(
+                        "{}; repeat /write {chapter} --confirm to continue",
+                        error
+                    )))
+                }
                 Err(error) => {
                     self.ambiguous_request = error.to_string().contains("ambiguous");
                     Ok(ReplOutcome::Error(error.to_string()))
@@ -326,6 +335,27 @@ impl Repl {
             status.warning
         )
     }
+}
+
+fn parse_write_request(request: Option<String>) -> Result<(String, bool)> {
+    let mut chapter = None;
+    let mut confirmed = false;
+    for word in request.as_deref().unwrap_or("chapter_1").split_whitespace() {
+        if word == "--confirm" {
+            ensure_not_confirmed(&mut confirmed)?;
+        } else if chapter.replace(word).is_some() {
+            bail!("/write accepts one chapter ID and optional --confirm");
+        }
+    }
+    Ok((chapter.unwrap_or("chapter_1").into(), confirmed))
+}
+
+fn ensure_not_confirmed(confirmed: &mut bool) -> Result<()> {
+    if *confirmed {
+        bail!("/write accepts --confirm only once");
+    }
+    *confirmed = true;
+    Ok(())
 }
 
 fn parse_role(role: &str) -> Result<AgentRole> {

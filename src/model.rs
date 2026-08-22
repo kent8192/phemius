@@ -218,6 +218,17 @@ impl ScriptedModel {
         }
     }
 
+    /// Returns a clone that consumes the same deterministic queue as its siblings.
+    pub fn shared_clone(&self) -> Self {
+        if let Some(shared_responses) = &self.shared_responses {
+            return Self {
+                responses: VecDeque::new(),
+                shared_responses: Some(Arc::clone(shared_responses)),
+            };
+        }
+        Self::shared(self.responses.iter().cloned())
+    }
+
     fn complete(&mut self, request: &ModelRequest) -> ModelResult<ModelResponse> {
         let response = if let Some(responses) = &self.shared_responses {
             responses
@@ -252,6 +263,14 @@ impl ModelBackend {
         match self {
             Self::OpenRouter(client) => client.complete(request).await,
             Self::Scripted(client) => client.complete(&request),
+        }
+    }
+
+    /// Clones a backend for bounded parallel work without replaying scripted responses.
+    pub fn parallel_clone(&self) -> Self {
+        match self {
+            Self::OpenRouter(client) => Self::OpenRouter(client.clone()),
+            Self::Scripted(client) => Self::Scripted(client.shared_clone()),
         }
     }
 }

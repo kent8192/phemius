@@ -99,6 +99,15 @@ pub enum SessionEvent {
         /// Held maximum cost pending explicit reconciliation.
         reserved_cost: MicroDollars,
     },
+    /// A human correction was accepted and must be included in later context receipts.
+    CorrectionAccepted {
+        /// Stable correction rule ID.
+        rule_id: EntityId,
+        /// Chapter from which the correction was derived.
+        source_chapter: String,
+        /// Hash of the correction directive.
+        hash: String,
+    },
     /// A changeset entered a new typed lifecycle state.
     ChangesetStateChanged {
         /// Stable ID for the changeset.

@@ -472,6 +472,38 @@ pub struct CostStatus {
     pub warning: bool,
 }
 
+/// Indicates that the conservative chapter estimate crossed the warning threshold before any
+/// model request was sent.
+#[derive(Debug)]
+pub struct CostConfirmationRequired {
+    chapter_id: String,
+    estimated_cost: MicroDollars,
+}
+
+impl CostConfirmationRequired {
+    /// Returns the chapter whose request requires explicit confirmation.
+    pub fn chapter_id(&self) -> &str {
+        &self.chapter_id
+    }
+
+    /// Returns the conservative cost estimate that triggered the warning.
+    pub const fn estimated_cost(&self) -> MicroDollars {
+        self.estimated_cost
+    }
+}
+
+impl std::fmt::Display for CostConfirmationRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "estimated chapter cost exceeds $5; explicit confirmation is required before model request ({} microdollars)",
+            self.estimated_cost.as_u64()
+        )
+    }
+}
+
+impl std::error::Error for CostConfirmationRequired {}
+
 /// Shared controller for one writing session.
 pub struct RunController {
     backend: ModelBackend,
@@ -491,6 +523,7 @@ pub struct RunController {
     max_revisions: usize,
     cost_ledger: BudgetLedger,
     request_maximum_cost: Option<MicroDollars>,
+    cost_warning_confirmed: bool,
     cost_status: CostStatus,
     structure: Option<StoryStructure>,
     plot_framework: Option<String>,
@@ -534,6 +567,7 @@ impl RunController {
             max_revisions: 2,
             cost_ledger: BudgetLedger::new(MicroDollars::zero(), MicroDollars::zero()),
             request_maximum_cost: Some(MicroDollars::new(100_000)),
+            cost_warning_confirmed: false,
             cost_status: CostStatus {
                 chapter: MicroDollars::zero(),
                 run: MicroDollars::zero(),
@@ -733,6 +767,11 @@ impl RunController {
     /// Sets the maximum reservation used before each model call.
     pub fn set_request_maximum_cost(&mut self, maximum: Option<MicroDollars>) {
         self.request_maximum_cost = maximum;
+    }
+
+    /// Confirms the current conservative warning for the next chapter request.
+    pub fn confirm_cost_warning(&mut self) {
+        self.cost_warning_confirmed = true;
     }
 
     /// Returns a bounded cost projection for the REPL.
@@ -985,6 +1024,7 @@ impl RunController {
             .changeset
             .operations
             .iter()
+            .filter(|operation| operation.path.to_string_lossy().starts_with("本文/"))
             .filter_map(|operation| operation.candidate_path.clone())
             .collect::<Vec<_>>();
         let project = self.project.clone();
@@ -994,14 +1034,7 @@ impl RunController {
             let mut updated_hashes = BTreeMap::new();
             for candidate_path in candidate_operations {
                 let current = read_project_file(&project, &candidate_path)?;
-                let revised = if candidate_path
-                    .file_name()
-                    .is_some_and(|name| name == "manuscript.md")
-                {
-                    replace_candidate_body(current, &candidate_text)
-                } else {
-                    append_candidate(current, &candidate_text)
-                };
+                let revised = replace_candidate_body(current, &candidate_text);
                 write_replaced_project_file(&project, &candidate_path, &revised)?;
                 updated_hashes.insert(candidate_path, sha256_bytes(&revised));
             }
@@ -1099,7 +1132,19 @@ impl RunController {
             diff,
             hash,
         };
+        let rule_id = EntityId::from_validated(rule.id.clone())
+            .ok_or_else(|| anyhow!("generated correction rule ID is invalid"))?;
+        if self.project.is_some() {
+            self.ensure_durable_session()?;
+        }
         self.corrections.push(rule.clone());
+        self.note_upstream_edit(source_chapter)?;
+        self.append_session_event(SessionEvent::CorrectionAccepted {
+            rule_id,
+            source_chapter: source_chapter.into(),
+            hash: rule.hash.clone(),
+        })?;
+        self.checkpoint(&rule.hash)?;
         Ok(rule)
     }
 
@@ -1358,6 +1403,25 @@ impl RunController {
         if self.request_maximum_cost.is_none() {
             bail!("unknown model price; generation is stopped");
         }
+        let maximum = self
+            .request_maximum_cost
+            .expect("request maximum was checked above");
+        let estimated_cost = maximum
+            .as_u64()
+            .checked_mul(9)
+            .ok_or_else(|| anyhow!("chapter cost arithmetic overflow"))?;
+        ensure!(
+            estimated_cost <= 10_000_000,
+            "chapter budget hard stop at $10 before model reservation"
+        );
+        if !self.cost_warning_confirmed && estimated_cost > 5_000_000 {
+            return Err(CostConfirmationRequired {
+                chapter_id: chapter_id.into(),
+                estimated_cost: MicroDollars::new(estimated_cost),
+            }
+            .into());
+        }
+        self.cost_warning_confirmed = false;
         if self.project.is_some() && self.session.is_none() {
             self.attach_latest_session()?;
         }
@@ -1503,7 +1567,7 @@ impl RunController {
                 specs.push((
                     *role,
                     format!(
-                        "Review candidate chapter {chapter_id} without editing it.\n\nImmutable candidate:\n{candidate_text}\n\nImmutable context receipt: provisional canon hashes={provisional_canon_hashes:?}; corrections={correction_receipts:?}. Report typed evidence as FINDING|kind|artifact|start|end|message."
+                        "Review candidate chapter {chapter_id} without editing it.\n\nImmutable candidate:\n{candidate_text}\n\nCompiled source context:\n{compiled_context}\n\nContext receipt:\n{context_receipt_json}\n\nImmutable context facts: provisional canon hashes={provisional_canon_hashes:?}; corrections={correction_receipts:?}. Report typed evidence as FINDING|kind|artifact|start|end|message."
                     ),
                 ));
             }
@@ -1550,7 +1614,7 @@ impl RunController {
                 .collect::<Vec<_>>()
                 .join("\n");
             let required_facts = format!(
-                "provisional canon hashes={provisional_canon_hashes:?}; correction receipts={correction_receipts:?}"
+                "compiled source context:\n{compiled_context}\n\ncontext receipt:\n{context_receipt_json}\n\nprovisional canon hashes={provisional_canon_hashes:?}; correction receipts={correction_receipts:?}"
             );
             let request = ModelRequest::new(
                 AgentRole::Reviser.name(),
@@ -1594,7 +1658,7 @@ impl RunController {
                             specs.push((
                                 *role,
                                 format!(
-                                    "Re-review this revised immutable candidate chapter {chapter_id}; report only current typed evidence as FINDING|kind|artifact|start|end|message.\n\nCandidate:\n{candidate_text}\n\nRequired facts and correction directives:\n{required_facts}"
+                                    "Re-review this revised immutable candidate chapter {chapter_id}; report only current typed evidence as FINDING|kind|artifact|start|end|message.\n\nCandidate:\n{candidate_text}\n\nRequired source context, receipt, and correction directives:\n{required_facts}"
                                 ),
                             ));
                         }
@@ -1808,7 +1872,7 @@ impl RunController {
             )
             .with_model(self.model(*role));
             self.reserve_request(chapter_id)?;
-            requests.push((*role, request, self.backend.clone()));
+            requests.push((*role, request, self.backend.parallel_clone()));
         }
         let mut results = stream::iter(requests)
             .map(|(role, request, mut backend)| async move {
@@ -2390,16 +2454,15 @@ fn update_project_change(
 ) -> Result<PreparedChange> {
     let mut operations = previous.operations.clone();
     for operation in &mut operations {
+        if !operation.path.to_string_lossy().starts_with("本文/") {
+            continue;
+        }
         let Some(candidate_path) = operation.candidate_path.as_ref() else {
             continue;
         };
         let current = read_project_file(project, candidate_path)
             .with_context(|| format!("failed to read candidate {}", candidate_path.display()))?;
-        let revised = if operation.path.to_string_lossy().starts_with("本文/") {
-            replace_candidate_body(current, candidate_text)
-        } else {
-            append_candidate(current, candidate_text)
-        };
+        let revised = replace_candidate_body(current, candidate_text);
         write_replaced_project_file(project, candidate_path, &revised)?;
         operation.after_sha256 = Some(sha256_bytes(&revised));
     }

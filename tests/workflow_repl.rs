@@ -77,6 +77,41 @@ async fn shared_scripted_backend_consumes_distinct_writer_and_critic_responses()
 }
 
 #[tokio::test]
+async fn ordinary_scripted_backend_clones_share_the_response_queue() {
+    let responses = [
+        "architect plan",
+        "draft",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-1",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-2",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-3",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-4",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-5",
+        "FINDING|other|本文/chapter_1.md|0|0|critic-6",
+    ]
+    .into_iter()
+    .map(|text| {
+        Ok(ModelResponse {
+            text: text.into(),
+            tool_calls: Vec::new(),
+        })
+    });
+
+    let run = RunController::fixture(ScriptedModel::shared(responses))
+        .write_chapter("chapter_1")
+        .await
+        .unwrap();
+
+    assert_eq!(run.findings.len(), 6);
+    for index in 1..=6 {
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.message.ends_with(&format!("critic-{index}")))
+        );
+    }
+}
+
+#[tokio::test]
 async fn unknown_finding_kind_stops_the_pipeline_fail_closed() {
     let backend = ScriptedModel::new([
         Ok(ModelResponse {
@@ -217,6 +252,35 @@ fn scoped_corrections_for_scene_character_and_location_reach_later_chapters() {
     assert_eq!(receipt[1].rule_id, character.id);
     assert_eq!(receipt[2].rule_id, location.id);
     assert!(run.correction_receipt("chapter_2").is_empty());
+}
+
+#[test]
+fn accepted_correction_stales_descendants_and_is_recorded_in_session() {
+    let directory = TestDir::new("correction-session");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let mut controller =
+        RunController::fixture_with_project(project.clone(), ScriptedModel::new([]));
+    controller.register_chapter("chapter_1", 1, ChapterState::Approved);
+    controller.register_chapter("chapter_2", 2, ChapterState::Candidate);
+    controller.register_chapter("chapter_3", 3, ChapterState::Approved);
+
+    controller
+        .accept_human_correction("chapter_1", "old", "new", "project", None)
+        .unwrap();
+
+    assert_eq!(controller.chapter("chapter_2").state, ChapterState::Stale);
+    assert_eq!(
+        controller.chapter("chapter_3").state,
+        ChapterState::NeedsRevalidation
+    );
+    let session_dir = fs::read_dir(directory.path().join(".phemius/records/sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let journal = fs::read_to_string(session_dir.join("session.jsonl")).unwrap();
+    assert!(journal.contains("correction-accepted"));
 }
 
 #[tokio::test]
@@ -401,36 +465,17 @@ async fn structure_preflight_requires_scene_box_and_macro_links() {
 #[tokio::test]
 async fn revision_cycles_are_bounded_and_ambiguous_requests_are_not_retried() {
     let blocker = "FINDING|canon|本文/chapter_1.md|0|4|conflict";
-    let backend = ScriptedModel::new([
-        Ok(ModelResponse {
-            text: "draft".into(),
-            tool_calls: Vec::new(),
-        }),
-        Ok(ModelResponse {
-            text: blocker.into(),
-            tool_calls: Vec::new(),
-        }),
+    let mut responses = vec![Ok(ModelResponse {
+        text: "draft".into(),
+        tool_calls: Vec::new(),
+    })];
+    responses.extend((0..21).map(|_| {
         Ok(ModelResponse {
             text: blocker.into(),
             tool_calls: Vec::new(),
-        }),
-        Ok(ModelResponse {
-            text: blocker.into(),
-            tool_calls: Vec::new(),
-        }),
-        Ok(ModelResponse {
-            text: blocker.into(),
-            tool_calls: Vec::new(),
-        }),
-        Ok(ModelResponse {
-            text: blocker.into(),
-            tool_calls: Vec::new(),
-        }),
-        Ok(ModelResponse {
-            text: blocker.into(),
-            tool_calls: Vec::new(),
-        }),
-    ]);
+        })
+    }));
+    let backend = ScriptedModel::new(responses);
     let result = RunController::fixture(backend)
         .write_chapter("chapter_1")
         .await
@@ -452,6 +497,7 @@ async fn revision_cycles_are_bounded_and_ambiguous_requests_are_not_retried() {
 async fn cost_warning_and_chapter_hard_gate_are_checked_before_reservation() {
     let mut controller = RunController::fixture(ScriptedModel::new([]));
     controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(1_000_001)));
+    controller.confirm_cost_warning();
     controller.write_chapter("chapter_1").await.unwrap();
     assert!(controller.cost_status().warning);
     assert!(controller.cost_status().chapter.as_u64() > 5_000_000);
@@ -460,6 +506,53 @@ async fn cost_warning_and_chapter_hard_gate_are_checked_before_reservation() {
     gated.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(3_000_001)));
     let error = gated.write_chapter("chapter_1").await.unwrap_err();
     assert!(error.to_string().contains("$10"));
+}
+
+#[tokio::test]
+async fn repl_requires_explicit_cost_confirmation_before_model_request() {
+    let backend = ScriptedModel::new([Ok(ModelResponse {
+        text: "draft".into(),
+        tool_calls: Vec::new(),
+    })]);
+    let mut controller = RunController::fixture(backend);
+    controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(1_000_001)));
+    let mut repl = Repl::with_controller(controller);
+
+    assert!(matches!(
+        repl.handle_async("/write chapter_1").await.unwrap(),
+        ReplOutcome::AwaitingConfirmation(message) if message.contains("$5")
+    ));
+    assert!(matches!(
+        repl.handle_async("/write chapter_1 --confirm").await.unwrap(),
+        ReplOutcome::Message(message) if message.contains("candidate")
+    ));
+}
+
+#[tokio::test]
+async fn candidate_edit_does_not_copy_prose_into_non_manuscript_artifacts() {
+    let directory = TestDir::new("artifact-edit-protection");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let chapter_id = prefixed_uuid(EntityKind::Chapter);
+    let mut controller =
+        RunController::fixture_with_project(project.clone(), ScriptedModel::new([]));
+    let run = controller.write_chapter(chapter_id.as_str()).await.unwrap();
+    let non_manuscript = run
+        .changeset
+        .operations
+        .iter()
+        .find(|operation| !operation.path.to_string_lossy().starts_with("本文/"))
+        .and_then(|operation| operation.candidate_path.as_ref())
+        .map(|path| (path.clone(), fs::read(project.root.join(path)).unwrap()))
+        .unwrap();
+
+    controller
+        .edit_candidate(chapter_id.as_str(), "human revision")
+        .unwrap();
+
+    assert_eq!(
+        fs::read(project.root.join(non_manuscript.0)).unwrap(),
+        non_manuscript.1
+    );
 }
 
 #[test]
