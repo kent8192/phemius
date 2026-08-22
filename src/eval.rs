@@ -300,6 +300,16 @@ pub fn run_eval(fixture_root: &Path) -> Result<EvalReport> {
 struct EvalExpectation {
     #[serde(default)]
     required_response: Option<String>,
+    #[serde(default)]
+    forbidden_responses: Vec<String>,
+    #[serde(default)]
+    min_response_chars: Option<usize>,
+    #[serde(default)]
+    max_response_chars: Option<usize>,
+    #[serde(default)]
+    max_tool_calls: Option<usize>,
+    #[serde(default)]
+    required_tool_calls: Vec<String>,
 }
 
 fn evaluate_trial(task: &EvalTask, expected: &EvalExpectation, trial: &Trial) -> Outcome {
@@ -325,10 +335,35 @@ fn evaluate_trial(task: &EvalTask, expected: &EvalExpectation, trial: &Trial) ->
         Ok(value) => value,
         Err(error) => return Outcome::provider_failure_with(error.to_string()),
     };
-    let first_response = responses
+    let response_values = responses
         .get("responses")
         .and_then(serde_json::Value::as_array)
-        .and_then(|responses| responses.first())
+        .ok_or_else(|| Outcome::failure("scripted response list is missing"));
+    let response_values = match response_values {
+        Ok(values) if !values.is_empty() => values,
+        Ok(_) => return Outcome::failure("scripted response list is empty"),
+        Err(outcome) => return outcome,
+    };
+    let mut tool_names = Vec::new();
+    for response in response_values {
+        let Some(response) = response.as_object() else {
+            return Outcome::failure("scripted response entry is not an object");
+        };
+        if let Some(calls) = response.get("tool_calls") {
+            let Some(calls) = calls.as_array() else {
+                return Outcome::failure("scripted tool_calls is not an array");
+            };
+            for call in calls {
+                let Some(name) = call.get("name").and_then(serde_json::Value::as_str) else {
+                    return Outcome::failure("scripted tool call has no name");
+                };
+                tool_names.push(name.to_owned());
+            }
+        }
+    }
+    let first_response = response_values
+        .first()
+        .and_then(serde_json::Value::as_object)
         .and_then(|response| response.get("text"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
@@ -341,6 +376,41 @@ fn evaluate_trial(task: &EvalTask, expected: &EvalExpectation, trial: &Trial) ->
         return Outcome::failure(format!(
             "required deterministic response is missing: {required}"
         ));
+    }
+    if let Some(minimum) = expected.min_response_chars
+        && first_response.chars().count() < minimum
+    {
+        return Outcome::failure(format!(
+            "response is shorter than the deterministic minimum: {minimum}"
+        ));
+    }
+    if let Some(maximum) = expected.max_response_chars
+        && first_response.chars().count() > maximum
+    {
+        return Outcome::failure(format!(
+            "response exceeds the deterministic maximum: {maximum}"
+        ));
+    }
+    if let Some(maximum) = expected.max_tool_calls
+        && tool_names.len() > maximum
+    {
+        return Outcome::failure(format!(
+            "scripted tool calls exceed the deterministic maximum: {maximum}"
+        ));
+    }
+    for forbidden in &expected.forbidden_responses {
+        if first_response.contains(forbidden) {
+            return Outcome::failure(format!(
+                "forbidden deterministic response is present: {forbidden}"
+            ));
+        }
+    }
+    for required_tool in &expected.required_tool_calls {
+        if !tool_names.iter().any(|name| name == required_tool) {
+            return Outcome::failure(format!(
+                "required deterministic tool call is missing: {required_tool}"
+            ));
+        }
     }
     if instruction.contains("provider_failure") {
         return Outcome::provider_failure();

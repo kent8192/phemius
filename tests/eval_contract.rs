@@ -36,3 +36,10 @@ fn smoke_fixture_runs_offline_and_passes_deterministic_gates() {
     assert_eq!(report.status, EvalStatus::Pass);
     assert_eq!(report.trials, 1);
 }
+
+#[test]
+fn deterministic_expectations_cover_length_and_tool_contracts() {
+    let report = run_eval(Path::new("fixtures/eval/contract")).unwrap();
+    assert_eq!(report.status, EvalStatus::Pass);
+    assert_eq!(report.passed_trials, 1);
+}

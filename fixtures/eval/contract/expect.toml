@@ -1,0 +1,6 @@
+required_response = "CONTRACT_PASS"
+forbidden_responses = ["FORBIDDEN"]
+min_response_chars = 10
+max_response_chars = 100
+max_tool_calls = 1
+required_tool_calls = ["read_file"]

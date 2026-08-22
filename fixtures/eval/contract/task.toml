@@ -1,0 +1,5 @@
+id = "contract"
+instruction = "instruction.md"
+expect = "expect.toml"
+scripted_responses = "scripted-responses.json"
+trials = 1

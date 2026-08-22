@@ -1,0 +1,10 @@
+{
+  "responses": [
+    {
+      "text": "CONTRACT_PASS: bounded candidate",
+      "tool_calls": [
+        {"name": "read_file", "arguments": {"path": "前提/作品.md"}}
+      ]
+    }
+  ]
+}
