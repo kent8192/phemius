@@ -10,6 +10,9 @@ The OpenRouter client is the only production component that reads
 provider parameters, and disable the context-compression plugin. The client
 does not retry transport failures or silently switch providers. Malformed SSE,
 invalid tool calls, unknown prices, and ambiguous completions stop the run.
+OpenRouter web discovery, when explicitly attached to a request, is a
+provider-operated `openrouter:web_search` server tool; cited pages still pass
+the HTTPS snapshot and manifest hash checks before they enter manuscript context.
 
 The actual model ID and durable usage facts belong in the run receipt; prompts
 and model output are not copied into the append-only session truth. Secret

@@ -6,11 +6,13 @@ use std::{
 };
 
 use phemius::{
+    model::ToolCall,
     sandbox::{ApprovalMode, ChoiceReason, SandboxMode, ShellError, ShellRequest, run_shell},
     skills::{SkillCatalog, load_hierarchical_instructions},
     tools::{AgentRole, Tool, ToolAccessError, ToolExecutor, ToolRequest},
 };
 use rstest::rstest;
+use serde_json::json;
 
 #[rstest]
 fn critic_tool_set_never_contains_shell() {
@@ -32,6 +34,57 @@ fn tool_catalog_order_is_stable() {
             "web",
             "subagent",
         ]
+    );
+}
+
+#[rstest]
+fn model_tool_definitions_match_the_executable_read_boundary() {
+    let definitions = Tool::model_definitions(AgentRole::Author);
+    let names = definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        ["read_file", "search_files", "diff", "import", "git"]
+    );
+    let critic_definitions = Tool::model_definitions(AgentRole::ConsistencyCritic);
+    assert!(
+        critic_definitions
+            .iter()
+            .all(|definition| definition.name != "edit_candidate")
+    );
+}
+
+#[rstest]
+fn model_tool_calls_parse_only_fixed_requests() {
+    let request = ToolRequest::from_call(&ToolCall {
+        id: Some("call-1".into()),
+        name: "git".into(),
+        arguments: json!({"query": "status"}),
+    })
+    .unwrap();
+    assert_eq!(
+        request,
+        ToolRequest::Git {
+            query: phemius::tools::GitQuery::Status
+        }
+    );
+    assert!(
+        ToolRequest::from_call(&ToolCall {
+            id: None,
+            name: "edit_candidate".into(),
+            arguments: json!({"path": "draft.md", "contents": "x"}),
+        })
+        .is_err()
+    );
+    assert!(
+        ToolRequest::from_call(&ToolCall {
+            id: None,
+            name: "read_file".into(),
+            arguments: json!({"path": "a.md", "extra": true}),
+        })
+        .is_err()
     );
 }
 

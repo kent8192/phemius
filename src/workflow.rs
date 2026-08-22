@@ -38,7 +38,7 @@ use crate::{
     project::Project,
     session::{Checkpoint, ContextEpoch, SessionEvent, SessionJournal},
     sources::{ManifestDocument, Snapshot},
-    tools::{AgentRole as ToolRole, Tool},
+    tools::{AgentRole as ToolRole, Tool, ToolExecutor, ToolRequest},
 };
 
 /// The fixed roles used by the reviewed writing pipeline.
@@ -776,6 +776,10 @@ impl RunController {
         }
     }
 
+    fn model_tools_for_role(role: AgentRole) -> Vec<crate::model::ToolDefinition> {
+        Tool::model_definitions(role.tool_role())
+    }
+
     /// Returns the attached project, if this controller has a durable approval boundary.
     pub fn project(&self) -> Option<&Project> {
         self.project.as_ref()
@@ -979,7 +983,7 @@ impl RunController {
         let model_request = ModelRequest::new(
             role.name(),
             vec![ModelMessage::user(request.clone())],
-            Vec::new(),
+            Self::model_tools_for_role(role),
         )
         .with_model(self.model(role));
         let response = self
@@ -1728,7 +1732,7 @@ impl RunController {
             vec![ModelMessage::user(format!(
                 "Plan chapter {chapter_id} from the approved scene, box, and macro structure. Return a plan only."
             ))],
-            Vec::new(),
+            Self::model_tools_for_role(AgentRole::StoryArchitect),
         )
         .with_model(self.model(AgentRole::StoryArchitect));
         let architect_plan = match self
@@ -1799,7 +1803,7 @@ impl RunController {
                     .collect::<Vec<_>>()
                     .join("\n")
             ))],
-            Vec::new(),
+            Self::model_tools_for_role(AgentRole::Writer),
         )
         .with_model(self.model(AgentRole::Writer));
         trace.writer_calls = 1;
@@ -1930,7 +1934,7 @@ impl RunController {
                 vec![ModelMessage::user(format!(
                     "Revise only this candidate prose and preserve every approved fact.\n\nCandidate:\n{candidate_text}\n\nTyped findings:\n{typed_findings}\n\nRequired facts and correction directives:\n{required_facts}"
                 ))],
-                Vec::new(),
+                Self::model_tools_for_role(AgentRole::Reviser),
             )
             .with_model(self.model(AgentRole::Reviser));
             match self.complete_model_request(chapter_id, request).await {
@@ -2274,6 +2278,71 @@ impl RunController {
     }
 
     async fn complete_model_request(
+        &mut self,
+        chapter_id: &str,
+        mut request: ModelRequest,
+    ) -> ModelResult<ModelResponse> {
+        let role = match request.role.as_str() {
+            "coordinator" | "validator" => ToolRole::Coordinator,
+            role if role.contains("critic") => ToolRole::ConsistencyCritic,
+            _ => ToolRole::Author,
+        };
+        let workspace = self.project.as_ref().map(|project| project.root.clone());
+        let mut executor = None;
+        for turn in 0..64 {
+            let response = self
+                .complete_model_turn(chapter_id, request.clone())
+                .await?;
+            if response.tool_calls.is_empty() {
+                return Ok(response);
+            }
+            let workspace = workspace.as_deref().ok_or_else(|| {
+                crate::model::ModelFailure::stopped(
+                    "model requested a tool but no project workspace is attached",
+                )
+            })?;
+            if executor.is_none() {
+                executor = Some(ToolExecutor::new(workspace, role).map_err(|error| {
+                    crate::model::ModelFailure::stopped(format!(
+                        "failed to open model tool workspace: {error}"
+                    ))
+                })?);
+            }
+            request.messages.push(ModelMessage::assistant(
+                response.text.clone(),
+                response.tool_calls.clone(),
+            ));
+            for (index, call) in response.tool_calls.iter().enumerate() {
+                let tool_request = ToolRequest::from_call(call)?;
+                let result = executor
+                    .as_mut()
+                    .expect("tool executor initialized")
+                    .execute(tool_request)
+                    .map_err(|error| {
+                        crate::model::ModelFailure::stopped(format!(
+                            "model tool {} failed: {error}",
+                            call.name
+                        ))
+                    })?;
+                let call_id = call
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("phemius-call-{turn}-{index}"));
+                request.messages.push(ModelMessage::tool(
+                    call_id,
+                    format!(
+                        "artifact_sha256={}; total_bytes={}; truncated={}\n{}",
+                        result.sha256, result.total_bytes, result.truncated, result.visible
+                    ),
+                ));
+            }
+        }
+        Err(crate::model::ModelFailure::stopped(
+            "model tool loop exceeded 64 turns",
+        ))
+    }
+
+    async fn complete_model_turn(
         &mut self,
         chapter_id: &str,
         request: ModelRequest,
@@ -2691,7 +2760,28 @@ fn request_context_hash(request: &ModelRequest) -> String {
         bytes.extend_from_slice(message.role.as_bytes());
         bytes.push(0);
         bytes.extend_from_slice(message.content.as_bytes());
+        for call in &message.tool_calls {
+            bytes.extend_from_slice(call.name.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(call.id.as_deref().unwrap_or_default().as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(call.arguments.to_string().as_bytes());
+            bytes.push(0);
+        }
+        if let Some(id) = &message.tool_call_id {
+            bytes.extend_from_slice(id.as_bytes());
+        }
         bytes.push(0xff);
+    }
+    for tool in &request.tools {
+        bytes.extend_from_slice(tool.name.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(tool.input_schema.to_string().as_bytes());
+        bytes.push(0xfe);
+    }
+    for tool in &request.server_tools {
+        bytes.extend_from_slice(format!("{:?}", tool).as_bytes());
+        bytes.push(0xfd);
     }
     sha256_bytes(&bytes)
 }

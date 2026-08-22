@@ -40,14 +40,22 @@ The default model is `deepseek/deepseek-v4-pro-0813`. `/model <id>` changes the
 session model and `/model <role> <id>` changes one workflow role. These are
 explicit human commands; natural-language text cannot persist a model choice.
 
+Model requests use a validated read-only tool loop for `read_file`,
+`search_files`, `diff`, `import`, and read-only `git`. The controller retains
+the workspace capability, appends assistant/tool follow-up messages, and keeps
+candidate writes, shell, Web discovery, and subagents outside the model's
+direct authority.
+
 ## Initialize a project
 
 ```sh
 cargo run -- init ./my-novel
-# answer the title prompt
+# answer the title, premise, language, genre, framework, and style prompts
 ```
 
-The initializer creates the canon directories and one work ID. It does not
+The initializer creates the canon directories and one work ID. The interview
+answers are written to an unapproved candidate under
+`.phemius/runtime/candidates/`; they do not change canon directly. It does not
 create an approved structure or framework. Generation stops until those
 definitions are valid.
 

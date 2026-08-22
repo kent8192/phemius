@@ -5,7 +5,7 @@ use phemius::{
     context::CoverageDisposition,
     cost::{Price, Usage},
     domain::{EntityKind, prefixed_uuid},
-    model::{ModelFailure, ModelResponse, ScriptedModel},
+    model::{ModelFailure, ModelResponse, ScriptedModel, ToolCall},
     project::{InitAnswers, initialize_project},
     repl::{Repl, ReplOutcome, RoutedInput, route_input},
     sources::{ManifestDocument, Snapshot, SourceEntry, SourceKind, SourceScope, SourceTier},
@@ -13,6 +13,7 @@ use phemius::{
         AgentRole, AgentSpec, ChapterState, Finding, FindingDisposition, FindingKind, RunController,
     },
 };
+use serde_json::json;
 
 #[tokio::test]
 async fn chapter_pipeline_runs_writer_then_three_critics_at_most_then_reviser() {
@@ -41,6 +42,51 @@ async fn chapter_pipeline_runs_writer_then_three_critics_at_most_then_reviser() 
     );
     assert!(result.changeset.state.is_approvable());
     assert_eq!(result.trace.roles.first(), Some(&AgentRole::StoryArchitect));
+}
+
+#[tokio::test]
+async fn project_workflow_dispatches_a_validated_read_tool_and_continues() {
+    let directory = TestDir::new("workflow-model-tool-loop");
+    let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
+    let chapter_id = prefixed_uuid(EntityKind::Chapter);
+    let responses = [
+        Ok(ModelResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: Some("call-read".into()),
+                name: "read_file".into(),
+                arguments: json!({"path": "前提/作品.md"}),
+            }],
+            usage: None,
+        }),
+        Ok(ModelResponse {
+            text: "architect plan".into(),
+            tool_calls: Vec::new(),
+            usage: None,
+        }),
+        Ok(ModelResponse {
+            text: "draft after tool loop".into(),
+            tool_calls: Vec::new(),
+            usage: None,
+        }),
+    ]
+    .into_iter()
+    .chain((0..6).map(|_| {
+        Ok(ModelResponse {
+            text: "FINDING|other|本文/chapter|0|0|advisory".into(),
+            tool_calls: Vec::new(),
+            usage: None,
+        })
+    }))
+    .collect::<Vec<_>>();
+    let run = RunController::fixture_with_project(project, ScriptedModel::shared(responses))
+        .write_chapter(chapter_id.as_str())
+        .await
+        .unwrap();
+
+    assert_eq!(run.candidate_text, "draft after tool loop");
+    assert_eq!(run.trace.architect_calls, 1);
+    assert_eq!(run.trace.writer_calls, 1);
 }
 
 #[tokio::test]

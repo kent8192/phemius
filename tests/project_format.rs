@@ -86,6 +86,41 @@ fn init_creates_the_japanese_canon_tree_without_overwriting() {
 }
 
 #[test]
+fn init_interview_answers_are_retained_in_an_unapproved_candidate() {
+    let root = TestDir::new("init-interview");
+    initialize_project(
+        root.path(),
+        &InitAnswers::interview(
+            "作品名",
+            "海辺の町で失踪事件を追う",
+            "日本語",
+            "ミステリ",
+            "箱書き",
+            "短い場面と静かな文体",
+        ),
+    )
+    .unwrap();
+
+    let candidates = fs::read_dir(root.path().join(".phemius/runtime/candidates"))
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    let metadata = fs::read_to_string(candidates[0].path().join("init.toml")).unwrap();
+    for answer in [
+        "title = \"作品名\"",
+        "premise = \"海辺の町で失踪事件を追う\"",
+        "language = \"日本語\"",
+        "genre = \"ミステリ\"",
+        "framework = \"箱書き\"",
+        "style = \"短い場面と静かな文体\"",
+        "state = \"unapproved\"",
+    ] {
+        assert!(metadata.contains(answer), "missing {answer}");
+    }
+}
+
+#[test]
 fn macro_beats_can_link_multiple_scenes() {
     let structure = fixture_structure();
 

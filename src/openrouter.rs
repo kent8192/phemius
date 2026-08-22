@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::cost::Usage;
 use crate::model::{
-    ModelFailure, ModelMessage, ModelRequest, ModelResponse, ModelResult, ToolCall,
+    ModelFailure, ModelMessage, ModelRequest, ModelResponse, ModelResult, ServerTool, ToolCall,
 };
 
 const OPENROUTER_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -208,10 +208,12 @@ pub fn parse_sse_events(events: impl AsRef<str>) -> ModelResult<ModelResponse> {
 }
 
 fn request_body(request: &ModelRequest) -> Value {
+    let mut tools = request.tools.iter().map(tool_body).collect::<Vec<_>>();
+    tools.extend(request.server_tools.iter().map(server_tool_body));
     json!({
         "model": request.model,
         "messages": request.messages.iter().map(message_body).collect::<Vec<_>>(),
-        "tools": request.tools.iter().map(tool_body).collect::<Vec<_>>(),
+        "tools": tools,
         "stream": true,
         "provider": {
             "allow_fallbacks": false,
@@ -224,8 +226,53 @@ fn request_body(request: &ModelRequest) -> Value {
     })
 }
 
+fn server_tool_body(tool: &ServerTool) -> Value {
+    match tool {
+        ServerTool::WebSearch {
+            engine,
+            max_results,
+        } => {
+            let mut body = json!({"type": "openrouter:web_search"});
+            let mut parameters = serde_json::Map::new();
+            if let Some(engine) = engine {
+                parameters.insert("engine".into(), Value::String(engine.clone()));
+            }
+            if let Some(max_results) = max_results {
+                parameters.insert("max_results".into(), json!(max_results));
+            }
+            if !parameters.is_empty() {
+                body["parameters"] = Value::Object(parameters);
+            }
+            body
+        }
+    }
+}
+
 fn message_body(message: &ModelMessage) -> Value {
-    json!({"role": message.role, "content": message.content})
+    let mut body = json!({"role": message.role, "content": message.content});
+    if !message.tool_calls.is_empty() {
+        body["tool_calls"] = Value::Array(
+            message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": serde_json::to_string(&call.arguments)
+                                .unwrap_or_else(|_| "{}".into()),
+                        },
+                    })
+                })
+                .collect(),
+        );
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        body["tool_call_id"] = Value::String(tool_call_id.clone());
+    }
+    body
 }
 
 fn tool_body(tool: &crate::model::ToolDefinition) -> Value {

@@ -141,23 +141,14 @@ pub fn parse_repl_command(input: &str) -> Result<ReplCommand> {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    if matches!(cli.command, Some(TopLevelCommand::Init { .. })) {
-        eprint!("Project title: ");
-        io::stderr()
-            .flush()
-            .context("failed to prompt for project title")?;
-    }
     let stdin = io::stdin();
     run_with_input(cli, &mut stdin.lock()).await
 }
 
 pub async fn run_with_input(cli: Cli, input: &mut impl BufRead) -> Result<()> {
     if let Some(TopLevelCommand::Init { path }) = &cli.command {
-        let mut title = String::new();
-        input
-            .read_line(&mut title)
-            .context("failed to read project title")?;
-        let project = initialize_project(path, &InitAnswers::minimal(title.trim()))?;
+        let answers = read_init_answers(input)?;
+        let project = initialize_project(path, &answers)?;
         let backend = production_backend()?;
         let _ = run_project_repl(project, backend, input).await?;
     } else if let Some(TopLevelCommand::Eval { project }) = &cli.command {
@@ -191,11 +182,8 @@ pub async fn run_with_input_with_backend(
 ) -> Result<Repl> {
     let project = match cli.command {
         Some(TopLevelCommand::Init { path }) => {
-            let mut title = String::new();
-            input
-                .read_line(&mut title)
-                .context("failed to read project title")?;
-            initialize_project(&path, &InitAnswers::minimal(title.trim()))?
+            let answers = read_init_answers(input)?;
+            initialize_project(&path, &answers)?
         }
         None => Project::open(&cli.project)?,
         Some(TopLevelCommand::Eval { .. }) => {
@@ -203,6 +191,33 @@ pub async fn run_with_input_with_backend(
         }
     };
     run_project_repl(project, backend, input).await
+}
+
+fn read_init_answers(input: &mut impl BufRead) -> Result<InitAnswers> {
+    let title = read_init_answer(input, "Project title: ")?;
+    let premise = read_init_answer(input, "Premise or logline (optional): ")?;
+    let language = read_init_answer(input, "Writing language (optional): ")?;
+    let genre = read_init_answer(input, "Genre (optional): ")?;
+    let framework = read_init_answer(
+        input,
+        "Plot framework (optional; Save the Cat, three-act, hakogaki, or custom): ",
+    )?;
+    let style = read_init_answer(input, "Style or constraints (optional): ")?;
+    Ok(InitAnswers::interview(
+        title, premise, language, genre, framework, style,
+    ))
+}
+
+fn read_init_answer(input: &mut impl BufRead, prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    io::stderr()
+        .flush()
+        .context("failed to flush initialization prompt")?;
+    let mut answer = String::new();
+    input
+        .read_line(&mut answer)
+        .context("failed to read initialization answer")?;
+    Ok(answer.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 fn production_backend() -> Result<ModelBackend> {

@@ -21,12 +21,40 @@ pub struct ProjectConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitAnswers {
     pub title: String,
+    pub premise: String,
+    pub language: String,
+    pub genre: String,
+    pub framework: String,
+    pub style: String,
 }
 
 impl InitAnswers {
     pub fn minimal(title: impl Into<String>) -> Self {
         Self {
             title: title.into(),
+            premise: String::new(),
+            language: String::new(),
+            genre: String::new(),
+            framework: String::new(),
+            style: String::new(),
+        }
+    }
+
+    pub fn interview(
+        title: impl Into<String>,
+        premise: impl Into<String>,
+        language: impl Into<String>,
+        genre: impl Into<String>,
+        framework: impl Into<String>,
+        style: impl Into<String>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            premise: premise.into(),
+            language: language.into(),
+            genre: genre.into(),
+            framework: framework.into(),
+            style: style.into(),
         }
     }
 }
@@ -244,6 +272,11 @@ pub fn initialize_project(root: &Path, answers: &InitAnswers) -> Result<Project>
         id: candidate_id,
         state: "unapproved",
         title: &answers.title,
+        premise: &answers.premise,
+        language: &answers.language,
+        genre: &answers.genre,
+        framework: &answers.framework,
+        style: &answers.style,
     };
     write_new(
         &candidate_dir.join("init.toml"),
@@ -252,11 +285,10 @@ pub fn initialize_project(root: &Path, answers: &InitAnswers) -> Result<Project>
             .as_bytes(),
     )?;
     staging.persist(root)?;
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("failed to canonicalize initialized root {}", root.display()))?;
 
-    Ok(Project {
-        root: root.to_path_buf(),
-        config,
-    })
+    Ok(Project { root, config })
 }
 
 struct StagingDirectory {
@@ -394,6 +426,11 @@ struct InitialCandidate<'a> {
     id: EntityId,
     state: &'static str,
     title: &'a str,
+    premise: &'a str,
+    language: &'a str,
+    genre: &'a str,
+    framework: &'a str,
+    style: &'a str,
 }
 
 fn directory_is_empty_or_missing(path: &Path) -> Result<bool> {

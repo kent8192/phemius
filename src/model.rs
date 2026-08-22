@@ -71,6 +71,10 @@ pub struct ModelMessage {
     pub role: String,
     /// Plain text content.
     pub content: String,
+    /// Assistant tool calls associated with this message.
+    pub tool_calls: Vec<ToolCall>,
+    /// Provider tool-call identifier for a tool-result message.
+    pub tool_call_id: Option<String>,
 }
 
 impl ModelMessage {
@@ -79,6 +83,28 @@ impl ModelMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// Builds an assistant message that may carry tool calls.
+    pub fn assistant(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// Builds a tool-result message for one assistant call.
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
@@ -92,6 +118,39 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema-like object contract enforced by this client.
     pub input_schema: Value,
+}
+
+/// A provider-operated server tool that does not require local dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServerTool {
+    /// Lets OpenRouter perform bounded discovery during one request.
+    WebSearch {
+        /// Optional search engine selector accepted by OpenRouter.
+        engine: Option<String>,
+        /// Optional maximum result count.
+        max_results: Option<u8>,
+    },
+}
+
+impl ServerTool {
+    /// Creates the default OpenRouter web-search server tool.
+    pub fn web_search() -> Self {
+        Self::WebSearch {
+            engine: None,
+            max_results: None,
+        }
+    }
+
+    /// Adds an explicit result bound to a web-search server tool.
+    pub fn with_max_results(mut self, max_results: u8) -> Self {
+        match &mut self {
+            Self::WebSearch {
+                max_results: current,
+                ..
+            } => *current = Some(max_results),
+        }
+        self
+    }
 }
 
 impl ToolDefinition {
@@ -130,6 +189,8 @@ pub struct ModelRequest {
     pub messages: Vec<ModelMessage>,
     /// Functions that may be returned and dispatched after validation.
     pub tools: Vec<ToolDefinition>,
+    /// Provider-operated server tools for this single request.
+    pub server_tools: Vec<ServerTool>,
 }
 
 impl ModelRequest {
@@ -144,12 +205,19 @@ impl ModelRequest {
             model: DEFAULT_MODEL.into(),
             messages,
             tools,
+            server_tools: Vec::new(),
         }
     }
 
     /// Replaces the model for this single role/session request.
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self
+    }
+
+    /// Enables one provider-operated web-search discovery tool for this request.
+    pub fn with_web_search(mut self) -> Self {
+        self.server_tools.push(ServerTool::web_search());
         self
     }
 
@@ -173,7 +241,7 @@ impl ModelRequest {
 }
 
 /// A fully assembled model tool call. It is not executable until the controller dispatches it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolCall {
     /// Provider call identifier, retained for the subsequent tool-result message.
     pub id: Option<String>,

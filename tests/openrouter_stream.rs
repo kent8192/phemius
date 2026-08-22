@@ -78,6 +78,58 @@ async fn request_disables_router_fallback_and_context_compression() {
 
 #[rstest]
 #[tokio::test]
+async fn follow_up_tool_messages_use_openai_compatible_roles() {
+    let server = RecordingHttpServer::start(fixture_success_sse()).await;
+    let client = OpenRouterClient::for_test(server.url(), "test-key").unwrap();
+    let call = ToolCall {
+        id: Some("call_1".into()),
+        name: "read_file".into(),
+        arguments: json!({"path": "前提/作品.md"}),
+    };
+    let request = ModelRequest::new(
+        "writer",
+        vec![
+            ModelMessage::user("Read the source."),
+            ModelMessage::assistant("", vec![call]),
+            ModelMessage::tool("call_1", "artifact_sha256=abc\n作品"),
+        ],
+        vec![ToolDefinition::object(
+            "read_file",
+            "Reads one source file.",
+            json!({"path": {"type": "string"}}),
+            ["path"],
+        )],
+    );
+
+    client.complete(request).await.unwrap();
+
+    let body = server.single_json_request().await;
+    assert_eq!(body["messages"][1]["role"], "assistant");
+    assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(
+        body["messages"][1]["tool_calls"][0]["function"]["name"],
+        "read_file"
+    );
+    assert_eq!(body["messages"][2]["role"], "tool");
+    assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+}
+
+#[rstest]
+#[tokio::test]
+async fn web_search_is_sent_as_an_openrouter_server_tool() {
+    let server = RecordingHttpServer::start(fixture_success_sse()).await;
+    let client = OpenRouterClient::for_test(server.url(), "test-key").unwrap();
+    let request = fixture_request().with_web_search();
+
+    client.complete(request).await.unwrap();
+
+    let body = server.single_json_request().await;
+    assert_eq!(body["tools"][1]["type"], "openrouter:web_search");
+    assert_eq!(body["tools"][1].get("function"), None);
+}
+
+#[rstest]
+#[tokio::test]
 async fn production_client_reads_the_environment_key_at_request_time() {
     let environment = EnvironmentVariable::set("OPENROUTER_API_KEY", "construction-key");
     let server = RecordingHttpServer::start(fixture_success_sse()).await;

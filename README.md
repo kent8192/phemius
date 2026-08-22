@@ -47,8 +47,10 @@ The second variable is a conservative maximum reservation per model call in
 microdollars. If it is missing or invalid, paid generation stops rather than
 guessing a price.
 
-`init` asks for a title and creates the project tree. It does not invent a
-plot, approve a framework, or start a paid request. See
+`init` asks for a title, premise, language, genre, plot-framework preference,
+and style constraints. Answers are retained in an unapproved candidate
+changeset; they do not silently change canon, approve a framework, or start a
+paid request. See
 [`docs/configuration.md`](docs/configuration.md) for the two small JSON plan
 files needed before writing.
 
@@ -136,6 +138,15 @@ fail closed.
 
 The tool table is fixed and role-scoped. File tools stay below the candidate
 workspace, retain complete output hashes, and bound model-visible output.
+Architect, writer, reviser, and coordinator requests expose only the executable
+read boundary (`read_file`, `search_files`, `diff`, `import`, and read-only
+`git`). Returned calls are schema-validated, dispatched through the held
+capability, and sent back as OpenAI-compatible assistant/tool messages. Candidate
+writes remain controller-owned; shell, web discovery, and subagent tools are
+trusted-controller operations rather than unimplemented model functions.
+An explicit discovery request may opt into OpenRouter's
+`openrouter:web_search` server tool; cited pages still have to pass the existing
+HTTPS snapshot and manifest-registration boundary before manuscript context uses them.
 Shell tools use macOS Seatbelt with a cleared child environment, no inherited
 API key, and network denial. `/usr/bin/sandbox-exec` is deprecated by macOS;
 if the profile cannot be created, Phemius stops or asks the human to choose an

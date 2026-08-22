@@ -20,6 +20,9 @@ use cap_std::{
     fs::{Dir, OpenOptions, OpenOptionsExt},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::model::{ModelFailure, ToolCall, ToolDefinition};
 
 const MAX_VISIBLE_TOKENS: usize = 10_000;
 const MAX_RESULT_BYTES: u64 = 100 * 1024 * 1024;
@@ -100,6 +103,51 @@ impl Tool {
             AgentRole::Author | AgentRole::Coordinator => Self::all(),
         }
     }
+
+    /// Converts executable, non-shell tools into model-facing definitions.
+    ///
+    /// Shell, web discovery, and subagent execution remain trusted-controller operations until
+    /// their approval and async dispatch boundaries are available.  Exposing only executable
+    /// definitions prevents the model from requesting a tool that cannot be completed.
+    pub fn model_definitions(role: AgentRole) -> Vec<ToolDefinition> {
+        Self::for_role(role)
+            .iter()
+            .filter_map(|tool| match tool {
+                Self::ReadFile => Some(ToolDefinition::object(
+                    tool.name(),
+                    "Read one regular file below the project workspace.",
+                    json!({"path": {"type": "string", "minLength": 1}}),
+                    ["path"],
+                )),
+                Self::SearchFiles => Some(ToolDefinition::object(
+                    tool.name(),
+                    "Search regular project files for literal text.",
+                    json!({"query": {"type": "string", "minLength": 1}}),
+                    ["query"],
+                )),
+                Self::EditCandidate => None,
+                Self::Diff => Some(ToolDefinition::object(
+                    tool.name(),
+                    "Read the current project diff.",
+                    json!({}),
+                    Vec::<&str>::new(),
+                )),
+                Self::Import => Some(ToolDefinition::object(
+                    tool.name(),
+                    "Read one regular project file as source material.",
+                    json!({"path": {"type": "string", "minLength": 1}}),
+                    ["path"],
+                )),
+                Self::Git => Some(ToolDefinition::object(
+                    tool.name(),
+                    "Read-only Git status or diff.",
+                    json!({"query": {"type": "string", "enum": ["status", "diff"]}}),
+                    ["query"],
+                )),
+                Self::Shell | Self::Web | Self::Subagent => None,
+            })
+            .collect()
+    }
 }
 
 /// A controller-assigned model role.
@@ -176,6 +224,86 @@ impl ToolRequest {
             Self::Diff => Tool::Diff,
             Self::Import { .. } => Tool::Import,
             Self::Git { .. } => Tool::Git,
+        }
+    }
+
+    /// Parses a validated model call into a fixed controller request.
+    pub fn from_call(call: &ToolCall) -> std::result::Result<Self, ModelFailure> {
+        let object = call.arguments.as_object().ok_or_else(|| {
+            ModelFailure::stopped(format!("tool {} arguments must be an object", call.name))
+        })?;
+        let string = |key: &str| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    ModelFailure::stopped(format!(
+                        "tool {} requires string argument {key}",
+                        call.name
+                    ))
+                })
+        };
+        let exact_keys = |allowed: &[&str]| {
+            if object.len() == allowed.len()
+                && object
+                    .keys()
+                    .all(|key| allowed.iter().any(|allowed| *allowed == key))
+            {
+                Ok(())
+            } else {
+                Err(ModelFailure::stopped(format!(
+                    "tool {} supplied unexpected arguments",
+                    call.name
+                )))
+            }
+        };
+        match call.name.as_str() {
+            "read_file" => {
+                exact_keys(&["path"])?;
+                Ok(Self::ReadFile {
+                    path: PathBuf::from(string("path")?),
+                })
+            }
+            "search_files" => {
+                exact_keys(&["query"])?;
+                Ok(Self::SearchFiles {
+                    query: string("query")?,
+                })
+            }
+            "diff" => {
+                exact_keys(&[])?;
+                Ok(Self::Diff)
+            }
+            "import" => {
+                exact_keys(&["path"])?;
+                Ok(Self::Import {
+                    path: PathBuf::from(string("path")?),
+                })
+            }
+            "git" => {
+                exact_keys(&["query"])?;
+                Ok(Self::Git {
+                    query: match string("query")?.as_str() {
+                        "status" => GitQuery::Status,
+                        "diff" => GitQuery::Diff,
+                        value => {
+                            return Err(ModelFailure::stopped(format!(
+                                "tool git query {value} is not supported"
+                            )));
+                        }
+                    },
+                })
+            }
+            "edit_candidate" | "shell" | "web" | "subagent" => Err(ModelFailure::stopped(format!(
+                "tool {} is not available in this model loop",
+                call.name
+            ))),
+            _ => Err(ModelFailure::stopped(format!(
+                "model requested unknown tool {}",
+                call.name
+            ))),
         }
     }
 }
