@@ -354,7 +354,15 @@ fn evaluate_trial(task: &EvalTask, expected: &EvalExpectation, trial: &Trial) ->
                 return Outcome::failure("scripted tool_calls is not an array");
             };
             for call in calls {
-                let Some(name) = call.get("name").and_then(serde_json::Value::as_str) else {
+                let name = call
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        call.get("function")
+                            .and_then(|function| function.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                    });
+                let Some(name) = name else {
                     return Outcome::failure("scripted tool call has no name");
                 };
                 tool_names.push(name.to_owned());
