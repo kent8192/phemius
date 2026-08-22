@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     changeset::{
-        ApprovalRecord, Changeset, FileOperation, OperationKind, PinnedPath,
+        ApprovalRecord, Changeset, FileOperation, OperationKind, PinnedPath, ValidationError,
         approval_chain_head_in, approval_record_bytes, canon_root_hash_in, open_dir_no_follow_io,
         open_pinned_path_io, open_project_root_io, path_alias_key, read_regular_at_io,
         sha256_bytes, validate_changeset_in, validate_target_lexical,
@@ -79,6 +79,7 @@ pub struct RecoveryOutcome {
 #[derive(Debug)]
 pub struct ManualResolutionRequired {
     changeset_id: String,
+    evidence_path: Option<PathBuf>,
     source: Option<anyhow::Error>,
 }
 
@@ -87,9 +88,14 @@ impl ManualResolutionRequired {
         &self.changeset_id
     }
 
+    pub fn evidence_path(&self) -> Option<&Path> {
+        self.evidence_path.as_deref()
+    }
+
     fn pending(changeset_id: &str) -> Self {
         Self {
             changeset_id: changeset_id.to_owned(),
+            evidence_path: None,
             source: None,
         }
     }
@@ -97,7 +103,21 @@ impl ManualResolutionRequired {
     fn after_error(changeset_id: &str, source: anyhow::Error) -> Self {
         Self {
             changeset_id: changeset_id.to_owned(),
+            evidence_path: None,
             source: Some(source),
+        }
+    }
+
+    fn approval_evidence(error: ValidationError) -> Self {
+        let changeset_id = error
+            .approval_evidence_id()
+            .unwrap_or("unknown-approval-evidence")
+            .to_owned();
+        let evidence_path = error.approval_evidence_path().map(Path::to_path_buf);
+        Self {
+            changeset_id,
+            evidence_path,
+            source: Some(anyhow::Error::new(error)),
         }
     }
 }
@@ -109,6 +129,9 @@ impl fmt::Display for ManualResolutionRequired {
             "changeset {} requires manual resolution",
             self.changeset_id
         )?;
+        if let Some(path) = &self.evidence_path {
+            write!(formatter, " for approval evidence {}", path.display())?;
+        }
         if let Some(source) = &self.source {
             write!(formatter, ": {source}")?;
         }
@@ -799,20 +822,7 @@ fn verify_current_committed_head(root: &Dir, transactions: &[Transaction]) -> Re
     require_retained_receipts_for_approval_files(root, transactions)?;
     let head = match approval_chain_head_in(root) {
         Ok(head) => head,
-        Err(error) => {
-            let Some(transaction) = transactions
-                .iter()
-                .filter(|transaction| transaction.journal.state == JournalState::Committed)
-                .max_by_key(|transaction| transaction.journal.chapter_order)
-            else {
-                return Err(error.into());
-            };
-            return Err(ManualResolutionRequired::after_error(
-                &transaction.journal.changeset_id,
-                anyhow::Error::new(error),
-            )
-            .into());
-        }
+        Err(error) => return Err(ManualResolutionRequired::approval_evidence(error).into()),
     };
     let Some((head_id, head_order)) = head else {
         return Ok(());

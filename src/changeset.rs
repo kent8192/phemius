@@ -148,6 +148,8 @@ impl ValidationErrorKind {
 pub struct ValidationError {
     kind: ValidationErrorKind,
     message: String,
+    approval_evidence_id: Option<String>,
+    approval_evidence_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -171,11 +173,27 @@ impl ValidationError {
         Self {
             kind,
             message: message.into(),
+            approval_evidence_id: None,
+            approval_evidence_path: None,
         }
     }
 
     fn io(context: &str, error: std::io::Error) -> Self {
         Self::new(ValidationErrorKind::Io, format!("{context}: {error}"))
+    }
+
+    fn with_approval_evidence(mut self, path: &Path, changeset_id: Option<&str>) -> Self {
+        self.approval_evidence_id = changeset_id.map(str::to_owned);
+        self.approval_evidence_path = Some(path.to_path_buf());
+        self
+    }
+
+    pub(crate) fn approval_evidence_id(&self) -> Option<&str> {
+        self.approval_evidence_id.as_deref()
+    }
+
+    pub(crate) fn approval_evidence_path(&self) -> Option<&Path> {
+        self.approval_evidence_path.as_deref()
     }
 }
 
@@ -572,6 +590,18 @@ pub fn approval_record_bytes(change: &Changeset) -> Result<Vec<u8>, ValidationEr
 struct ScannedApproval {
     record: ApprovalRecord,
     sha256: String,
+    path: PathBuf,
+}
+
+impl ScannedApproval {
+    fn evidence_error(
+        &self,
+        kind: ValidationErrorKind,
+        message: impl Into<String>,
+    ) -> ValidationError {
+        ValidationError::new(kind, message)
+            .with_approval_evidence(&self.path, Some(self.record.changeset_id.as_str()))
+    }
 }
 
 fn validate_approval_order_in(root: &Dir, change: &Changeset) -> Result<(), ValidationError> {
@@ -670,33 +700,34 @@ fn scan_approval_records_in(root: &Dir) -> Result<Vec<ScannedApproval>, Validati
     let mut approvals = Vec::with_capacity(entries.len());
     let mut orders = HashSet::new();
     for entry in entries {
-        let file_type = entry
-            .file_type()
-            .map_err(|error| ValidationError::io("failed to inspect approval record", error))?;
-        if !file_type.is_file() {
-            return validation_error(
-                ValidationErrorKind::DependencyHash,
-                format!(
-                    "unknown approval entry: {}",
-                    PathBuf::from(".phemius/records/approvals")
-                        .join(entry.file_name())
-                        .display()
-                ),
-            );
-        }
         let name = entry.file_name();
-        let bytes = read_regular_at_io(&directory, &name)
-            .map_err(|error| ValidationError::io("failed to read approval record", error))?;
+        let path = PathBuf::from(".phemius/records/approvals").join(&name);
+        let filename_id = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|id| is_prefixed_uuid(id, EntityKind::Changeset))
+            .map(str::to_owned);
+        let file_type = entry.file_type().map_err(|error| {
+            ValidationError::io("failed to inspect approval record", error)
+                .with_approval_evidence(&path, filename_id.as_deref())
+        })?;
+        if !file_type.is_file() {
+            return Err(ValidationError::new(
+                ValidationErrorKind::DependencyHash,
+                format!("unknown approval entry: {}", path.display()),
+            )
+            .with_approval_evidence(&path, filename_id.as_deref()));
+        }
+        let bytes = read_regular_at_io(&directory, &name).map_err(|error| {
+            ValidationError::io("failed to read approval record", error)
+                .with_approval_evidence(&path, filename_id.as_deref())
+        })?;
         let record: ApprovalRecord = serde_json::from_slice(&bytes).map_err(|error| {
             ValidationError::new(
                 ValidationErrorKind::DependencyHash,
-                format!(
-                    "invalid approval record {}: {error}",
-                    PathBuf::from(".phemius/records/approvals")
-                        .join(&name)
-                        .display()
-                ),
+                format!("invalid approval record {}: {error}", path.display()),
             )
+            .with_approval_evidence(&path, filename_id.as_deref())
         })?;
         let expected_name = format!("{}.json", record.changeset_id.as_str());
         if name != expected_name.as_str()
@@ -714,15 +745,11 @@ fn scan_approval_records_in(root: &Dir) -> Result<Vec<ScannedApproval>, Validati
             .all(|hash| is_sha256(hash))
             || approval_validation_hash(&record) != record.validation_hash
         {
-            return validation_error(
+            return Err(ValidationError::new(
                 ValidationErrorKind::DependencyHash,
-                format!(
-                    "invalid approval proof: {}",
-                    PathBuf::from(".phemius/records/approvals")
-                        .join(&name)
-                        .display()
-                ),
-            );
+                format!("invalid approval proof: {}", path.display()),
+            )
+            .with_approval_evidence(&path, Some(record.changeset_id.as_str())));
         }
         let sha256 = sha256_bytes(&bytes);
         crate::journal::validate_committed_receipt_in(root, &record, &sha256).map_err(|error| {
@@ -733,24 +760,29 @@ fn scan_approval_records_in(root: &Dir) -> Result<Vec<ScannedApproval>, Validati
                     record.changeset_id.as_str()
                 ),
             )
+            .with_approval_evidence(&path, Some(record.changeset_id.as_str()))
         })?;
-        approvals.push(ScannedApproval { record, sha256 });
+        approvals.push(ScannedApproval {
+            record,
+            sha256,
+            path,
+        });
     }
     approvals.sort_by_key(|approval| approval.record.chapter_order);
     for (index, approval) in approvals.iter().enumerate() {
         let expected_order = index as u32 + 1;
         if approval.record.chapter_order != expected_order {
-            return validation_error(
+            return Err(approval.evidence_error(
                 ValidationErrorKind::DependencyOrder,
                 "approval chain contains a chapter-order gap",
-            );
+            ));
         }
         if index == 0 {
             if !approval.record.dependencies.is_empty() {
-                return validation_error(
+                return Err(approval.evidence_error(
                     ValidationErrorKind::DependencyOrder,
                     "first approval record has dependencies",
-                );
+                ));
             }
             continue;
         }
@@ -760,10 +792,10 @@ fn scan_approval_records_in(root: &Dir) -> Result<Vec<ScannedApproval>, Validati
                 && dependency.chapter_order == previous.record.chapter_order
                 && dependency.approval_record_sha256 == previous.sha256
         }) {
-            return validation_error(
+            return Err(approval.evidence_error(
                 ValidationErrorKind::DependencyOrder,
                 "approval chain does not reference its previous head",
-            );
+            ));
         }
         for dependency in &approval.record.dependencies {
             if !approvals[..index].iter().any(|earlier| {
@@ -771,10 +803,10 @@ fn scan_approval_records_in(root: &Dir) -> Result<Vec<ScannedApproval>, Validati
                     && dependency.chapter_order == earlier.record.chapter_order
                     && dependency.approval_record_sha256 == earlier.sha256
             }) {
-                return validation_error(
+                return Err(approval.evidence_error(
                     ValidationErrorKind::DependencyHash,
                     "approval record has an invalid dependency proof",
-                );
+                ));
             }
         }
     }

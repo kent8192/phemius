@@ -1,4 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use phemius::{
     changeset::{
@@ -291,6 +294,36 @@ fn unexpected_approval_evidence_is_a_typed_manual_conflict() {
         &fixture.change,
     );
     assert_eq!(fixture.read_canon(), observed);
+    assert!(unexpected.is_file());
+}
+
+#[test]
+fn approval_conflict_identifies_offending_record_not_latest_head() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    let second = fixture.followup_change("second-approved-chapter");
+    apply_changeset(&fixture.project, &second).unwrap();
+    let unexpected = fixture
+        .approval_path()
+        .parent()
+        .unwrap()
+        .join("wrong-name.json");
+    fs::copy(fixture.approval_path(), &unexpected).unwrap();
+    let observed = fixture.read_canon();
+    let observed_root = canon_root_hash(&fixture.project).unwrap();
+
+    let error = recover_pending(&fixture.root).unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("approval evidence conflict must require manual resolution");
+    assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+    assert_ne!(manual.changeset_id(), second.id.as_str());
+    assert_eq!(
+        manual.evidence_path(),
+        Some(Path::new(".phemius/records/approvals/wrong-name.json"))
+    );
+    assert_eq!(fixture.read_canon(), observed);
+    assert_eq!(canon_root_hash(&fixture.project).unwrap(), observed_root);
     assert!(unexpected.is_file());
 }
 
