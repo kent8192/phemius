@@ -1193,7 +1193,10 @@ fn collect_directory_in(
         let name = entry.file_name();
         let child_relative = relative.join(&name);
         let segments = path_segments(&child_relative, ValidationErrorKind::InvalidPath)?;
-        if is_git_path(&segments) || is_runtime_path(&segments) || is_local_settings_path(&segments)
+        if is_git_path(&segments)
+            || is_runtime_path(&segments)
+            || is_local_settings_path(&segments)
+            || is_session_record_path(&segments)
         {
             continue;
         }
@@ -1480,6 +1483,13 @@ fn is_local_settings_path(segments: &[&str]) -> bool {
     segments.len() == 2
         && segments[0].eq_ignore_ascii_case(".phemius")
         && segments[1].eq_ignore_ascii_case("local.toml")
+}
+
+fn is_session_record_path(segments: &[&str]) -> bool {
+    segments.len() >= 3
+        && segments[0].eq_ignore_ascii_case(".phemius")
+        && segments[1].eq_ignore_ascii_case("records")
+        && segments[2].eq_ignore_ascii_case("sessions")
 }
 
 pub(crate) fn path_alias_key(path: &Path) -> Result<String, ValidationError> {

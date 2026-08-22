@@ -8,6 +8,8 @@ pub mod cli;
 pub mod context;
 /// Detects exact and near-copy source overlap before prose is accepted.
 pub mod copycheck;
+/// Tracks bounded model-call costs without floating-point arithmetic.
+pub mod cost;
 /// Defines stable IDs and core command-domain types.
 pub mod domain;
 /// Records append-only durable runtime evidence.
@@ -16,5 +18,7 @@ pub mod journal;
 pub mod plot;
 /// Parses project artifacts and initializes the canonical project tree.
 pub mod project;
+/// Persists append-only session evidence and derived checkpoints.
+pub mod session;
 /// Ingests source material and validates manifest-bound snapshots.
 pub mod sources;
