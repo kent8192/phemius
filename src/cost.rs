@@ -2,6 +2,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::Path,
@@ -18,6 +20,65 @@ const TOKENS_PER_PRICE_UNIT: u64 = 1_000_000;
 const CHAPTER_WARNING: MicroDollars = MicroDollars(5 * MICROS_PER_DOLLAR);
 const CHAPTER_CAP: MicroDollars = MicroDollars(10 * MICROS_PER_DOLLAR);
 const RUN_CAP: MicroDollars = MicroDollars(120 * MICROS_PER_DOLLAR);
+
+/// The durable-write phase whose failure leaves an event's persistence unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CostPersistenceStage {
+    /// The event write may have written a partial or complete record.
+    Write,
+    /// The event write completed but the stream flush failed.
+    Flush,
+    /// The event flush completed but the durable data sync failed.
+    SyncData,
+}
+
+/// Reports that a cost event may be on disk and the ledger must be reopened or reconciled.
+#[derive(Debug)]
+pub struct CostDurabilityUnknown {
+    stage: CostPersistenceStage,
+    source: anyhow::Error,
+}
+
+impl CostDurabilityUnknown {
+    fn new(stage: CostPersistenceStage, source: anyhow::Error) -> Self {
+        Self { stage, source }
+    }
+
+    /// Returns the phase after which durable event presence became unknown.
+    pub const fn stage(&self) -> CostPersistenceStage {
+        self.stage
+    }
+}
+
+impl fmt::Display for CostDurabilityUnknown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cost event durability is unknown after {:?}; reopen or reconcile before retrying: {}",
+            self.stage, self.source
+        )
+    }
+}
+
+impl Error for CostDurabilityUnknown {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Injects a persistence interruption for an integration regression test.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestCostPersistenceInterruption {
+    /// Fails before any bytes are written, so rollback remains safe.
+    BeforeWrite,
+    /// Fails after `write_all`, leaving the event's persistence unknown.
+    AfterWrite,
+    /// Fails after `flush`, leaving the event's persistence unknown.
+    AfterFlush,
+    /// Fails after `sync_data`, leaving the event's persistence unknown.
+    AfterSyncData,
+}
 
 /// A whole number of microdollars.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -127,6 +188,14 @@ enum LedgerEvent {
     },
 }
 
+enum PersistError {
+    Before(anyhow::Error),
+    After {
+        stage: CostPersistenceStage,
+        source: anyhow::Error,
+    },
+}
+
 #[derive(Default)]
 struct LedgerState {
     chapter_start: MicroDollars,
@@ -134,9 +203,18 @@ struct LedgerState {
     reservations: BTreeMap<String, Reservation>,
     settled_requests: BTreeSet<String>,
     warnings: BTreeSet<String>,
+    durability_unknown: bool,
 }
 
 impl LedgerState {
+    fn ensure_mutable(&self) -> Result<()> {
+        ensure!(
+            !self.durability_unknown,
+            "cost ledger requires reopen or reconciliation after durability is unknown"
+        );
+        Ok(())
+    }
+
     fn chapter_total(&self, chapter_id: &str) -> Result<MicroDollars> {
         self.reservations
             .values()
@@ -280,7 +358,7 @@ impl BudgetLedger {
 
     /// Holds the maximum request cost before any network operation starts.
     pub fn reserve(&self, chapter_id: &str, maximum_cost: MicroDollars) -> Result<Reservation> {
-        self.reserve_inner(chapter_id, maximum_cost, false)
+        self.reserve_inner(chapter_id, maximum_cost, None)
     }
 
     /// Injects a pre-write persistence failure for an integration regression test.
@@ -290,34 +368,56 @@ impl BudgetLedger {
         chapter_id: &str,
         maximum_cost: MicroDollars,
     ) -> Result<Reservation> {
-        self.reserve_inner(chapter_id, maximum_cost, true)
+        self.reserve_inner(
+            chapter_id,
+            maximum_cost,
+            Some(TestCostPersistenceInterruption::BeforeWrite),
+        )
+    }
+
+    /// Injects a persistence interruption for an integration regression test.
+    #[doc(hidden)]
+    pub fn reserve_with_test_interruption(
+        &self,
+        chapter_id: &str,
+        maximum_cost: MicroDollars,
+        interruption: TestCostPersistenceInterruption,
+    ) -> Result<Reservation> {
+        self.reserve_inner(chapter_id, maximum_cost, Some(interruption))
     }
 
     fn reserve_inner(
         &self,
         chapter_id: &str,
         maximum_cost: MicroDollars,
-        force_persist_failure: bool,
+        interruption: Option<TestCostPersistenceInterruption>,
     ) -> Result<Reservation> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("cost ledger lock poisoned"))?;
+        state.ensure_mutable()?;
         let warning_was_emitted = state.warnings.contains(chapter_id);
         let reservation = state.reserve(chapter_id, maximum_cost)?;
-        if let Err(error) = self.persist(
+        match self.persist(
             LedgerEvent::Reserved {
                 reservation: reservation.clone(),
             },
-            force_persist_failure,
+            interruption,
         ) {
-            state.reservations.remove(reservation.request_id.as_str());
-            if reservation.warning_required && !warning_was_emitted {
-                state.warnings.remove(chapter_id);
+            Ok(()) => Ok(reservation),
+            Err(PersistError::Before(error)) => {
+                state.reservations.remove(reservation.request_id.as_str());
+                if reservation.warning_required && !warning_was_emitted {
+                    state.warnings.remove(chapter_id);
+                }
+                Err(error)
             }
-            return Err(error);
+            Err(PersistError::After { stage, source }) => {
+                state.durability_unknown = true;
+                Err(CostDurabilityUnknown::new(stage, source).into())
+            }
         }
-        Ok(reservation)
     }
 
     /// Replaces a reservation with the actual charged cost after a known completion.
@@ -326,28 +426,35 @@ impl BudgetLedger {
             .state
             .lock()
             .map_err(|_| anyhow!("cost ledger lock poisoned"))?;
+        state.ensure_mutable()?;
         let original = state
             .reservations
             .get(reservation.request_id.as_str())
             .cloned()
             .ok_or_else(|| anyhow!("reservation is unknown"))?;
         state.settle(&reservation.request_id, actual_cost)?;
-        if let Err(error) = self.persist(
+        match self.persist(
             LedgerEvent::Settled {
                 request_id: reservation.request_id.clone(),
                 actual_cost,
             },
-            false,
+            None,
         ) {
-            state
-                .reservations
-                .insert(reservation.request_id.as_str().into(), original);
-            state
-                .settled_requests
-                .remove(reservation.request_id.as_str());
-            return Err(error);
+            Ok(()) => Ok(()),
+            Err(PersistError::Before(error)) => {
+                state
+                    .reservations
+                    .insert(reservation.request_id.as_str().into(), original);
+                state
+                    .settled_requests
+                    .remove(reservation.request_id.as_str());
+                Err(error)
+            }
+            Err(PersistError::After { stage, source }) => {
+                state.durability_unknown = true;
+                Err(CostDurabilityUnknown::new(stage, source).into())
+            }
         }
-        Ok(())
     }
 
     /// Keeps an ambiguous request reserved. Reconciliation must call [`Self::settle`] explicitly.
@@ -356,6 +463,7 @@ impl BudgetLedger {
             .state
             .lock()
             .map_err(|_| anyhow!("cost ledger lock poisoned"))?;
+        state.ensure_mutable()?;
         ensure!(
             state
                 .reservations
@@ -365,24 +473,66 @@ impl BudgetLedger {
         Ok(())
     }
 
-    fn persist(&self, event: LedgerEvent, force_failure: bool) -> Result<()> {
-        if force_failure {
-            return Err(anyhow!("simulated cost ledger persistence failure"));
+    fn persist(
+        &self,
+        event: LedgerEvent,
+        interruption: Option<TestCostPersistenceInterruption>,
+    ) -> std::result::Result<(), PersistError> {
+        if interruption == Some(TestCostPersistenceInterruption::BeforeWrite) {
+            return Err(PersistError::Before(anyhow!(
+                "simulated cost ledger persistence failure"
+            )));
         }
         let Some(journal) = &self.journal else {
             return Ok(());
         };
         let mut file = journal
             .lock()
-            .map_err(|_| anyhow!("cost journal lock poisoned"))?;
-        file.try_lock().context("cost ledger is already locked")?;
-        let mut line =
-            serde_json::to_vec(&event).context("failed to serialize cost ledger event")?;
+            .map_err(|_| PersistError::Before(anyhow!("cost journal lock poisoned")))?;
+        file.try_lock()
+            .context("cost ledger is already locked")
+            .map_err(PersistError::Before)?;
+        let mut line = serde_json::to_vec(&event)
+            .context("failed to serialize cost ledger event")
+            .map_err(PersistError::Before)?;
         line.push(b'\n');
         file.write_all(&line)
-            .context("failed to append cost ledger event")?;
-        file.flush().context("failed to flush cost ledger event")?;
-        file.sync_data().context("failed to sync cost ledger event")
+            .context("failed to append cost ledger event")
+            .map_err(|source| PersistError::After {
+                stage: CostPersistenceStage::Write,
+                source,
+            })?;
+        if interruption == Some(TestCostPersistenceInterruption::AfterWrite) {
+            return Err(PersistError::After {
+                stage: CostPersistenceStage::Write,
+                source: anyhow!("simulated post-write cost ledger persistence failure"),
+            });
+        }
+        file.flush()
+            .context("failed to flush cost ledger event")
+            .map_err(|source| PersistError::After {
+                stage: CostPersistenceStage::Flush,
+                source,
+            })?;
+        if interruption == Some(TestCostPersistenceInterruption::AfterFlush) {
+            return Err(PersistError::After {
+                stage: CostPersistenceStage::Flush,
+                source: anyhow!("simulated post-flush cost ledger persistence failure"),
+            });
+        }
+        file.sync_data()
+            .context("failed to sync cost ledger event")
+            .map_err(|source| PersistError::After {
+                stage: CostPersistenceStage::SyncData,
+                source,
+            })?;
+        if interruption == Some(TestCostPersistenceInterruption::AfterSyncData) {
+            return Err(PersistError::After {
+                stage: CostPersistenceStage::SyncData,
+                source: anyhow!("simulated post-sync cost ledger persistence failure"),
+            });
+        }
+        Ok(())
     }
 }
 

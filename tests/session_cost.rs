@@ -7,7 +7,10 @@ use std::{
 
 use phemius::{
     changeset::canon_root_hash,
-    cost::{BudgetLedger, MicroDollars, Price, Usage},
+    cost::{
+        BudgetLedger, CostDurabilityUnknown, CostPersistenceStage, MicroDollars, Price,
+        TestCostPersistenceInterruption, Usage,
+    },
     domain::{EntityKind, prefixed_uuid},
     project::{Project, ProjectConfig},
     session::{
@@ -167,6 +170,40 @@ fn failed_reservation_persistence_does_not_consume_the_chapter_warning() {
             .unwrap()
             .warning_required,
         true
+    );
+}
+
+#[rstest]
+fn post_write_reservation_failure_keeps_the_durable_hold_and_freezes_the_ledger() {
+    let directory = TestDir::new("post-write-reservation-failure");
+    let path = directory.path().join("costs.jsonl");
+    let ledger = BudgetLedger::open(&path).unwrap();
+
+    let error = ledger
+        .reserve_with_test_interruption(
+            "chapter_1",
+            micros(6_000_000),
+            TestCostPersistenceInterruption::AfterWrite,
+        )
+        .unwrap_err();
+    let durability_unknown = error.downcast_ref::<CostDurabilityUnknown>().unwrap();
+
+    assert_eq!(durability_unknown.stage(), CostPersistenceStage::Write);
+    assert_eq!(ledger.reserve("chapter_1", micros(1)).is_err(), true);
+    assert_eq!(fs::read(&path).unwrap().ends_with(b"\n"), true);
+    drop(ledger);
+
+    let replayed = BudgetLedger::open(&path).unwrap();
+    assert_eq!(
+        replayed.reserve("chapter_1", micros(5_000_000)).is_err(),
+        true
+    );
+    assert_eq!(
+        replayed
+            .reserve("chapter_1", micros(4_000_000))
+            .unwrap()
+            .warning_required,
+        false
     );
 }
 
