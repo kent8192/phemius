@@ -184,25 +184,78 @@ fn retained_committed_history_survives_later_approvals() {
 }
 
 #[test]
-fn injected_or_externally_renamed_transaction_evidence_is_never_deleted() {
+fn injected_or_relocated_committed_evidence_is_preserved_and_blocks_approval() {
     let injected = ApplyFixture::new();
     apply_changeset(&injected.project, &injected.change).unwrap();
     let injected_entry = injected.transaction_path().join("external-entry");
     fs::create_dir(&injected_entry).unwrap();
     fs::write(injected_entry.join("nested-evidence"), b"external evidence").unwrap();
-    assert!(recover_pending(&injected.root).is_err());
+    assert_manual_resolution(
+        recover_pending(&injected.root).unwrap_err(),
+        &injected.change,
+    );
     assert_eq!(
         fs::read(injected_entry.join("nested-evidence")).unwrap(),
         b"external evidence"
+    );
+    let injected_followup = injected.followup_change("injected-receipt");
+    assert_eq!(
+        validate_changeset(&injected.project, &injected_followup)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::DependencyHash
+    );
+    assert_manual_resolution(
+        apply_changeset(&injected.project, &injected_followup).unwrap_err(),
+        &injected.change,
     );
 
     let renamed = ApplyFixture::new();
     apply_changeset(&renamed.project, &renamed.change).unwrap();
     let moved = renamed.outside.join("externally-renamed-transaction");
     fs::rename(renamed.transaction_path(), &moved).unwrap();
-    recover_pending(&renamed.root).unwrap();
+    assert_manual_resolution(recover_pending(&renamed.root).unwrap_err(), &renamed.change);
     assert!(moved.join("journal.prepared.json").is_file());
     assert!(moved.join("journal.committed.json").is_file());
+    let renamed_followup = renamed.followup_change("relocated-receipt");
+    assert_eq!(
+        validate_changeset(&renamed.project, &renamed_followup)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::DependencyHash
+    );
+    assert_manual_resolution(
+        apply_changeset(&renamed.project, &renamed_followup).unwrap_err(),
+        &renamed.change,
+    );
+    assert!(moved.join("journal.committed.json").is_file());
+}
+
+#[test]
+fn approval_record_without_runtime_transaction_root_is_not_durable_truth() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    let retained = fixture.outside.join("retained-journal-root");
+    fs::rename(fixture.root.join(".phemius/runtime/journal"), &retained).unwrap();
+
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
+    let followup = fixture.followup_change("missing-runtime-receipt");
+    assert_eq!(
+        validate_changeset(&fixture.project, &followup)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::DependencyHash
+    );
+    assert_manual_resolution(
+        apply_changeset(&fixture.project, &followup).unwrap_err(),
+        &fixture.change,
+    );
+    assert!(
+        retained
+            .join(fixture.change.id.as_str())
+            .join("journal.committed.json")
+            .is_file()
+    );
 }
 
 #[test]
@@ -825,22 +878,17 @@ fn every_prepared_apply_boundary_requires_manual_resolution_without_mutation() {
 }
 
 #[test]
-fn committed_cleanup_pending_remains_append_only_history() {
+fn retained_committed_history_remains_append_only() {
     let fixture = ApplyFixture::new();
 
-    apply_changeset_for_test(
-        &fixture.project,
-        &fixture.change,
-        TestInterruption::CleanupPending,
-    )
-    .unwrap();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
 
     assert_eq!(recover_pending(&fixture.root).unwrap().kept_committed, 1);
     assert_eq!(recover_pending(&fixture.root).unwrap().kept_committed, 1);
 }
 
 #[test]
-fn committed_journal_sync_failure_never_rolls_back_and_requires_recovery() {
+fn committed_post_rename_sync_failure_requires_manual_resolution() {
     let fixture = ApplyFixture::new();
 
     let error = apply_changeset_for_test(
@@ -849,16 +897,71 @@ fn committed_journal_sync_failure_never_rolls_back_and_requires_recovery() {
         TestInterruption::CommitDurabilityUnknown,
     )
     .unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("Committed post-rename sync failure must be typed");
+    assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+    assert!(std::error::Error::source(manual).is_some());
+    let observed = fixture.read_canon();
     assert!(
-        error
-            .to_string()
-            .contains("commit durability unknown; run recovery, do not retry")
+        fixture
+            .transaction_path()
+            .join("journal.committed.json")
+            .is_file()
     );
-    assert_eq!(recover_pending(&fixture.root).unwrap().kept_committed, 1);
-    assert_eq!(
-        canon_root_hash(&fixture.project).unwrap(),
-        fixture.change.result_root_hash
+    assert!(
+        fixture
+            .transaction_path()
+            .join("journal.durability-unknown.json")
+            .is_file()
     );
+
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
+    assert_eq!(fixture.read_canon(), observed);
+    assert_manual_resolution(
+        apply_changeset(&fixture.project, &fixture.change).unwrap_err(),
+        &fixture.change,
+    );
+    assert_eq!(fixture.read_canon(), observed);
+}
+
+#[test]
+fn prepared_post_rename_sync_failure_requires_manual_resolution() {
+    let fixture = ApplyFixture::new();
+    let before = fixture.read_canon();
+
+    let error = apply_changeset_for_test(
+        &fixture.project,
+        &fixture.change,
+        TestInterruption::PreparedDurabilityUnknown,
+    )
+    .unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("Prepared post-rename sync failure must be typed");
+    assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+    assert!(std::error::Error::source(manual).is_some());
+    assert_eq!(fixture.read_canon(), before);
+    assert!(
+        fixture
+            .transaction_path()
+            .join("journal.prepared.json")
+            .is_file()
+    );
+    assert!(
+        fixture
+            .transaction_path()
+            .join("journal.durability-unknown.json")
+            .is_file()
+    );
+
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
+    assert_eq!(fixture.read_canon(), before);
+    assert_manual_resolution(
+        apply_changeset(&fixture.project, &fixture.change).unwrap_err(),
+        &fixture.change,
+    );
+    assert_eq!(fixture.read_canon(), before);
 }
 
 #[test]
@@ -885,7 +988,14 @@ fn unknown_entries_and_multiple_pending_transactions_fail_closed() {
             .unwrap();
         }
 
-        assert!(recover_pending(&fixture.root).is_err());
+        let error = recover_pending(&fixture.root).unwrap_err();
+        let manual = error
+            .downcast_ref::<ManualResolutionRequired>()
+            .expect("valid transaction conflicts must require manual resolution");
+        assert!(std::error::Error::source(manual).is_some());
+        if !multiple {
+            assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+        }
         assert!(fixture.root.join("本文/create.md").exists());
         assert!(journal_root.join(fixture.change.id.as_str()).exists());
     }
@@ -1145,9 +1255,15 @@ fn missing_or_corrupt_journal_evidence_is_preserved_fail_closed() {
             fs::remove_file(&journal).unwrap();
         }
 
-        assert!(recover_pending(&fixture.root).is_err());
+        let observed = fixture.read_canon();
+        let error = recover_pending(&fixture.root).unwrap_err();
+        let manual = error
+            .downcast_ref::<ManualResolutionRequired>()
+            .expect("invalid Prepared evidence must require manual resolution");
+        assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+        assert!(std::error::Error::source(manual).is_some());
         assert!(transaction.exists());
-        assert!(fixture.root.join("本文/create.md").exists());
+        assert_eq!(fixture.read_canon(), observed);
     }
 }
 
@@ -1169,8 +1285,6 @@ fn journal_state_must_match_its_append_only_marker_name() {
 fn retained_committed_journal_must_match_its_approval_record() {
     let fixture = ApplyFixture::new();
     apply_changeset(&fixture.project, &fixture.change).unwrap();
-    let followup = fixture.followup_change("journal-record-match");
-    apply_changeset(&fixture.project, &followup).unwrap();
     for name in ["journal.prepared.json", "journal.committed.json"] {
         let marker = fixture.transaction_path().join(name);
         let mut journal: serde_json::Value =
@@ -1179,7 +1293,18 @@ fn retained_committed_journal_must_match_its_approval_record() {
         fs::write(marker, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
     }
 
-    assert!(recover_pending(&fixture.root).is_err());
+    assert_manual_resolution(recover_pending(&fixture.root).unwrap_err(), &fixture.change);
+    let followup = fixture.followup_change("journal-record-mismatch");
+    assert_eq!(
+        validate_changeset(&fixture.project, &followup)
+            .unwrap_err()
+            .kind(),
+        ValidationErrorKind::DependencyHash
+    );
+    assert_manual_resolution(
+        apply_changeset(&fixture.project, &followup).unwrap_err(),
+        &fixture.change,
+    );
     assert!(fixture.transaction_path().is_dir());
 }
 

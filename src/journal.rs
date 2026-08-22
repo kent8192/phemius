@@ -51,6 +51,14 @@ struct JournalEntry {
     after_sha256: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DurabilityUnknown {
+    changeset_id: String,
+    state: JournalState,
+    journal_sha256: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestInterruption {
     AfterFirstRename,
@@ -58,9 +66,9 @@ pub enum TestInterruption {
     AfterReplaceInstall,
     AfterDeletePreserve,
     AfterApprovalInstall,
+    PreparedDurabilityUnknown,
     CommitDurabilityUnknown,
     AfterCommit,
-    CleanupPending,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -98,7 +106,7 @@ impl fmt::Display for ManualResolutionRequired {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "prepared changeset {} requires manual resolution",
+            "changeset {} requires manual resolution",
             self.changeset_id
         )?;
         if let Some(source) = &self.source {
@@ -169,11 +177,17 @@ fn apply(
     validate_changeset_in(project, &root, change).context("changeset is not approvable")?;
 
     let transaction = prepare_transaction(&root, &lock.runtime, change)?;
-    if let Err(error) = persist_journal(&transaction.dir, &transaction.journal, false) {
+    let prepared_sync_failure = interruption == Some(TestInterruption::PreparedDurabilityUnknown);
+    if let Err(error) = persist_journal(
+        &transaction.dir,
+        &transaction.journal,
+        prepared_sync_failure,
+    ) {
         return match error {
             PersistError::Before(error) => Err(error),
-            PersistError::After(error) => Err(error
-                .context("prepared journal durability is unknown; run recovery before retrying")),
+            PersistError::After(error) => {
+                durability_unknown_resolution(&transaction, &transaction.journal, error)
+            }
         };
     }
 
@@ -222,7 +236,7 @@ fn apply(
         Ok(()) => {}
         Err(PersistError::Before(error)) => return manual_resolution(&transaction, error),
         Err(PersistError::After(error)) => {
-            return Err(error.context("commit durability unknown; run recovery, do not retry"));
+            return durability_unknown_resolution(&transaction, &committed, error);
         }
     }
     if interruption == Some(TestInterruption::AfterCommit) {
@@ -415,14 +429,31 @@ fn manual_resolution(transaction: &Transaction, error: anyhow::Error) -> Result<
     Err(ManualResolutionRequired::after_error(&transaction.journal.changeset_id, error).into())
 }
 
+fn durability_unknown_resolution(
+    transaction: &Transaction,
+    journal: &ApplyJournal,
+    error: anyhow::Error,
+) -> Result<()> {
+    let source = match record_durability_unknown(&transaction.dir, journal) {
+        Ok(()) => error,
+        Err(marker_error) => error.context(format!(
+            "failed to retain durability-unknown marker: {marker_error}"
+        )),
+    };
+    Err(ManualResolutionRequired::after_error(&journal.changeset_id, source).into())
+}
+
 fn recover_pending_locked(root: &Dir, runtime: &Dir) -> Result<RecoveryOutcome> {
     let transactions = load_transactions(root, runtime)?;
-    if transactions.is_empty() {
-        return Ok(RecoveryOutcome::default());
-    }
     for transaction in &transactions {
         if transaction.journal.state == JournalState::Committed {
-            verify_committed_approval(transaction)?;
+            if let Err(error) = verify_committed_approval(transaction) {
+                return Err(ManualResolutionRequired::after_error(
+                    &transaction.journal.changeset_id,
+                    error,
+                )
+                .into());
+            }
         }
     }
     let prepared = transactions
@@ -453,7 +484,15 @@ fn load_transactions(root: &Dir, runtime: &Dir) -> Result<Vec<Transaction>> {
     let mut transactions = Vec::with_capacity(entries.len());
     for entry in entries {
         let name = entry.file_name();
-        transactions.push(load_transaction(root, &journal_root, &name)?);
+        let name_text = name.to_string_lossy();
+        let transaction = load_transaction(root, &journal_root, &name).map_err(|error| {
+            if is_prefixed_uuid(&name_text, EntityKind::Changeset) {
+                anyhow::Error::from(ManualResolutionRequired::after_error(&name_text, error))
+            } else {
+                error
+            }
+        })?;
+        transactions.push(transaction);
     }
     ensure!(
         transactions
@@ -474,6 +513,7 @@ fn load_transaction(root: &Dir, journal_root: &Dir, name: &OsStr) -> Result<Tran
     );
     let dir = open_dir_no_follow(journal_root, name)
         .with_context(|| format!("journal entry is not a real directory: {name_text}"))?;
+    reject_durability_unknown(&dir, &name_text)?;
     let prepared = read_journal(&dir, "journal.prepared.json")?
         .ok_or_else(|| anyhow!("journal.prepared.json is missing"))?;
     ensure!(
@@ -539,6 +579,56 @@ fn read_journal(dir: &Dir, name: &str) -> Result<Option<ApplyJournal>> {
         .map(Some)
 }
 
+fn record_durability_unknown(dir: &Dir, journal: &ApplyJournal) -> Result<()> {
+    let journal_bytes = journal_bytes(journal)?;
+    let marker = DurabilityUnknown {
+        changeset_id: journal.changeset_id.clone(),
+        state: journal.state,
+        journal_sha256: sha256_bytes(&journal_bytes),
+    };
+    let mut marker_bytes = serde_json::to_vec_pretty(&marker)?;
+    marker_bytes.push(b'\n');
+    write_new_synced(
+        dir,
+        OsStr::new("journal.durability-unknown.json"),
+        &marker_bytes,
+    )?;
+    sync_dir(dir)
+}
+
+fn reject_durability_unknown(dir: &Dir, changeset_id: &str) -> Result<()> {
+    let bytes = match read_regular_at(dir, OsStr::new("journal.durability-unknown.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if io_kind(&error) == Some(std::io::ErrorKind::NotFound) => return Ok(()),
+        Err(error) => return Err(error).context("durability-unknown marker is invalid"),
+    };
+    let marker: DurabilityUnknown = serde_json::from_slice(&bytes)
+        .context("failed to parse journal.durability-unknown.json")?;
+    ensure!(
+        marker.changeset_id == changeset_id,
+        "durability-unknown marker identity does not match its transaction directory"
+    );
+    ensure!(
+        is_hash(&marker.journal_sha256),
+        "durability-unknown marker contains an invalid journal hash"
+    );
+    let journal_name = match marker.state {
+        JournalState::Prepared => OsStr::new("journal.prepared.json"),
+        JournalState::Committed => OsStr::new("journal.committed.json"),
+    };
+    ensure!(
+        sha256_bytes(&read_regular_at(dir, journal_name)?) == marker.journal_sha256,
+        "durability-unknown marker does not match its journal"
+    );
+    Err(anyhow!(
+        "{} journal durability is unknown",
+        match marker.state {
+            JournalState::Prepared => "prepared",
+            JournalState::Committed => "committed",
+        }
+    ))
+}
+
 fn validate_journal(journal: &ApplyJournal) -> Result<()> {
     ensure!(!journal.entries.is_empty(), "journal has no operations");
     ensure!(journal.chapter_order > 0, "journal has no chapter order");
@@ -581,6 +671,7 @@ fn validate_transaction_entries(dir: &Dir, journal: &ApplyJournal) -> Result<()>
     let mut allowed = HashSet::from([
         OsString::from("journal.prepared.json"),
         OsString::from("journal.committed.json"),
+        OsString::from("journal.durability-unknown.json"),
         OsString::from("approval-record.json"),
     ]);
     for (index, entry) in journal.entries.iter().enumerate() {
@@ -668,7 +759,42 @@ fn verify_committed_approval(transaction: &Transaction) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_committed_receipt_in(
+    root: &Dir,
+    record: &ApprovalRecord,
+    approval_sha256: &str,
+) -> Result<()> {
+    let phemius = try_open_dir(root, OsStr::new(".phemius"))?
+        .ok_or_else(|| anyhow!("runtime transaction root is missing"))?;
+    let runtime = try_open_dir(&phemius, OsStr::new("runtime"))?
+        .ok_or_else(|| anyhow!("runtime transaction root is missing"))?;
+    let journal_root = try_open_dir(&runtime, OsStr::new("journal"))?
+        .ok_or_else(|| anyhow!("runtime transaction root is missing"))?;
+    let transaction = load_transaction(
+        root,
+        &journal_root,
+        OsStr::new(record.changeset_id.as_str()),
+    )
+    .context("matching committed receipt is invalid or missing")?;
+    ensure!(
+        transaction.journal.state == JournalState::Committed,
+        "matching committed receipt is not committed"
+    );
+    ensure!(
+        transaction.journal.approval_record_sha256 == approval_sha256,
+        "committed receipt approval hash does not match the approval record"
+    );
+    ensure!(
+        transaction.journal.changeset_id == record.changeset_id.as_str()
+            && transaction.journal.base_root_hash == record.base_root_hash
+            && transaction.journal.chapter_order == record.chapter_order,
+        "committed receipt does not match the approval record"
+    );
+    verify_committed_approval(&transaction)
+}
+
 fn verify_current_committed_head(root: &Dir, transactions: &[Transaction]) -> Result<()> {
+    require_retained_receipts_for_approval_files(root, transactions)?;
     let Some((head_id, head_order)) = approval_chain_head_in(root)? else {
         return Ok(());
     };
@@ -676,7 +802,10 @@ fn verify_current_committed_head(root: &Dir, transactions: &[Transaction]) -> Re
         transaction.journal.state == JournalState::Committed
             && transaction.journal.changeset_id == head_id.as_str()
     }) else {
-        return Ok(());
+        return Err(anyhow!(
+            "approval chain head {} has no retained committed receipt",
+            head_id.as_str()
+        ));
     };
     ensure!(
         head.journal.chapter_order == head_order,
@@ -686,6 +815,46 @@ fn verify_current_committed_head(root: &Dir, transactions: &[Transaction]) -> Re
         canon_root_hash_in(root)? == head.journal.result_root_hash,
         "current committed canon root changed"
     );
+    Ok(())
+}
+
+fn require_retained_receipts_for_approval_files(
+    root: &Dir,
+    transactions: &[Transaction],
+) -> Result<()> {
+    let Some(directory) = approval_directory(root, false)? else {
+        return Ok(());
+    };
+    for entry in directory
+        .entries()
+        .context("failed to enumerate approval records")?
+    {
+        let entry = entry.context("failed to read approval record entry")?;
+        if !entry
+            .file_type()
+            .context("failed to inspect approval record")?
+            .is_file()
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            continue;
+        };
+        if !is_prefixed_uuid(id, EntityKind::Changeset) {
+            continue;
+        }
+        if !transactions.iter().any(|transaction| {
+            transaction.journal.state == JournalState::Committed
+                && transaction.journal.changeset_id == id
+        }) {
+            return Err(ManualResolutionRequired::after_error(
+                id,
+                anyhow!("approval record has no retained committed receipt"),
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -700,9 +869,7 @@ fn persist_journal(
     force_sync_failure: bool,
 ) -> std::result::Result<(), PersistError> {
     let temporary = OsString::from(format!("journal-{}.tmp", uuid::Uuid::now_v7()));
-    let mut bytes =
-        serde_json::to_vec_pretty(journal).map_err(|error| PersistError::Before(anyhow!(error)))?;
-    bytes.push(b'\n');
+    let bytes = journal_bytes(journal).map_err(PersistError::Before)?;
     if let Err(error) = write_new_synced(transaction, &temporary, &bytes) {
         return Err(PersistError::Before(error));
     }
@@ -721,6 +888,12 @@ fn persist_journal(
         )));
     }
     sync_dir(transaction).map_err(PersistError::After)
+}
+
+fn journal_bytes(journal: &ApplyJournal) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(journal)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn approval_directory(root: &Dir, create: bool) -> Result<Option<Dir>> {

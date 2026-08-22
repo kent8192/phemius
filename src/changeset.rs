@@ -724,10 +724,17 @@ fn scan_approval_records_in(root: &Dir) -> Result<Vec<ScannedApproval>, Validati
                 ),
             );
         }
-        approvals.push(ScannedApproval {
-            record,
-            sha256: sha256_bytes(&bytes),
-        });
+        let sha256 = sha256_bytes(&bytes);
+        crate::journal::validate_committed_receipt_in(root, &record, &sha256).map_err(|error| {
+            ValidationError::new(
+                ValidationErrorKind::DependencyHash,
+                format!(
+                    "approval record {} has no matching durable receipt: {error}",
+                    record.changeset_id.as_str()
+                ),
+            )
+        })?;
+        approvals.push(ScannedApproval { record, sha256 });
     }
     approvals.sort_by_key(|approval| approval.record.chapter_order);
     for (index, approval) in approvals.iter().enumerate() {
