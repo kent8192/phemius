@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
 use phemius::{
+    cost::Usage,
     model::{
         DEFAULT_MODEL, ModelBackend, ModelFailureClass, ModelMessage, ModelRequest, ModelResponse,
         ScriptedModel, ToolCall, ToolDefinition,
@@ -26,6 +27,16 @@ fn assembles_split_text_and_indexed_tool_arguments_until_done() {
         response.tool_calls[0].arguments,
         json!({"path":"前提/作品.md"})
     );
+}
+
+#[rstest]
+fn parses_provider_usage_from_the_terminal_sse_event() {
+    let response = parse_sse_events(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}\n\ndata: [DONE]\n\n",
+    )
+    .unwrap();
+
+    assert_eq!(response.usage, Some(Usage::new(12, 7)));
 }
 
 #[rstest]
@@ -111,6 +122,7 @@ async fn scripted_backend_consumes_one_validated_response_per_call() {
             name: "read_file".into(),
             arguments: json!({"path": "前提/作品.md"}),
         }],
+        usage: None,
     };
     let mut backend = ModelBackend::Scripted(ScriptedModel::new([Ok(response.clone())]));
 
@@ -143,6 +155,7 @@ async fn constrained_tool_arguments_reject_invalid_values() {
                 name: "read_sections".into(),
                 arguments,
             }],
+            usage: None,
         };
         let mut backend = ModelBackend::Scripted(ScriptedModel::new([Ok(response)]));
 
@@ -167,6 +180,7 @@ async fn constrained_tool_arguments_accept_valid_combinator_values() {
             name: "read_sections".into(),
             arguments: json!({"path": "前提/作品.md", "sections": [1, 2]}),
         }],
+        usage: None,
     };
     let mut backend = ModelBackend::Scripted(ScriptedModel::new([Ok(response.clone())]));
 
@@ -186,6 +200,7 @@ async fn unsupported_tool_schema_constraints_fail_closed() {
             name: "read_uri".into(),
             arguments: json!({"uri": "https://example.test"}),
         }],
+        usage: None,
     };
     let request = ModelRequest::new(
         "writer",

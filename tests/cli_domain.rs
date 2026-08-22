@@ -223,34 +223,42 @@ async fn trusted_cli_write_then_approve_applies_the_project_changeset() {
         Ok(ModelResponse {
             text: "plan".into(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
         Ok(ModelResponse {
             text: "本文".into(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
     ]);
     let mut controller = RunController::with_project(project.clone(), backend.into());

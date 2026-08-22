@@ -130,39 +130,87 @@ impl Repl {
     /// Handles a potentially asynchronous write/review request.
     pub async fn handle_async(&mut self, input: &str) -> Result<ReplOutcome> {
         let routed = route_input(input)?;
-        if let RoutedInput::Command(ReplCommand::Write { request }) = routed {
-            if self.mode == ReplMode::Consult {
-                return Ok(ReplOutcome::Error("consult mode is read-only".into()));
-            }
-            let (chapter, confirmed) = parse_write_request(request)?;
-            let Some(controller) = self.controller.as_mut() else {
-                return Ok(ReplOutcome::Error(
-                    "no writing controller is attached".into(),
-                ));
-            };
-            if confirmed {
-                controller.confirm_cost_warning();
-            }
-            match controller.write_chapter(&chapter).await {
-                Ok(run) => Ok(ReplOutcome::Message(format!(
-                    "candidate {} is {:?}; use /approve {} after review",
-                    chapter,
-                    run.state,
-                    run.changeset.id.as_str()
-                ))),
-                Err(error) if error.downcast_ref::<CostConfirmationRequired>().is_some() => {
-                    Ok(ReplOutcome::AwaitingConfirmation(format!(
-                        "{}; repeat /write {chapter} --confirm to continue",
-                        error
-                    )))
+        match routed {
+            RoutedInput::Command(ReplCommand::Write { request }) => {
+                if self.mode == ReplMode::Consult {
+                    return Ok(ReplOutcome::Error("consult mode is read-only".into()));
                 }
-                Err(error) => {
-                    self.ambiguous_request = error.to_string().contains("ambiguous");
-                    Ok(ReplOutcome::Error(error.to_string()))
+                let (chapter, confirmed) = parse_write_request(request)?;
+                let Some(controller) = self.controller.as_mut() else {
+                    return Ok(ReplOutcome::Error(
+                        "no writing controller is attached".into(),
+                    ));
+                };
+                if confirmed {
+                    controller.confirm_cost_warning();
+                }
+                match controller.write_chapter(&chapter).await {
+                    Ok(run) => Ok(ReplOutcome::Message(format!(
+                        "candidate {} is {:?}; use /approve {} after review",
+                        chapter,
+                        run.state,
+                        run.changeset.id.as_str()
+                    ))),
+                    Err(error) if error.downcast_ref::<CostConfirmationRequired>().is_some() => {
+                        Ok(ReplOutcome::AwaitingConfirmation(format!(
+                            "{}; repeat /write {chapter} --confirm to continue",
+                            error
+                        )))
+                    }
+                    Err(error) => {
+                        self.ambiguous_request = error.to_string().contains("ambiguous");
+                        Ok(ReplOutcome::Error(error.to_string()))
+                    }
                 }
             }
-        } else {
-            self.handle(input)
+            RoutedInput::AgentText(text) if self.mode == ReplMode::Work => {
+                let Some(controller) = self.controller.as_mut() else {
+                    return Ok(ReplOutcome::AgentText(text));
+                };
+                match controller
+                    .run_coordinator_request(AgentRole::StoryArchitect, text)
+                    .await
+                {
+                    Ok(response) => Ok(ReplOutcome::Coordinator(response)),
+                    Err(error) => {
+                        self.ambiguous_request = error.to_string().contains("ambiguous");
+                        Ok(ReplOutcome::Error(error.to_string()))
+                    }
+                }
+            }
+            RoutedInput::Command(
+                command @ (ReplCommand::Plan { .. }
+                | ReplCommand::Review { .. }
+                | ReplCommand::Revise { .. }
+                | ReplCommand::Diff { .. }),
+            ) => {
+                if self.mode == ReplMode::Consult {
+                    return Ok(ReplOutcome::ReadOnly(
+                        "consult mode: coordinator request is read-only".into(),
+                    ));
+                }
+                let Some(controller) = self.controller.as_mut() else {
+                    return Ok(ReplOutcome::ReadOnly(
+                        "no writing controller is attached; request was not executed".into(),
+                    ));
+                };
+                let role = match command {
+                    ReplCommand::Plan { .. } => AgentRole::StoryArchitect,
+                    ReplCommand::Review { .. } => AgentRole::CanonCritic,
+                    ReplCommand::Revise { .. } => AgentRole::Reviser,
+                    ReplCommand::Diff { .. } => AgentRole::Validator,
+                    _ => unreachable!(),
+                };
+                let request = coordinator_request(command);
+                match controller.run_coordinator_request(role, request).await {
+                    Ok(response) => Ok(ReplOutcome::Coordinator(response)),
+                    Err(error) => {
+                        self.ambiguous_request = error.to_string().contains("ambiguous");
+                        Ok(ReplOutcome::Error(error.to_string()))
+                    }
+                }
+            }
+            _ => self.handle(input),
         }
     }
 
@@ -286,7 +334,7 @@ impl Repl {
                     }
                     match controller.resume_checkpoint() {
                         Ok(Some(checkpoint)) => Ok(ReplOutcome::Message(format!(
-                            "resumed latest checkpoint at event offset {} (cost {} microdollars)",
+                            "latest checkpoint loaded at event offset {} (cost {} microdollars); state reconstruction is required before generation, manual resolution is required",
                             checkpoint.last_event_offset,
                             checkpoint.cost.as_u64()
                         ))),

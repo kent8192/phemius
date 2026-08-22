@@ -28,7 +28,7 @@ use crate::{
     cli::ReplMode,
     context::{ContextCompiler, ContextReceipt, ContextRequest},
     copycheck::{AllowedSource, CopyPolicy, scan_near_copy},
-    cost::{BudgetLedger, MicroDollars},
+    cost::{BudgetLedger, MicroDollars, Price, Reservation},
     domain::{EntityId, EntityKind, prefixed_uuid},
     model::{
         ModelBackend, ModelFailureClass, ModelMessage, ModelRequest, ModelResponse, ModelResult,
@@ -527,6 +527,7 @@ pub struct RunController {
     max_revisions: usize,
     cost_ledger: BudgetLedger,
     request_maximum_cost: Option<MicroDollars>,
+    request_price: Option<Price>,
     cost_warning_confirmed: bool,
     cost_status: CostStatus,
     structure: Option<StoryStructure>,
@@ -573,6 +574,7 @@ impl RunController {
             max_revisions: 2,
             cost_ledger: BudgetLedger::new(MicroDollars::zero(), MicroDollars::zero()),
             request_maximum_cost: None,
+            request_price: None,
             cost_warning_confirmed: false,
             cost_status: CostStatus {
                 chapter: MicroDollars::zero(),
@@ -624,6 +626,7 @@ impl RunController {
         let mut controller = Self::new(backend);
         controller.project = Some(project);
         controller.load_request_maximum_from_environment();
+        controller.load_request_price_from_environment();
         controller.load_declared_project_plan();
         controller
     }
@@ -635,6 +638,25 @@ impl RunController {
         if let Ok(microdollars) = value.parse::<u64>() {
             self.request_maximum_cost = Some(MicroDollars::new(microdollars));
         }
+    }
+
+    fn load_request_price_from_environment(&mut self) {
+        let (Ok(input), Ok(output)) = (
+            std::env::var("PHEMIUS_INPUT_PRICE_MICRODOLLARS_PER_MILLION"),
+            std::env::var("PHEMIUS_OUTPUT_PRICE_MICRODOLLARS_PER_MILLION"),
+        ) else {
+            return;
+        };
+        let Ok(input) = input.parse::<u64>() else {
+            return;
+        };
+        let Ok(output) = output.parse::<u64>() else {
+            return;
+        };
+        self.request_price = Some(Price {
+            input_per_million: MicroDollars::new(input),
+            output_per_million: MicroDollars::new(output),
+        });
     }
 
     fn load_declared_project_plan(&mut self) {
@@ -788,6 +810,11 @@ impl RunController {
         self.request_maximum_cost = maximum;
     }
 
+    /// Sets optional input/output prices used to settle provider usage.
+    pub fn set_request_price(&mut self, price: Option<Price>) {
+        self.request_price = price;
+    }
+
     /// Confirms the current conservative warning for the next chapter request.
     pub fn confirm_cost_warning(&mut self) {
         self.cost_warning_confirmed = true;
@@ -821,6 +848,40 @@ impl RunController {
         Ok(format!(
             "coordinator request recorded: {request}; canon unchanged"
         ))
+    }
+
+    /// Executes a read-only coordinator request through the selected typed role.
+    pub async fn run_coordinator_request(
+        &mut self,
+        role: AgentRole,
+        request: impl Into<String>,
+    ) -> Result<String> {
+        let request = request.into();
+        ensure!(!request.trim().is_empty(), "coordinator request is empty");
+        if self.project.is_some() && self.session.is_none() {
+            self.attach_latest_session()?;
+        }
+        ensure!(
+            !self.recovery_required,
+            "durable checkpoint requires in-memory state reconstruction; manual resolution is required"
+        );
+        self.ensure_durable_session()?;
+        self.append_session_event(SessionEvent::UserInstruction {
+            text: format!("coordinator: {request}"),
+        })?;
+        let model_request = ModelRequest::new(
+            role.name(),
+            vec![ModelMessage::user(request.clone())],
+            Vec::new(),
+        )
+        .with_model(self.model(role));
+        let response = self
+            .complete_model_request("coordinator", model_request)
+            .await
+            .map_err(model_error)?;
+        let hash = sha256_bytes(response.text.as_bytes());
+        self.checkpoint(&hash)?;
+        Ok(response.text)
     }
 
     /// Opens the project-local append-only session journal and cost ledger on first use.
@@ -1538,8 +1599,10 @@ impl RunController {
             Vec::new(),
         )
         .with_model(self.model(AgentRole::StoryArchitect));
-        self.reserve_request(chapter_id)?;
-        let architect_plan = match self.backend.complete(architect_request).await {
+        let architect_plan = match self
+            .complete_model_request(chapter_id, architect_request)
+            .await
+        {
             Ok(response) => response.text,
             Err(error)
                 if !self.strict_backend_errors && error.class() == ModelFailureClass::Stopped =>
@@ -1607,9 +1670,11 @@ impl RunController {
             Vec::new(),
         )
         .with_model(self.model(AgentRole::Writer));
-        self.reserve_request(chapter_id)?;
         trace.writer_calls = 1;
-        let writer_text = match self.backend.complete(writer_request).await {
+        let writer_text = match self
+            .complete_model_request(chapter_id, writer_request)
+            .await
+        {
             Ok(response) => response.text,
             Err(error)
                 if !self.strict_backend_errors && error.class() == ModelFailureClass::Stopped =>
@@ -1736,8 +1801,7 @@ impl RunController {
                 Vec::new(),
             )
             .with_model(self.model(AgentRole::Reviser));
-            self.reserve_request(chapter_id)?;
-            match self.backend.complete(request).await {
+            match self.complete_model_request(chapter_id, request).await {
                 Ok(response) if !response.text.is_empty() => {
                     candidate_text = response.text;
                     self.invalidate_chapter_findings(chapter_id);
@@ -1999,27 +2063,47 @@ impl RunController {
                 Vec::new(),
             )
             .with_model(self.model(*role));
-            self.reserve_request(chapter_id)?;
-            requests.push((*role, request, self.backend.parallel_clone()));
+            let reservation = self.reserve_request(chapter_id)?;
+            let context_hash = request_context_hash(&request);
+            self.append_session_event(SessionEvent::ModelCallStarted {
+                request_id: reservation.request_id.clone(),
+                context_hash,
+            })?;
+            requests.push((*role, request, self.backend.parallel_clone(), reservation));
         }
         let mut results = stream::iter(requests)
-            .map(|(role, request, mut backend)| async move {
+            .map(|(role, request, mut backend, reservation)| async move {
                 let result = backend.complete(request).await;
-                (role, result)
+                (role, reservation, result)
             })
             .buffer_unordered(3)
             .collect::<Vec<_>>()
             .await;
-        results.sort_by_key(|(role, _)| {
+        for (_, reservation, result) in &results {
+            match result {
+                Ok(response) => self.record_model_completion(reservation, response)?,
+                Err(error) if error.class() == ModelFailureClass::Ambiguous => {
+                    self.append_session_event(SessionEvent::ModelCallAmbiguous {
+                        request_id: reservation.request_id.clone(),
+                        reserved_cost: reservation.reserved_cost,
+                    })?;
+                }
+                Err(_) => {}
+            }
+        }
+        results.sort_by_key(|(role, _, _)| {
             specs
                 .iter()
                 .position(|(expected, _)| expected == role)
                 .unwrap_or(usize::MAX)
         });
-        Ok(results)
+        Ok(results
+            .into_iter()
+            .map(|(role, _, result)| (role, result))
+            .collect())
     }
 
-    fn reserve_request(&mut self, chapter_id: &str) -> Result<()> {
+    fn reserve_request(&mut self, chapter_id: &str) -> Result<Reservation> {
         let maximum = self
             .request_maximum_cost
             .ok_or_else(|| anyhow!("unknown model price; generation is stopped"))?;
@@ -2048,8 +2132,77 @@ impl RunController {
         self.cost_status.chapter = self.cost_status.chapter.checked_add_for_work(maximum)?;
         self.cost_status.run = self.cost_status.run.checked_add_for_work(maximum)?;
         self.cost_status.warning |= reservation.warning_required;
-        // ModelResponse carries no metered usage.  Leave the maximum reservation held in the
-        // durable ledger rather than settling optimistically; reconciliation can settle it later.
+        Ok(reservation)
+    }
+
+    async fn complete_model_request(
+        &mut self,
+        chapter_id: &str,
+        request: ModelRequest,
+    ) -> ModelResult<ModelResponse> {
+        let reservation = self
+            .reserve_request(chapter_id)
+            .map_err(|error| crate::model::ModelFailure::stopped(error.to_string()))?;
+        self.append_session_event(SessionEvent::ModelCallStarted {
+            request_id: reservation.request_id.clone(),
+            context_hash: request_context_hash(&request),
+        })
+        .map_err(|error| crate::model::ModelFailure::stopped(error.to_string()))?;
+        match self.backend.complete(request).await {
+            Ok(response) => {
+                self.record_model_completion(&reservation, &response)
+                    .map_err(|error| crate::model::ModelFailure::stopped(error.to_string()))?;
+                Ok(response)
+            }
+            Err(error) if error.class() == ModelFailureClass::Ambiguous => {
+                self.append_session_event(SessionEvent::ModelCallAmbiguous {
+                    request_id: reservation.request_id,
+                    reserved_cost: reservation.reserved_cost,
+                })
+                .map_err(|event_error| {
+                    crate::model::ModelFailure::stopped(event_error.to_string())
+                })?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn record_model_completion(
+        &mut self,
+        reservation: &Reservation,
+        response: &ModelResponse,
+    ) -> Result<()> {
+        let Some(usage) = response.usage else {
+            return self.cost_ledger.retain_ambiguous(reservation);
+        };
+        self.append_session_event(SessionEvent::ModelCallCompleted {
+            request_id: reservation.request_id.clone(),
+            usage,
+        })?;
+        let Some(price) = self.request_price else {
+            return self.cost_ledger.retain_ambiguous(reservation);
+        };
+        let actual = price.cost_for(usage)?;
+        self.cost_ledger.settle(reservation, actual)?;
+        let delta = reservation
+            .reserved_cost
+            .as_u64()
+            .saturating_sub(actual.as_u64());
+        self.cost_status.chapter = MicroDollars::new(
+            self.cost_status
+                .chapter
+                .as_u64()
+                .checked_sub(delta)
+                .ok_or_else(|| anyhow!("chapter cost settlement underflow"))?,
+        );
+        self.cost_status.run = MicroDollars::new(
+            self.cost_status
+                .run
+                .as_u64()
+                .checked_sub(delta)
+                .ok_or_else(|| anyhow!("run cost settlement underflow"))?,
+        );
         Ok(())
     }
 
@@ -2382,6 +2535,17 @@ fn model_error(error: crate::model::ModelFailure) -> anyhow::Error {
     } else {
         anyhow!(error)
     }
+}
+
+fn request_context_hash(request: &ModelRequest) -> String {
+    let mut bytes = Vec::new();
+    for message in &request.messages {
+        bytes.extend_from_slice(message.role.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(message.content.as_bytes());
+        bytes.push(0xff);
+    }
+    sha256_bytes(&bytes)
 }
 
 impl From<ScriptedModel> for ModelBackend {

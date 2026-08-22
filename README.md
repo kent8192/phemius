@@ -37,6 +37,9 @@ logs. A production run therefore starts with:
 ```sh
 export OPENROUTER_API_KEY='…'
 export PHEMIUS_MAX_REQUEST_MICRODOLLARS=300000
+# Optional exact settlement prices, in microdollars per million tokens.
+export PHEMIUS_INPUT_PRICE_MICRODOLLARS_PER_MILLION=660000
+export PHEMIUS_OUTPUT_PRICE_MICRODOLLARS_PER_MILLION=1980000
 cargo run --release -- init ./my-novel
 ```
 
@@ -73,9 +76,11 @@ The interactive REPL starts in `work` mode. The trusted commands are:
 | `/model [role] <model-id>` | Manually select a model for the session or role |
 | `/cost`, `/compact`, `/resume`, `/skills`, `/clean`, `/quit` | Inspect limits, checkpoint, resume, load skills, request clean-up, or exit |
 
-Natural language is ordinary coordinator input. It cannot approve, resolve,
-clean, persist model settings, or enable unrestricted execution. `/approve`
-never exists as a model tool.
+Natural language is ordinary coordinator input and, in the async REPL, is sent
+to the story-architect coordinator role. `/plan`, `/review`, `/revise`, and
+`/diff` use their corresponding typed roles. Coordinator responses never
+approve, resolve, clean, persist model settings, or enable unrestricted
+execution. `/approve` never exists as a model tool.
 
 Planning definitions are loaded from `.phemius/structure.json` and
 `.phemius/framework.json`; invalid or missing definitions fail closed before
@@ -115,6 +120,9 @@ Prepared journals and ambiguous model calls stop for manual resolution rather
 than guessing or replaying a request. Sessions use append-only JSONL plus a
 derived checkpoint; compaction preserves typed canon, source, correction,
 blocker, stale, and cost facts instead of treating a lossy summary as truth.
+When the provider returns usage, it is recorded and settled against the
+optional configured price; without a trusted price, the maximum reservation is
+kept provisional.
 
 The budget policy is fixed at `$5` warning, `$10` per-chapter stop, and `$120`
 continuous-run stop. The warning is confirmed before the first request that

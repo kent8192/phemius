@@ -27,6 +27,15 @@ children and is not serialized into session events, checkpoints, receipts, or
 debug output. The endpoint, provider policy, and context-compression setting
 are intentionally fixed in v0.1.
 
+For exact post-response settlement, optionally provide both provider prices as
+whole microdollars per million tokens. If either value is absent, usage is
+recorded but the maximum reservation remains provisional.
+
+```sh
+export PHEMIUS_INPUT_PRICE_MICRODOLLARS_PER_MILLION=660000
+export PHEMIUS_OUTPUT_PRICE_MICRODOLLARS_PER_MILLION=1980000
+```
+
 The default model is `deepseek/deepseek-v4-pro-0813`. `/model <id>` changes the
 session model and `/model <role> <id>` changes one workflow role. These are
 explicit human commands; natural-language text cannot persist a model choice.
@@ -100,10 +109,11 @@ and stops continuous generation at `$120`. The REPL asks for
 Session evidence is kept in `.phemius/records/sessions/<run-id>/` as
 append-only `session.jsonl` and `cost.jsonl`, with a derived `checkpoint.json`.
 If a session has events but no checkpoint, the next run stops for manual
-resolution. `/resume` reads a checkpoint without resending an API request. A
-fresh process does not regenerate from a checkpoint until its in-memory
-workflow state has been reconstructed; this is a deliberate fail-closed
-boundary against duplicate or authority-losing writes.
+resolution. `/resume` loads a checkpoint without resending an API request and
+reports that state reconstruction is still required. A fresh process does not
+regenerate from a checkpoint until its in-memory workflow state has been
+reconstructed; this is a deliberate fail-closed boundary against duplicate or
+authority-losing writes.
 
 ## Skills and shell
 

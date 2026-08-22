@@ -8,6 +8,7 @@ use std::{
 use regex::Regex;
 use serde_json::{Value, json};
 
+use crate::cost::Usage;
 use crate::openrouter::OpenRouterClient;
 
 /// The pinned default OpenRouter model.
@@ -189,6 +190,8 @@ pub struct ModelResponse {
     pub text: String,
     /// Calls validated by the selected backend before dispatch can occur.
     pub tool_calls: Vec<ToolCall>,
+    /// Provider-reported token usage when the backend supplied it.
+    pub usage: Option<Usage>,
 }
 
 /// Deterministic model backend for evaluation and tests only.

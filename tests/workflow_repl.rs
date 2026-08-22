@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf};
 use phemius::{
     changeset::{approval_record_path, validate_changeset},
     context::CoverageDisposition,
+    cost::{Price, Usage},
     domain::{EntityKind, prefixed_uuid},
     model::{ModelFailure, ModelResponse, ScriptedModel},
     project::{InitAnswers, initialize_project},
@@ -18,6 +19,7 @@ async fn chapter_pipeline_runs_writer_then_three_critics_at_most_then_reviser() 
     let backend = ScriptedModel::new([Ok(ModelResponse {
         text: "chapter draft".into(),
         tool_calls: Vec::new(),
+        usage: None,
     })]);
     let result = RunController::fixture(backend)
         .write_chapter("chapter_1")
@@ -42,6 +44,22 @@ async fn chapter_pipeline_runs_writer_then_three_critics_at_most_then_reviser() 
 }
 
 #[tokio::test]
+async fn async_coordinator_request_uses_a_typed_role_without_changing_canon() {
+    let backend = ScriptedModel::new([Ok(ModelResponse {
+        text: "plan response".into(),
+        tool_calls: Vec::new(),
+        usage: Some(Usage::new(10, 20)),
+    })]);
+    let mut controller = RunController::fixture(backend);
+    controller.set_request_price(Some(Price::parse_per_million("1", "1").unwrap()));
+    let mut repl = Repl::with_controller(controller);
+
+    let outcome = repl.handle_async("/plan next chapter").await.unwrap();
+
+    assert_eq!(outcome, ReplOutcome::Coordinator("plan response".into()));
+}
+
+#[tokio::test]
 async fn shared_scripted_backend_consumes_distinct_writer_and_critic_responses() {
     let responses = [
         "architect plan",
@@ -58,6 +76,7 @@ async fn shared_scripted_backend_consumes_distinct_writer_and_critic_responses()
         Ok(ModelResponse {
             text: text.into(),
             tool_calls: Vec::new(),
+            usage: None,
         })
     });
     let run = RunController::fixture(ScriptedModel::shared(responses))
@@ -93,6 +112,7 @@ async fn ordinary_scripted_backend_clones_share_the_response_queue() {
         Ok(ModelResponse {
             text: text.into(),
             tool_calls: Vec::new(),
+            usage: None,
         })
     });
 
@@ -117,14 +137,17 @@ async fn unknown_finding_kind_stops_the_pipeline_fail_closed() {
         Ok(ModelResponse {
             text: "plan".into(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
         Ok(ModelResponse {
             text: "draft".into(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
         Ok(ModelResponse {
             text: "FINDING|invented-kind|本文/chapter_1.md|0|4|unknown".into(),
             tool_calls: Vec::new(),
+            usage: None,
         }),
     ]);
     let error = RunController::fixture(backend)
@@ -367,7 +390,7 @@ async fn project_repl_resume_reads_the_latest_durable_checkpoint() {
     let mut repl = Repl::with_controller(controller);
     let outcome = repl.handle("/resume").unwrap();
     assert!(
-        matches!(outcome, ReplOutcome::Message(message) if message.contains("resumed latest checkpoint"))
+        matches!(outcome, ReplOutcome::Message(message) if message.contains("state reconstruction is required"))
     );
 }
 
@@ -496,11 +519,13 @@ async fn revision_cycles_are_bounded_and_ambiguous_requests_are_not_retried() {
     let mut responses = vec![Ok(ModelResponse {
         text: "draft".into(),
         tool_calls: Vec::new(),
+        usage: None,
     })];
     responses.extend((0..21).map(|_| {
         Ok(ModelResponse {
             text: blocker.into(),
             tool_calls: Vec::new(),
+            usage: None,
         })
     }));
     let backend = ScriptedModel::new(responses);
@@ -540,6 +565,7 @@ async fn repl_requires_explicit_cost_confirmation_before_model_request() {
     let backend = ScriptedModel::new([Ok(ModelResponse {
         text: "draft".into(),
         tool_calls: Vec::new(),
+        usage: None,
     })]);
     let mut controller = RunController::fixture(backend);
     controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(300_001)));
@@ -663,6 +689,7 @@ async fn project_approval_validates_applies_and_leaves_durable_proof() {
     let backend = ScriptedModel::new([Ok(ModelResponse {
         text: "本文".into(),
         tool_calls: Vec::new(),
+        usage: None,
     })]);
     let mut controller = RunController::fixture_with_project(project.clone(), backend);
     let run = controller.write_chapter(chapter_id.as_str()).await.unwrap();
@@ -718,6 +745,7 @@ async fn project_approval_fails_closed_when_candidate_bytes_are_missing() {
     let backend = ScriptedModel::new([Ok(ModelResponse {
         text: "本文".into(),
         tool_calls: Vec::new(),
+        usage: None,
     })]);
     let mut controller = RunController::fixture_with_project(project, backend);
     let run = controller.write_chapter(chapter_id.as_str()).await.unwrap();

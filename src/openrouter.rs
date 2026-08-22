@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, redirect::Policy};
 use serde_json::{Value, json};
 
+use crate::cost::Usage;
 use crate::model::{
     ModelFailure, ModelMessage, ModelRequest, ModelResponse, ModelResult, ToolCall,
 };
@@ -241,6 +242,7 @@ fn tool_body(tool: &crate::model::ToolDefinition) -> Value {
 #[derive(Default)]
 struct SseAccumulator {
     choices: BTreeMap<usize, ChoiceAccumulator>,
+    usage: Option<Usage>,
     done: bool,
 }
 
@@ -271,11 +273,14 @@ impl SseAccumulator {
         }
         let payload: Value = serde_json::from_str(data)
             .map_err(|_| ModelFailure::stopped("malformed OpenRouter SSE payload"))?;
+        if let Some(usage) = payload.get("usage") {
+            self.usage = Some(parse_usage(usage)?);
+        }
         let choices = payload
             .get("choices")
             .and_then(Value::as_array)
             .ok_or_else(|| ModelFailure::stopped("OpenRouter SSE payload has no choices"))?;
-        if choices.is_empty() {
+        if choices.is_empty() && self.usage.is_none() {
             return Err(ModelFailure::stopped(
                 "OpenRouter SSE payload has empty choices",
             ));
@@ -381,6 +386,24 @@ impl SseAccumulator {
         Ok(ModelResponse {
             text: choice.text.clone(),
             tool_calls,
+            usage: self.usage,
         })
     }
+}
+
+fn parse_usage(value: &Value) -> ModelResult<Usage> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ModelFailure::stopped("OpenRouter usage is not an object"))?;
+    let input_tokens = object
+        .get("prompt_tokens")
+        .or_else(|| object.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ModelFailure::stopped("OpenRouter usage has no input token count"))?;
+    let output_tokens = object
+        .get("completion_tokens")
+        .or_else(|| object.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ModelFailure::stopped("OpenRouter usage has no output token count"))?;
+    Ok(Usage::new(input_tokens, output_tokens))
 }
