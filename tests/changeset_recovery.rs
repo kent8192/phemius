@@ -259,6 +259,42 @@ fn approval_record_without_runtime_transaction_root_is_not_durable_truth() {
 }
 
 #[test]
+fn unexpected_approval_evidence_is_a_typed_manual_conflict() {
+    let fixture = ApplyFixture::new();
+    apply_changeset(&fixture.project, &fixture.change).unwrap();
+    let unexpected = fixture
+        .approval_path()
+        .parent()
+        .unwrap()
+        .join("wrong-name.json");
+    let approval_bytes = fs::read(fixture.approval_path()).unwrap();
+    fs::write(&unexpected, &approval_bytes).unwrap();
+    let observed = fixture.read_canon();
+
+    let error = recover_pending(&fixture.root).unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("approval evidence conflict must require manual resolution");
+    assert_eq!(manual.changeset_id(), fixture.change.id.as_str());
+    assert!(
+        std::error::Error::source(manual)
+            .unwrap()
+            .to_string()
+            .contains("invalid approval proof")
+    );
+    assert_eq!(fixture.read_canon(), observed);
+    assert_eq!(fs::read(&unexpected).unwrap(), approval_bytes);
+
+    let followup = fixture.followup_change("unexpected-approval-evidence");
+    assert_manual_resolution(
+        apply_changeset(&fixture.project, &followup).unwrap_err(),
+        &fixture.change,
+    );
+    assert_eq!(fixture.read_canon(), observed);
+    assert!(unexpected.is_file());
+}
+
+#[test]
 fn unified_diff_is_deterministic_and_sorted_by_target_path() {
     let fixture = ApplyFixture::new();
 
@@ -999,6 +1035,58 @@ fn unknown_entries_and_multiple_pending_transactions_fail_closed() {
         assert!(fixture.root.join("本文/create.md").exists());
         assert!(journal_root.join(fixture.change.id.as_str()).exists());
     }
+}
+
+#[test]
+fn two_valid_prepared_journals_are_a_typed_manual_conflict() {
+    let fixture = ApplyFixture::new();
+    apply_changeset_for_test(
+        &fixture.project,
+        &fixture.change,
+        TestInterruption::AfterFirstRename,
+    )
+    .unwrap_err();
+    let observed = fixture.read_canon();
+    let journal_root = fixture.root.join(".phemius/runtime/journal");
+    let first = fixture.transaction_path();
+    let second_id = prefixed_uuid(EntityKind::Changeset);
+    let second = journal_root.join(second_id.as_str());
+    fs::create_dir(&second).unwrap();
+    for entry in fs::read_dir(&first).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), second.join(entry.file_name())).unwrap();
+    }
+    let marker = second.join("journal.prepared.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    journal["changeset_id"] = serde_json::Value::String(second_id.as_str().to_owned());
+    fs::write(&marker, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+
+    let error = recover_pending(&fixture.root).unwrap_err();
+    let manual = error
+        .downcast_ref::<ManualResolutionRequired>()
+        .expect("multiple valid Prepared journals must require manual resolution");
+    assert!(
+        manual.changeset_id() == fixture.change.id.as_str()
+            || manual.changeset_id() == second_id.as_str()
+    );
+    assert_eq!(
+        std::error::Error::source(manual).unwrap().to_string(),
+        "multiple prepared journal transactions"
+    );
+    assert_eq!(fixture.read_canon(), observed);
+    assert!(first.join("journal.prepared.json").is_file());
+    assert!(second.join("journal.prepared.json").is_file());
+
+    let apply_error = apply_changeset(&fixture.project, &fixture.change).unwrap_err();
+    assert!(
+        apply_error
+            .downcast_ref::<ManualResolutionRequired>()
+            .is_some()
+    );
+    assert_eq!(fixture.read_canon(), observed);
+    assert!(first.is_dir());
+    assert!(second.is_dir());
 }
 
 #[test]

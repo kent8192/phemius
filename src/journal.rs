@@ -494,14 +494,16 @@ fn load_transactions(root: &Dir, runtime: &Dir) -> Result<Vec<Transaction>> {
         })?;
         transactions.push(transaction);
     }
-    ensure!(
-        transactions
-            .iter()
-            .filter(|transaction| transaction.journal.state == JournalState::Prepared)
-            .count()
-            <= 1,
-        "multiple prepared journal transactions"
-    );
+    let mut prepared = transactions
+        .iter()
+        .filter(|transaction| transaction.journal.state == JournalState::Prepared);
+    if let (Some(transaction), Some(_)) = (prepared.next(), prepared.next()) {
+        return Err(ManualResolutionRequired::after_error(
+            &transaction.journal.changeset_id,
+            anyhow!("multiple prepared journal transactions"),
+        )
+        .into());
+    }
     Ok(transactions)
 }
 
@@ -795,7 +797,24 @@ pub(crate) fn validate_committed_receipt_in(
 
 fn verify_current_committed_head(root: &Dir, transactions: &[Transaction]) -> Result<()> {
     require_retained_receipts_for_approval_files(root, transactions)?;
-    let Some((head_id, head_order)) = approval_chain_head_in(root)? else {
+    let head = match approval_chain_head_in(root) {
+        Ok(head) => head,
+        Err(error) => {
+            let Some(transaction) = transactions
+                .iter()
+                .filter(|transaction| transaction.journal.state == JournalState::Committed)
+                .max_by_key(|transaction| transaction.journal.chapter_order)
+            else {
+                return Err(error.into());
+            };
+            return Err(ManualResolutionRequired::after_error(
+                &transaction.journal.changeset_id,
+                anyhow::Error::new(error),
+            )
+            .into());
+        }
+    };
+    let Some((head_id, head_order)) = head else {
         return Ok(());
     };
     let Some(head) = transactions.iter().find(|transaction| {
