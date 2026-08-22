@@ -161,6 +161,8 @@ pub async fn run_with_input(cli: Cli, input: &mut impl BufRead) -> Result<()> {
                 ReplOutcome::Quit => break,
                 ReplOutcome::Continue => {}
                 ReplOutcome::Message(message)
+                | ReplOutcome::Coordinator(message)
+                | ReplOutcome::ReadOnly(message)
                 | ReplOutcome::AgentText(message)
                 | ReplOutcome::AwaitingConfirmation(message)
                 | ReplOutcome::Error(message) => println!("{message}"),

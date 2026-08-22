@@ -4,23 +4,34 @@
 //! mutate the canonical project.  The only path to an approved chapter is the trusted REPL
 //! branch in [`crate::repl`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
+use uuid::Uuid;
 
 use crate::{
     changeset::{
-        Changeset, ChangesetState, FileOperation, OperationKind, calculate_validation_hash,
-        sha256_bytes,
+        ApprovalRecord, Changeset, ChangesetDependency, ChangesetState, FileOperation,
+        OperationKind, approval_record_path, calculate_candidate_hash, calculate_validation_hash,
+        canon_root_hash, content_result_hash, projected_root_hash, sha256_bytes,
     },
     cli::ReplMode,
+    copycheck::{AllowedSource, CopyPolicy, scan_near_copy},
     cost::{BudgetLedger, MicroDollars},
     domain::{EntityKind, prefixed_uuid},
     model::{ModelBackend, ModelFailureClass, ModelMessage, ModelRequest, ScriptedModel},
     plot::{StoryStructure, builtin_framework, validate_structure},
+    project::Project,
+    sources::ManifestDocument,
     tools::{AgentRole as ToolRole, Tool},
 };
 
@@ -168,6 +179,44 @@ impl FindingKind {
     }
 }
 
+/// Typed failure at the trusted chapter-approval boundary.
+#[derive(Debug)]
+pub enum ApprovalError {
+    /// No initialized project was attached to the controller.
+    ProjectRequired,
+    /// Candidate bytes or the changeset failed validation before any apply began.
+    Validation(String),
+    /// The journal could not apply the already-validated changeset.
+    Apply(String),
+    /// The journal returned success but its durable approval proof was absent or changed.
+    DurableProof(String),
+}
+
+impl std::fmt::Display for ApprovalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProjectRequired => {
+                formatter.write_str("approval requires an initialized project")
+            }
+            Self::Validation(message) => write!(formatter, "approval validation failed: {message}"),
+            Self::Apply(message) => write!(formatter, "approval apply failed: {message}"),
+            Self::DurableProof(message) => {
+                write!(formatter, "approval durable proof failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApprovalError {}
+
+struct PreparedChange {
+    operations: Vec<FileOperation>,
+    base_root_hash: String,
+    content_result_hash: String,
+    result_root_hash: String,
+    candidate_hash: String,
+}
+
 /// Trusted disposition assigned to one finding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FindingDisposition {
@@ -216,7 +265,7 @@ impl Finding {
         let evidence_hash =
             sha256_bytes(format!("{:?}\0{artifact}\0{start}\0{end}\0{message}", kind).as_bytes());
         Self {
-            id: prefixed_uuid(EntityKind::Finding).as_str().into(),
+            id: stable_finding_id(kind, &artifact, start, end, &message, &candidate_hash),
             kind,
             artifact,
             start,
@@ -322,6 +371,8 @@ pub struct ChapterRecord {
 pub struct WorkflowTrace {
     /// Ordered roles entered by the controller.
     pub roles: Vec<AgentRole>,
+    /// Number of architect requests.
+    pub architect_calls: usize,
     /// Number of writer requests.
     pub writer_calls: usize,
     /// Maximum critic fan-out promised by the controller.
@@ -390,6 +441,7 @@ impl ChapterRun {
     pub fn is_approvable(&self) -> bool {
         self.state == ChapterState::Approvable
             && self.changeset.state.is_approvable()
+            && self.changeset.unresolved_blocker_ids.is_empty()
             && self.findings.iter().all(|finding| {
                 !finding.kind.is_blocking() || finding.disposition != FindingDisposition::Open
             })
@@ -415,6 +467,7 @@ pub struct CostStatus {
 /// Shared controller for one writing session.
 pub struct RunController {
     backend: ModelBackend,
+    project: Option<Project>,
     model_by_role: BTreeMap<AgentRole, String>,
     chapters: BTreeMap<String, ChapterRecord>,
     chapter_runs: BTreeMap<String, ChapterRun>,
@@ -423,6 +476,7 @@ pub struct RunController {
     corrections: Vec<CorrectionRule>,
     preflight: PreflightReport,
     strict_preflight: bool,
+    structure_required: bool,
     length_unit: LengthUnit,
     min_length: usize,
     max_length: usize,
@@ -455,6 +509,7 @@ impl RunController {
         }
         Self {
             backend,
+            project: None,
             model_by_role,
             chapters: BTreeMap::new(),
             chapter_runs: BTreeMap::new(),
@@ -463,6 +518,7 @@ impl RunController {
             corrections: Vec::new(),
             preflight: PreflightReport::default(),
             strict_preflight: true,
+            structure_required: true,
             length_unit: LengthUnit::Graphemes,
             min_length: 8_000,
             max_length: 12_000,
@@ -492,11 +548,34 @@ impl RunController {
             macro_links: true,
         };
         controller.strict_preflight = true;
+        controller.structure_required = false;
         controller.min_length = 0;
         controller.max_length = usize::MAX;
         controller.strict_backend_errors = false;
         controller.register_chapter("chapter_1", 1, ChapterState::Planned);
         controller
+    }
+
+    /// Builds a deterministic controller attached to an initialized project.
+    #[doc(hidden)]
+    pub fn fixture_with_project<B: Into<ModelBackend>>(project: Project, backend: B) -> Self {
+        let mut controller = Self::fixture(backend);
+        controller.chapters.clear();
+        controller.project = Some(project);
+        controller.structure_required = false;
+        controller
+    }
+
+    /// Builds a production controller with a real project approval boundary.
+    pub fn with_project(project: Project, backend: ModelBackend) -> Self {
+        let mut controller = Self::new(backend);
+        controller.project = Some(project);
+        controller
+    }
+
+    /// Returns the attached project, if this controller has a durable approval boundary.
+    pub fn project(&self) -> Option<&Project> {
+        self.project.as_ref()
     }
 
     /// Builds a fixture with three chapters for stale-state tests.
@@ -642,6 +721,16 @@ impl RunController {
             run.findings.push(finding.clone());
             run.state = ChapterState::Candidate;
             run.changeset.state = ChangesetState::Reviewing;
+            if kind.is_blocking()
+                && let Some(entity_id) = crate::domain::EntityId::from_validated(finding.id.clone())
+                && !run
+                    .changeset
+                    .unresolved_blocker_ids
+                    .iter()
+                    .any(|id| id == &entity_id)
+            {
+                run.changeset.unresolved_blocker_ids.push(entity_id);
+            }
         }
         finding
     }
@@ -683,6 +772,9 @@ impl RunController {
             && let Some(run_finding) = run.findings.iter_mut().find(|item| item.id == finding_id)
         {
             run_finding.disposition = finding.disposition.clone();
+            run.changeset
+                .unresolved_blocker_ids
+                .retain(|id| id.as_str() != finding_id);
         }
         self.refresh_chapter_states();
         Ok(())
@@ -691,6 +783,11 @@ impl RunController {
     /// Changes candidate bytes and invalidates all findings tied to the old hash.
     pub fn edit_candidate(&mut self, chapter_id: &str, candidate: impl AsRef<[u8]>) -> Result<()> {
         let hash = sha256_bytes(candidate.as_ref());
+        ensure!(
+            self.chapter_opt(chapter_id)
+                .is_some_and(|chapter| chapter.state != ChapterState::Approved),
+            "approved canon cannot be edited as a candidate"
+        );
         let run = self
             .chapter_runs
             .get_mut(chapter_id)
@@ -709,6 +806,7 @@ impl RunController {
             finding.disposition = FindingDisposition::Open;
         }
         self.provisional_canon.insert(chapter_id.into(), hash);
+        self.note_upstream_edit(chapter_id)?;
         self.refresh_chapter_states();
         Ok(())
     }
@@ -722,6 +820,10 @@ impl RunController {
         scope: impl AsRef<str>,
         target: Option<&str>,
     ) -> Result<CorrectionRule> {
+        let source_order = self
+            .chapter_opt(source_chapter)
+            .ok_or_else(|| anyhow!("source chapter {source_chapter} was not found"))?
+            .order;
         let scope = match scope.as_ref() {
             "location" => CorrectionScope::Location,
             "character" => CorrectionScope::Character,
@@ -730,6 +832,34 @@ impl RunController {
             "project" => CorrectionScope::Project,
             _ => bail!("unknown correction scope"),
         };
+        ensure!(
+            !before.as_ref().trim().is_empty(),
+            "correction before text is required"
+        );
+        ensure!(
+            !after.as_ref().trim().is_empty(),
+            "correction after text is required"
+        );
+        if scope == CorrectionScope::Project {
+            ensure!(target.is_none(), "project corrections cannot have a target");
+        } else {
+            let target = target.ok_or_else(|| anyhow!("scoped corrections require a target"))?;
+            ensure!(!target.trim().is_empty(), "correction target is required");
+            ensure!(
+                target.starts_with("chapter_")
+                    || target.starts_with("scene_")
+                    || target.starts_with("box_")
+                    || target.starts_with("character_")
+                    || target.starts_with("location_"),
+                "correction target has an unknown entity prefix"
+            );
+            if let Some(target_chapter) = self.chapter_opt(target) {
+                ensure!(
+                    target_chapter.order >= source_order,
+                    "correction target must not precede its source chapter"
+                );
+            }
+        }
         let diff = format!("BEFORE:\n{}\nAFTER:\n{}", before.as_ref(), after.as_ref());
         let hash = sha256_bytes(diff.as_bytes());
         let rule = CorrectionRule {
@@ -755,8 +885,7 @@ impl RunController {
                 let source_order = self
                     .chapter_opt(&rule.source_chapter)
                     .map_or(0, |chapter| chapter.order);
-                source_order < chapter_order
-                    && (rule.scope == CorrectionScope::Project || rule.target.is_some())
+                source_order < chapter_order && correction_applies(rule, chapter_id, self)
             })
             .map(|rule| CorrectionReceipt {
                 rule_id: rule.id.clone(),
@@ -772,6 +901,12 @@ impl RunController {
             .chapter_opt(chapter_id)
             .ok_or_else(|| anyhow!("chapter {chapter_id} was not found"))?
             .order;
+        let descendant_ids = self
+            .chapters
+            .values()
+            .filter(|chapter| chapter.order > source_order)
+            .map(|chapter| chapter.id.clone())
+            .collect::<Vec<_>>();
         for chapter in self.chapters.values_mut() {
             if chapter.order <= source_order {
                 continue;
@@ -791,6 +926,9 @@ impl RunController {
             }
             self.provisional_canon.remove(&chapter.id);
         }
+        for descendant_id in descendant_ids {
+            self.invalidate_chapter_findings(&descendant_id);
+        }
         Ok(())
     }
 
@@ -801,6 +939,11 @@ impl RunController {
 
     /// Rejects one candidate through the trusted REPL branch.
     pub(crate) fn reject_chapter_trusted(&mut self, chapter_id: &str) -> Result<()> {
+        ensure!(
+            self.chapter_opt(chapter_id)
+                .is_some_and(|chapter| chapter.state != ChapterState::Approved),
+            "approved canon cannot be rejected"
+        );
         let chapter = self
             .chapters
             .get_mut(chapter_id)
@@ -842,6 +985,51 @@ impl RunController {
         {
             bail!("chapters must be approved in order");
         }
+        let Some(project) = self.project.clone() else {
+            return Err(anyhow::Error::new(ApprovalError::ProjectRequired));
+        };
+        let mut change = run.changeset.clone();
+        let dependencies = self
+            .project_dependencies(change.chapter_order)
+            .map_err(|error| anyhow::Error::new(ApprovalError::Validation(error.to_string())))?;
+        if change.dependencies != dependencies {
+            change.dependencies = dependencies;
+            change.parent_changeset_id = change
+                .dependencies
+                .first()
+                .map(|dependency| dependency.id.clone());
+            change.validation_hash = Some(calculate_validation_hash(&change));
+            change.result_root_hash = projected_root_hash(&project, &change).map_err(|error| {
+                anyhow::Error::new(ApprovalError::Validation(error.to_string()))
+            })?;
+        }
+        crate::changeset::validate_changeset(&project, &change)
+            .map_err(|error| anyhow::Error::new(ApprovalError::Validation(error.to_string())))?;
+        crate::journal::apply_changeset(&project, &change)
+            .map_err(|error| anyhow::Error::new(ApprovalError::Apply(error.to_string())))?;
+        let proof_path = approval_record_path(&project.root, &change.id);
+        let expected_proof = crate::changeset::approval_record_bytes(&change)
+            .map_err(|error| anyhow::Error::new(ApprovalError::DurableProof(error.to_string())))?;
+        let actual_proof = fs::read(&proof_path).map_err(|error| {
+            anyhow::Error::new(ApprovalError::DurableProof(format!(
+                "{}: {error}",
+                proof_path.display()
+            )))
+        })?;
+        ensure!(
+            actual_proof == expected_proof,
+            ApprovalError::DurableProof(
+                "approval record bytes do not match validated proof".into()
+            )
+        );
+        File::open(&proof_path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                anyhow::Error::new(ApprovalError::DurableProof(format!(
+                    "failed to fsync {}: {error}",
+                    proof_path.display()
+                )))
+            })?;
         let chapter = self.chapters.get_mut(chapter_id).expect("checked above");
         chapter.state = ChapterState::Approved;
         let run = self
@@ -849,7 +1037,9 @@ impl RunController {
             .get_mut(chapter_id)
             .expect("checked above");
         run.state = ChapterState::Approved;
+        run.changeset = change;
         run.changeset.state = ChangesetState::Approved;
+        self.note_upstream_edit(chapter_id)?;
         Ok(())
     }
 
@@ -877,6 +1067,30 @@ impl RunController {
                 self.preflight.is_ready(),
                 "approved scene, box, and macro plans are required"
             );
+            if self.structure_required {
+                let structure = self
+                    .structure
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("an approved story structure is required"))?;
+                validate_structure(structure)?;
+                ensure!(
+                    !structure.scenes.is_empty()
+                        && !structure.boxes.is_empty()
+                        && !structure.macro_beats.is_empty(),
+                    "approved scene, box, and macro structure links are required"
+                );
+                ensure!(
+                    structure
+                        .chapters
+                        .iter()
+                        .any(|chapter| chapter.id == chapter_id),
+                    "chapter {chapter_id} is not present in the approved story structure"
+                );
+                ensure!(
+                    self.plot_framework.is_some(),
+                    "a declarative plot framework is required"
+                );
+            }
         }
         if self.request_maximum_cost.is_none() {
             bail!("unknown model price; generation is stopped");
@@ -891,6 +1105,18 @@ impl RunController {
                 + 1;
             self.register_chapter(chapter_id, next, ChapterState::Planned);
         }
+        if let Some(chapter) = self.chapters.get(chapter_id)
+            && matches!(
+                chapter.state,
+                ChapterState::Stale | ChapterState::NeedsRevalidation
+            )
+        {
+            bail!(
+                "chapter {chapter_id} is {:?}; explicit regeneration or revalidation is required",
+                chapter.state
+            );
+        }
+        self.invalidate_chapter_findings(chapter_id);
         self.chapters
             .get_mut(chapter_id)
             .expect("chapter was registered")
@@ -898,6 +1124,25 @@ impl RunController {
 
         let mut trace = WorkflowTrace::default();
         trace.roles.push(AgentRole::StoryArchitect);
+        trace.architect_calls = 1;
+        let architect_request = ModelRequest::new(
+            AgentRole::StoryArchitect.name(),
+            vec![ModelMessage::user(format!(
+                "Plan chapter {chapter_id} from the approved scene, box, and macro structure. Return a plan only."
+            ))],
+            Vec::new(),
+        )
+        .with_model(self.model(AgentRole::StoryArchitect));
+        self.reserve_request(chapter_id)?;
+        let architect_plan = match self.backend.complete(architect_request).await {
+            Ok(response) => response.text,
+            Err(error)
+                if !self.strict_backend_errors && error.class() == ModelFailureClass::Stopped =>
+            {
+                String::new()
+            }
+            Err(error) => return Err(model_error(error)),
+        };
         trace.roles.push(AgentRole::Writer);
         let chapter_order = self.chapter(chapter_id).order;
         let provisional_canon_hashes = self
@@ -914,7 +1159,7 @@ impl RunController {
         let writer_request = ModelRequest::new(
             AgentRole::Writer.name(),
             vec![ModelMessage::user(format!(
-                "Write chapter {chapter_id}. Approved scene and box plans are required. Provisional canon hashes: {}. Corrections: {}",
+                "Write chapter {chapter_id}. Approved scene and box plans are required. Architect plan: {architect_plan}. Provisional canon hashes: {}. Corrections: {}",
                 provisional_canon_hashes
                     .iter()
                     .map(|(id, hash)| format!("{id}={hash}"))
@@ -940,7 +1185,25 @@ impl RunController {
             }
             Err(error) => return Err(model_error(error)),
         };
-        let candidate_hash = sha256_bytes(writer_text.as_bytes());
+        let changeset_id = prefixed_uuid(EntityKind::Changeset);
+        let dependencies = self.project_dependencies(chapter_order)?;
+        let mut prepared = if let Some(project) = self.project.as_ref() {
+            Some(prepare_project_change(
+                project,
+                &changeset_id,
+                chapter_id,
+                chapter_order,
+                &writer_text,
+                dependencies.clone(),
+            )?)
+        } else {
+            None
+        };
+        let mut candidate_hash = prepared.as_ref().map_or_else(
+            || sha256_bytes(writer_text.as_bytes()),
+            |change| change.candidate_hash.clone(),
+        );
+        let mut candidate_text = writer_text.clone();
 
         let mut findings = Vec::new();
         let critic_count = self.max_critics.min(AgentSpec::critic_roles().len());
@@ -953,7 +1216,7 @@ impl RunController {
             let request = ModelRequest::new(
                 role.name(),
                 vec![ModelMessage::user(format!(
-                    "Review candidate chapter {chapter_id} without editing it."
+                    "Review candidate chapter {chapter_id} without editing it.\n\nImmutable candidate:\n{candidate_text}\n\nProvisional context: {provisional_canon_hashes:?}\nCorrection receipt: {correction_receipts:?}"
                 ))],
                 Vec::new(),
             )
@@ -962,6 +1225,7 @@ impl RunController {
             critic_requests.push((*role, request, self.backend.clone()));
         }
         let strict_backend_errors = self.strict_backend_errors;
+        let mut failing_critic_roles = BTreeSet::new();
         let mut critic_results = stream::iter(critic_requests)
             .map(|(role, request, mut backend)| async move {
                 let result = backend.complete(request).await;
@@ -974,7 +1238,15 @@ impl RunController {
         for (role, result) in critic_results {
             match result {
                 Ok(response) => {
-                    findings.extend(parse_findings(&response.text, role, &candidate_hash))
+                    let role_findings =
+                        parse_findings(&response.text, role, &candidate_hash, &candidate_text)?;
+                    if role_findings
+                        .iter()
+                        .any(|finding| finding.blocks(&candidate_hash))
+                    {
+                        failing_critic_roles.insert(role);
+                    }
+                    findings.extend(role_findings);
                 }
                 Err(error)
                     if !strict_backend_errors && error.class() == ModelFailureClass::Stopped => {}
@@ -994,7 +1266,6 @@ impl RunController {
                 findings.push(finding);
             }
         }
-        findings.sort_by_key(|finding| finding.id.clone());
         for finding in &findings {
             self.finding_chapters
                 .insert(finding.id.clone(), chapter_id.into());
@@ -1022,7 +1293,70 @@ impl RunController {
             .with_model(self.model(AgentRole::Reviser));
             self.reserve_request(chapter_id)?;
             match self.backend.complete(request).await {
-                Ok(response) if !response.text.is_empty() => {}
+                Ok(response) if !response.text.is_empty() => {
+                    candidate_text = response.text;
+                    if let (Some(project), Some(previous)) =
+                        (self.project.as_ref(), prepared.as_ref())
+                    {
+                        prepared = Some(update_project_change(
+                            project,
+                            &changeset_id,
+                            previous,
+                            &candidate_text,
+                            dependencies.clone(),
+                            chapter_order,
+                        )?);
+                        candidate_hash = prepared
+                            .as_ref()
+                            .map(|change| change.candidate_hash.clone())
+                            .unwrap_or_else(|| sha256_bytes(candidate_text.as_bytes()));
+                    } else {
+                        candidate_hash = sha256_bytes(candidate_text.as_bytes());
+                    }
+                    findings = parse_findings(
+                        &candidate_text,
+                        AgentRole::Reviser,
+                        &candidate_hash,
+                        &candidate_text,
+                    )?;
+                    let rerun_roles = failing_critic_roles.iter().copied().collect::<Vec<_>>();
+                    failing_critic_roles.clear();
+                    for role in rerun_roles {
+                        trace.roles.push(role);
+                        trace.critic_calls += 1;
+                        let request = ModelRequest::new(
+                            role.name(),
+                            vec![ModelMessage::user(format!(
+                                "Re-review the revised immutable candidate chapter {chapter_id}; report only changed evidence.\n\nCandidate:\n{candidate_text}"
+                            ))],
+                            Vec::new(),
+                        )
+                        .with_model(self.model(role));
+                        self.reserve_request(chapter_id)?;
+                        let mut backend = self.backend.clone();
+                        match backend.complete(request).await {
+                            Ok(response) => {
+                                let role_findings = parse_findings(
+                                    &response.text,
+                                    role,
+                                    &candidate_hash,
+                                    &candidate_text,
+                                )?;
+                                if role_findings
+                                    .iter()
+                                    .any(|finding| finding.blocks(&candidate_hash))
+                                {
+                                    failing_critic_roles.insert(role);
+                                }
+                                findings.extend(role_findings);
+                            }
+                            Err(error)
+                                if !self.strict_backend_errors
+                                    && error.class() == ModelFailureClass::Stopped => {}
+                            Err(error) => return Err(model_error(error)),
+                        }
+                    }
+                }
                 Ok(_) => {}
                 Err(error)
                     if !self.strict_backend_errors
@@ -1036,7 +1370,7 @@ impl RunController {
         trace.roles.push(AgentRole::Validator);
         trace.validator_calls = 1;
         validate_length(
-            &writer_text,
+            &candidate_text,
             self.length_unit,
             self.min_length,
             self.max_length,
@@ -1048,67 +1382,77 @@ impl RunController {
             state = ChapterState::Approvable;
             changeset_state = ChangesetState::Approvable;
         }
-        let id = prefixed_uuid(EntityKind::Changeset);
-        let chapter_entity = prefixed_uuid(EntityKind::Chapter);
-        let manuscript_path = std::path::PathBuf::from(format!("本文/{chapter_id}.md"));
-        let candidate_path =
-            std::path::PathBuf::from(format!(".phemius/runtime/candidates/{chapter_id}.md"));
-        let operations = vec![
-            FileOperation {
+        self.invalidate_chapter_findings(chapter_id);
+        for finding in &findings {
+            self.finding_chapters
+                .insert(finding.id.clone(), chapter_id.into());
+            self.findings.insert(finding.id.clone(), finding.clone());
+        }
+        let prepared = prepared.unwrap_or_else(|| {
+            let chapter_entity = prefixed_uuid(EntityKind::Chapter);
+            let operations = [
+                (format!("本文/{chapter_id}.md"), "manuscript"),
+                ("前提/時系列.md".into(), "timeline"),
+                ("前提/伏線.md".into(), "foreshadowing"),
+            ]
+            .into_iter()
+            .map(|(path, _)| FileOperation {
                 kind: OperationKind::Replace,
-                path: manuscript_path,
-                before_sha256: Some(sha256_bytes(b"")),
+                path: PathBuf::from(path),
+                before_sha256: Some(sha256_bytes(b"synthetic-base")),
                 after_sha256: Some(candidate_hash.clone()),
-                candidate_path: Some(candidate_path),
-                affected_entities: vec![chapter_entity.clone()],
-            },
-            FileOperation {
-                kind: OperationKind::Replace,
-                path: std::path::PathBuf::from("前提/時系列.md"),
-                before_sha256: Some(sha256_bytes(b"")),
-                after_sha256: Some(candidate_hash.clone()),
-                candidate_path: Some(std::path::PathBuf::from(format!(
-                    ".phemius/runtime/candidates/{chapter_id}-timeline.md"
+                candidate_path: Some(PathBuf::from(format!(
+                    ".phemius/runtime/candidates/{}/{chapter_id}.md",
+                    changeset_id.as_str()
                 ))),
                 affected_entities: vec![chapter_entity.clone()],
-            },
-            FileOperation {
-                kind: OperationKind::Replace,
-                path: std::path::PathBuf::from("前提/伏線.md"),
-                before_sha256: Some(sha256_bytes(b"")),
-                after_sha256: Some(candidate_hash.clone()),
-                candidate_path: Some(std::path::PathBuf::from(format!(
-                    ".phemius/runtime/candidates/{chapter_id}-foreshadowing.md"
-                ))),
-                affected_entities: vec![chapter_entity],
-            },
-        ];
+            })
+            .collect();
+            PreparedChange {
+                operations,
+                base_root_hash: sha256_bytes(self.run_id.as_bytes()),
+                content_result_hash: candidate_hash.clone(),
+                result_root_hash: candidate_hash.clone(),
+                candidate_hash: candidate_hash.clone(),
+            }
+        });
         let mut changeset = Changeset {
-            id,
-            parent_changeset_id: None,
-            base_root_hash: sha256_bytes(self.run_id.as_bytes()),
-            content_result_hash: candidate_hash.clone(),
-            result_root_hash: candidate_hash.clone(),
+            id: changeset_id,
+            parent_changeset_id: dependencies.first().map(|dependency| dependency.id.clone()),
+            base_root_hash: prepared.base_root_hash,
+            content_result_hash: prepared.content_result_hash,
+            result_root_hash: prepared.result_root_hash,
             state: changeset_state,
-            operations,
-            candidate_hash: candidate_hash.clone(),
+            operations: prepared.operations,
+            candidate_hash: prepared.candidate_hash,
             validation_hash: None,
             unresolved_blocker_ids: findings
                 .iter()
                 .filter(|finding| finding.blocks(&candidate_hash))
-                .filter_map(|finding| {
-                    crate::domain::is_known_entity_id(&finding.id)
-                        .then(|| prefixed_uuid(EntityKind::Finding))
-                })
+                .filter_map(|finding| crate::domain::EntityId::from_validated(finding.id.clone()))
                 .collect(),
-            dependencies: Vec::new(),
+            dependencies,
             chapter_order,
         };
         changeset.validation_hash = Some(calculate_validation_hash(&changeset));
+        if let Some(project) = self.project.as_ref() {
+            let mut validation_candidate = changeset.clone();
+            validation_candidate.state = ChangesetState::Approvable;
+            validation_candidate.unresolved_blocker_ids.clear();
+            if let Err(error) = crate::changeset::validate_changeset(project, &validation_candidate)
+            {
+                // A later provisional chapter has no durable predecessor until the earlier
+                // chapter is approved; the trusted approval boundary revalidates this edge.
+                if error.kind() != crate::changeset::ValidationErrorKind::DependencyOrder {
+                    return Err(anyhow!("validator changeset gate failed: {error}"));
+                }
+            }
+            validate_project_quality_gates(project, &candidate_text)?;
+        }
         let context_receipt_hash = sha256_bytes(
             format!(
-                "{chapter_id}:{candidate_hash}:{:?}",
-                provisional_canon_hashes
+                "{chapter_id}:{candidate_hash}:{:?}:{:?}",
+                provisional_canon_hashes, correction_receipts
             )
             .as_bytes(),
         );
@@ -1121,7 +1465,7 @@ impl RunController {
             correction_receipts,
             provisional_canon_hashes,
             context_receipt_hash,
-            candidate_text: writer_text,
+            candidate_text,
             preflight: self.preflight.clone(),
         };
         self.provisional_canon
@@ -1144,12 +1488,23 @@ impl RunController {
         let mut ids = BTreeSet::new();
         for (index, id) in chapter_ids.iter().enumerate() {
             ensure!(ids.insert(id), "duplicate chapter in continuous run");
-            if let Some(previous) = self.chapters.get(id)
-                && previous.order != index as u32 + 1
-            {
-                bail!("chapter order must be explicit and contiguous");
+            if let Some(previous) = self.chapters.get(id) {
+                if previous.order != index as u32 + 1 {
+                    bail!("chapter order must be explicit and contiguous");
+                }
+                if matches!(
+                    previous.state,
+                    ChapterState::Stale | ChapterState::NeedsRevalidation
+                ) {
+                    bail!(
+                        "chapter {id} is {:?}; continuous generation requires explicit revalidation",
+                        previous.state
+                    );
+                }
             }
-            self.register_chapter(id.clone(), index as u32 + 1, ChapterState::Planned);
+            if !self.chapters.contains_key(id) {
+                self.register_chapter(id.clone(), index as u32 + 1, ChapterState::Planned);
+            }
         }
         let mut runs = Vec::with_capacity(chapter_ids.len());
         for id in chapter_ids {
@@ -1167,6 +1522,64 @@ impl RunController {
         self.cost_status.run = self.cost_status.run.checked_add_for_work(maximum)?;
         self.cost_status.warning |= reservation.warning_required;
         Ok(())
+    }
+
+    fn invalidate_chapter_findings(&mut self, chapter_id: &str) {
+        let ids = self
+            .finding_chapters
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == chapter_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.finding_chapters.remove(&id);
+            self.findings.remove(&id);
+        }
+        if let Some(run) = self.chapter_runs.get_mut(chapter_id) {
+            run.findings.clear();
+        }
+    }
+
+    fn project_dependencies(&self, chapter_order: u32) -> Result<Vec<ChangesetDependency>> {
+        let Some(project) = self.project.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if chapter_order <= 1 {
+            return Ok(Vec::new());
+        }
+        let directory = project.root.join(".phemius/records/approvals");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(anyhow!(error)),
+        };
+        let mut previous = None;
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let bytes = fs::read(entry.path())?;
+            let record: ApprovalRecord = serde_json::from_slice(&bytes).map_err(|error| {
+                anyhow!(
+                    "invalid approval record {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            if record.chapter_order == chapter_order - 1 {
+                ensure!(
+                    previous.is_none(),
+                    "multiple durable approvals exist for chapter order {}",
+                    record.chapter_order
+                );
+                previous = Some(ChangesetDependency {
+                    id: record.changeset_id,
+                    approval_record_sha256: sha256_bytes(&bytes),
+                    chapter_order: record.chapter_order,
+                });
+            }
+        }
+        Ok(previous.into_iter().collect())
     }
 
     fn refresh_chapter_states(&mut self) {
@@ -1190,6 +1603,98 @@ impl RunController {
     }
 }
 
+fn correction_applies(rule: &CorrectionRule, chapter_id: &str, controller: &RunController) -> bool {
+    if rule.scope == CorrectionScope::Project {
+        return true;
+    }
+    let Some(target) = rule.target.as_deref() else {
+        return false;
+    };
+    if target == chapter_id {
+        return true;
+    }
+    match rule.scope {
+        CorrectionScope::Chapter => controller
+            .chapter_opt(target)
+            .zip(controller.chapter_opt(chapter_id))
+            .is_some_and(|(target, chapter)| target.order <= chapter.order),
+        CorrectionScope::Scene => {
+            if let Some(structure) = controller.structure.as_ref()
+                && let Some(scene) = structure.scenes.iter().find(|scene| scene.id == target)
+                && let Some(target_chapter) = controller.chapter_opt(&scene.chapter_id)
+                && let Some(chapter) = controller.chapter_opt(chapter_id)
+            {
+                target_chapter.order >= chapter.order
+            } else {
+                target.starts_with("scene_") || target.starts_with("box_")
+            }
+        }
+        CorrectionScope::Location | CorrectionScope::Character => {
+            target.starts_with("character_") || target.starts_with("location_")
+        }
+        CorrectionScope::Project => true,
+    }
+}
+
+fn validate_project_quality_gates(project: &Project, candidate_text: &str) -> Result<()> {
+    let manifest_path = project.root.join("資料/manifest.md");
+    let manifest = fs::read(&manifest_path).with_context(|| {
+        format!(
+            "required source manifest is missing: {}",
+            manifest_path.display()
+        )
+    })?;
+    ManifestDocument::parse(&manifest)
+        .map_err(|error| anyhow!("source manifest validation failed: {error}"))?;
+
+    let mut sources = Vec::new();
+    for relative in [
+        "前提/作品.md",
+        "前提/世界観設定.md",
+        "前提/時系列.md",
+        "前提/伏線.md",
+        "箱書き/構成.md",
+    ] {
+        let path = project.root.join(relative);
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            sources.push(AllowedSource::plain(relative, text));
+        }
+    }
+    let findings = scan_near_copy(candidate_text, &sources, &CopyPolicy::default())
+        .map_err(|error| anyhow!("near-copy validator stopped: {error}"))?;
+    ensure!(
+        findings.iter().all(|finding| !finding.blocking),
+        "near-copy validator found a blocking source match"
+    );
+    Ok(())
+}
+
+fn stable_finding_id(
+    kind: FindingKind,
+    artifact: &str,
+    start: usize,
+    end: usize,
+    message: &str,
+    candidate_hash: &str,
+) -> String {
+    let material = format!(
+        "{:?}\0{artifact}\0{start}\0{end}\0{message}\0{candidate_hash}",
+        kind
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&Sha256::digest(material.as_bytes())[..16]);
+    // Keep the deterministic digest in the UUID-v7-shaped namespace accepted by the domain.
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{}_{}",
+        EntityKind::Finding.prefix(),
+        Uuid::from_bytes(bytes)
+    )
+}
+
 fn validate_length(text: &str, unit: LengthUnit, minimum: usize, maximum: usize) -> Result<()> {
     let count = match unit {
         LengthUnit::Graphemes => text.graphemes(true).count(),
@@ -1202,34 +1707,77 @@ fn validate_length(text: &str, unit: LengthUnit, minimum: usize, maximum: usize)
     Ok(())
 }
 
-fn parse_findings(text: &str, role: AgentRole, candidate_hash: &str) -> Vec<Finding> {
-    text.lines()
-        .filter_map(|line| {
-            let body = line.strip_prefix("FINDING|")?;
-            let parts = body.splitn(5, '|').collect::<Vec<_>>();
-            let [kind, artifact, start, end, message] = parts.as_slice() else {
-                return None;
-            };
-            let kind = match *kind {
-                "required-source" => FindingKind::RequiredSource,
-                "canon" => FindingKind::Canon,
-                "timeline" => FindingKind::Timeline,
-                "causality" => FindingKind::Causality,
-                "near-copy" => FindingKind::NearCopy,
-                "character" => FindingKind::Character,
-                "reader-pull" => FindingKind::ReaderPull,
-                "style" => FindingKind::Style,
-                "source-adherence" => FindingKind::SourceAdherence,
-                "story-edit" => FindingKind::StoryEdit,
-                _ => FindingKind::Other,
-            };
-            let start = start.parse().ok()?;
-            let end = end.parse().ok()?;
-            let mut finding = Finding::new(kind, *artifact, start, end, *message, candidate_hash);
-            finding.message = format!("{}: {}", role.name(), finding.message);
-            Some(finding)
-        })
-        .collect()
+fn parse_findings(
+    text: &str,
+    role: AgentRole,
+    candidate_hash: &str,
+    candidate_text: &str,
+) -> Result<Vec<Finding>> {
+    let mut findings = Vec::new();
+    for line in text.lines() {
+        let Some(body) = line.strip_prefix("FINDING|") else {
+            continue;
+        };
+        let parts = body.splitn(5, '|').collect::<Vec<_>>();
+        let [kind, artifact, start, end, message] = parts.as_slice() else {
+            bail!("malformed finding evidence from {}", role.name());
+        };
+        let kind = match *kind {
+            "required-source" => FindingKind::RequiredSource,
+            "canon" => FindingKind::Canon,
+            "timeline" => FindingKind::Timeline,
+            "causality" => FindingKind::Causality,
+            "near-copy" => FindingKind::NearCopy,
+            "character" => FindingKind::Character,
+            "reader-pull" => FindingKind::ReaderPull,
+            "style" => FindingKind::Style,
+            "source-adherence" => FindingKind::SourceAdherence,
+            "story-edit" => FindingKind::StoryEdit,
+            _ => FindingKind::Other,
+        };
+        let start = start
+            .parse::<usize>()
+            .map_err(|_| anyhow!("finding start is not an integer"))?;
+        let end = end
+            .parse::<usize>()
+            .map_err(|_| anyhow!("finding end is not an integer"))?;
+        validate_finding_evidence(artifact, start, end, candidate_text)?;
+        ensure!(!message.trim().is_empty(), "finding message is required");
+        let mut finding = Finding::new(kind, *artifact, start, end, *message, candidate_hash);
+        finding.message = format!("{}: {}", role.name(), finding.message);
+        findings.push(finding);
+    }
+    Ok(findings)
+}
+
+fn validate_finding_evidence(
+    artifact: &str,
+    start: usize,
+    end: usize,
+    candidate_text: &str,
+) -> Result<()> {
+    let path = Path::new(artifact);
+    ensure!(!artifact.trim().is_empty(), "finding artifact is required");
+    ensure!(
+        !path.is_absolute(),
+        "finding artifact must be project-relative"
+    );
+    ensure!(!artifact.contains('\0'), "finding artifact contains NUL");
+    ensure!(
+        path.components()
+            .all(|component| !matches!(component, std::path::Component::ParentDir)),
+        "finding artifact escapes the project"
+    );
+    ensure!(start <= end, "finding range is inverted");
+    ensure!(
+        end <= candidate_text.len(),
+        "finding range exceeds candidate bytes"
+    );
+    ensure!(
+        candidate_text.is_char_boundary(start) && candidate_text.is_char_boundary(end),
+        "finding range splits UTF-8"
+    );
+    Ok(())
 }
 
 fn model_error(error: crate::model::ModelFailure) -> anyhow::Error {
@@ -1274,4 +1822,266 @@ impl ReplMode {
             Self::Consult => "consult",
         }
     }
+}
+
+fn prepare_project_change(
+    project: &Project,
+    changeset_id: &crate::domain::EntityId,
+    chapter_id: &str,
+    chapter_order: u32,
+    writer_text: &str,
+    dependencies: Vec<ChangesetDependency>,
+) -> Result<PreparedChange> {
+    let base_root_hash = canon_root_hash(project).map_err(anyhow::Error::new)?;
+    let candidate_root = project
+        .root
+        .join(".phemius/runtime/candidates")
+        .join(changeset_id.as_str());
+    fs::create_dir_all(&candidate_root).with_context(|| {
+        format!(
+            "failed to create candidate directory {}",
+            candidate_root.display()
+        )
+    })?;
+    sync_directory(&candidate_root)?;
+
+    let chapter_entity = prefixed_uuid(EntityKind::Chapter);
+    let mut operations = Vec::new();
+    let mut add_artifact = |target: PathBuf,
+                            file_name: &str,
+                            candidate: Vec<u8>,
+                            entity: crate::domain::EntityId|
+     -> Result<()> {
+        let target_absolute = project.root.join(&target);
+        let existing = match fs::symlink_metadata(&target_absolute) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file(),
+                    "canon target is not a regular file: {}",
+                    target.display()
+                );
+                Some(fs::read(&target_absolute)?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(anyhow!(error)),
+        };
+        let candidate_relative = PathBuf::from(".phemius/runtime/candidates")
+            .join(changeset_id.as_str())
+            .join(file_name);
+        write_new_synced(&project.root.join(&candidate_relative), &candidate)?;
+        let (kind, before_sha256) = match existing {
+            Some(bytes) => (OperationKind::Replace, Some(sha256_bytes(&bytes))),
+            None => (OperationKind::Create, None),
+        };
+        operations.push(FileOperation {
+            kind,
+            path: target,
+            before_sha256,
+            after_sha256: Some(sha256_bytes(&candidate)),
+            candidate_path: Some(candidate_relative),
+            affected_entities: vec![entity],
+        });
+        Ok(())
+    };
+
+    let manuscript_target = PathBuf::from(format!("本文/{chapter_id}.md"));
+    let manuscript_absolute = project.root.join(&manuscript_target);
+    let manuscript = match fs::read(&manuscript_absolute) {
+        Ok(bytes) => append_candidate(bytes, writer_text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            format!("---\nid: {}\n---\n{}", chapter_entity.as_str(), writer_text).into_bytes()
+        }
+        Err(error) => return Err(anyhow!(error)),
+    };
+    add_artifact(
+        manuscript_target,
+        "manuscript.md",
+        manuscript,
+        chapter_entity.clone(),
+    )?;
+
+    for (target, file_name, entity) in [
+        (
+            "前提/時系列.md",
+            "timeline.md",
+            prefixed_uuid(EntityKind::Timeline),
+        ),
+        (
+            "前提/伏線.md",
+            "foreshadowing.md",
+            prefixed_uuid(EntityKind::Foreshadowing),
+        ),
+    ] {
+        let target_path = PathBuf::from(target);
+        let base = fs::read(project.root.join(&target_path))
+            .with_context(|| format!("required canon artifact is missing: {target}"))?;
+        add_artifact(
+            target_path,
+            file_name,
+            append_candidate(base, writer_text),
+            entity,
+        )?;
+    }
+
+    for (file_name, suffix) in [
+        ("context.md", "context receipt"),
+        ("critique.md", "critic summary"),
+        ("basis.md", "generation basis"),
+    ] {
+        let entity = prefixed_uuid(EntityKind::Rule);
+        add_artifact(
+            PathBuf::from(format!("メモ/{chapter_id}-{file_name}")),
+            file_name,
+            format!(
+                "---\nid: {}\n---\n# {suffix}\n\n{writer_text}\n",
+                entity.as_str()
+            )
+            .into_bytes(),
+            entity,
+        )?;
+    }
+
+    let mut change = Changeset {
+        id: changeset_id.clone(),
+        parent_changeset_id: None,
+        base_root_hash,
+        content_result_hash: String::new(),
+        result_root_hash: String::new(),
+        state: ChangesetState::Approvable,
+        operations,
+        candidate_hash: String::new(),
+        validation_hash: None,
+        unresolved_blocker_ids: Vec::new(),
+        dependencies,
+        chapter_order,
+    };
+    change.candidate_hash =
+        calculate_candidate_hash(project, &change).map_err(anyhow::Error::new)?;
+    change.content_result_hash =
+        content_result_hash(project, &change).map_err(anyhow::Error::new)?;
+    change.validation_hash = Some(calculate_validation_hash(&change));
+    change.result_root_hash = projected_root_hash(project, &change).map_err(anyhow::Error::new)?;
+    sync_directory(&candidate_root)?;
+    Ok(PreparedChange {
+        operations: change.operations,
+        base_root_hash: change.base_root_hash,
+        content_result_hash: change.content_result_hash,
+        result_root_hash: change.result_root_hash,
+        candidate_hash: change.candidate_hash,
+    })
+}
+
+fn update_project_change(
+    project: &Project,
+    changeset_id: &crate::domain::EntityId,
+    previous: &PreparedChange,
+    candidate_text: &str,
+    dependencies: Vec<ChangesetDependency>,
+    chapter_order: u32,
+) -> Result<PreparedChange> {
+    let mut operations = previous.operations.clone();
+    for operation in &mut operations {
+        let Some(candidate_path) = operation.candidate_path.as_ref() else {
+            continue;
+        };
+        let absolute = project.root.join(candidate_path);
+        let current = fs::read(&absolute)
+            .with_context(|| format!("failed to read candidate {}", absolute.display()))?;
+        let revised = if operation.path.to_string_lossy().starts_with("本文/") {
+            replace_candidate_body(current, candidate_text)
+        } else {
+            append_candidate(current, candidate_text)
+        };
+        write_replaced_synced(&absolute, &revised)?;
+        operation.after_sha256 = Some(sha256_bytes(&revised));
+    }
+    sync_directory(
+        &project
+            .root
+            .join(".phemius/runtime/candidates")
+            .join(changeset_id.as_str()),
+    )?;
+
+    let mut change = Changeset {
+        id: changeset_id.clone(),
+        parent_changeset_id: dependencies.first().map(|dependency| dependency.id.clone()),
+        base_root_hash: previous.base_root_hash.clone(),
+        content_result_hash: String::new(),
+        result_root_hash: String::new(),
+        state: ChangesetState::Approvable,
+        operations,
+        candidate_hash: String::new(),
+        validation_hash: None,
+        unresolved_blocker_ids: Vec::new(),
+        dependencies,
+        chapter_order,
+    };
+    change.candidate_hash =
+        calculate_candidate_hash(project, &change).map_err(anyhow::Error::new)?;
+    change.content_result_hash =
+        content_result_hash(project, &change).map_err(anyhow::Error::new)?;
+    change.validation_hash = Some(calculate_validation_hash(&change));
+    change.result_root_hash = projected_root_hash(project, &change).map_err(anyhow::Error::new)?;
+    Ok(PreparedChange {
+        operations: change.operations,
+        base_root_hash: change.base_root_hash,
+        content_result_hash: change.content_result_hash,
+        result_root_hash: change.result_root_hash,
+        candidate_hash: change.candidate_hash,
+    })
+}
+
+fn append_candidate(mut base: Vec<u8>, writer_text: &str) -> Vec<u8> {
+    if !base.ends_with(b"\n") {
+        base.push(b'\n');
+    }
+    base.extend_from_slice(b"<!-- phemius candidate -->\n");
+    base.extend_from_slice(writer_text.as_bytes());
+    base
+}
+
+fn replace_candidate_body(base: Vec<u8>, candidate_text: &str) -> Vec<u8> {
+    if let Some(separator) = base.windows(4).position(|window| window == b"---\n")
+        && separator == 0
+        && let Some(body_start) = base[4..].windows(4).position(|window| window == b"---\n")
+    {
+        let body_start = 4 + body_start + 4;
+        let mut result = base[..body_start].to_vec();
+        result.extend_from_slice(candidate_text.as_bytes());
+        return result;
+    }
+    candidate_text.as_bytes().to_vec()
+}
+
+fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create candidate {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write candidate {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync candidate {}", path.display()))?;
+    Ok(())
+}
+
+fn write_replaced_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).truncate(true);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to rewrite candidate {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write revised candidate {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync revised candidate {}", path.display()))?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("failed to open directory {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync directory {}", path.display()))
 }

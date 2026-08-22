@@ -38,6 +38,10 @@ pub enum ReplOutcome {
     Continue,
     /// Return a status or confirmation message.
     Message(String),
+    /// A coordinator request was accepted without granting trusted authority.
+    Coordinator(String),
+    /// A consult-mode command was classified as read-only.
+    ReadOnly(String),
     /// Natural language was passed to the coordinator as ordinary text.
     AgentText(String),
     /// A destructive or security-sensitive action needs explicit confirmation.
@@ -156,10 +160,32 @@ impl Repl {
             | ReplCommand::Diff { .. }
             | ReplCommand::Skills
             | ReplCommand::Skill { .. }
-            | ReplCommand::Compact => Ok(ReplOutcome::Message("request accepted for coordinator".into())),
-            ReplCommand::Write { .. } => Ok(ReplOutcome::Message(
-                "use the asynchronous REPL runner for /write".into(),
-            )),
+            | ReplCommand::Compact => {
+                if self.mode == ReplMode::Consult {
+                    Ok(ReplOutcome::ReadOnly(
+                        "consult mode: coordinator request is read-only".into(),
+                    ))
+                } else if self.controller.is_none() {
+                    Ok(ReplOutcome::ReadOnly(
+                        "no writing controller is attached; request was not executed".into(),
+                    ))
+                } else {
+                    Ok(ReplOutcome::Coordinator("request accepted for coordinator".into()))
+                }
+            }
+            | ReplCommand::Write { .. } => {
+                if self.mode == ReplMode::Consult {
+                    Ok(ReplOutcome::Error("consult mode is read-only".into()))
+                } else if self.controller.is_none() {
+                    Ok(ReplOutcome::Error(
+                        "no writing controller is attached".into(),
+                    ))
+                } else {
+                    Ok(ReplOutcome::Coordinator(
+                        "use the asynchronous REPL runner for /write".into(),
+                    ))
+                }
+            }
             ReplCommand::Approve { id } => {
                 if self.mode == ReplMode::Consult {
                     return Ok(ReplOutcome::Error("consult mode is read-only".into()));
@@ -196,20 +222,38 @@ impl Repl {
                     Err(error) => Ok(ReplOutcome::Error(error.to_string())),
                 }
             }
-            ReplCommand::Model { role, id } => self.handle_model(role, id),
+            ReplCommand::Model { role, id } => {
+                if self.mode == ReplMode::Consult {
+                    return Ok(ReplOutcome::Error("consult mode is read-only".into()));
+                }
+                self.handle_model(role, id)
+            }
             ReplCommand::Cost => Ok(ReplOutcome::Message(self.cost_message())),
             ReplCommand::Resume => {
                 if self.ambiguous_request {
-                    Ok(ReplOutcome::Message(
+                    let outcome = ReplOutcome::Message(
                         "the previous request is ambiguous; choose retry, switch model, or stop".into(),
-                    ))
+                    );
+                    if self.mode == ReplMode::Consult {
+                        Ok(ReplOutcome::ReadOnly(
+                            "consult mode: choose retry, switch model, or stop; no request was resent".into(),
+                        ))
+                    } else {
+                        Ok(outcome)
+                    }
                 } else {
                     Ok(ReplOutcome::Message("no ambiguous request is pending".into()))
                 }
             }
-            ReplCommand::Clean => Ok(ReplOutcome::AwaitingConfirmation(
-                "clean requires an explicit human confirmation".into(),
-            )),
+            ReplCommand::Clean => {
+                if self.mode == ReplMode::Consult {
+                    Ok(ReplOutcome::Error("consult mode is read-only".into()))
+                } else {
+                    Ok(ReplOutcome::AwaitingConfirmation(
+                        "clean requires an explicit human confirmation".into(),
+                    ))
+                }
+            }
             ReplCommand::Quit => Ok(ReplOutcome::Quit),
             ReplCommand::NaturalLanguage(text) => Ok(ReplOutcome::AgentText(text)),
         }
@@ -217,6 +261,14 @@ impl Repl {
 
     fn handle_model(&mut self, role: Option<String>, id: Option<String>) -> Result<ReplOutcome> {
         let Some(id) = id else {
+            if self.mode == ReplMode::Consult {
+                return Ok(ReplOutcome::Error("consult mode is read-only".into()));
+            }
+            if self.controller.is_none() {
+                return Ok(ReplOutcome::Error(
+                    "no writing controller is attached".into(),
+                ));
+            }
             return Ok(ReplOutcome::Message("model selection is manual".into()));
         };
         let Some(controller) = self.controller.as_mut() else {

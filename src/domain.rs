@@ -8,6 +8,12 @@ impl EntityId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Reconstructs an ID only when it is a recognized semantic UUID-v7 value.
+    pub fn from_validated(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        is_known_entity_id(&value).then_some(Self(value))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
