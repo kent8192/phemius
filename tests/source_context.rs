@@ -1,4 +1,10 @@
-use std::{collections::HashSet, ffi::CString, fs, os::unix::ffi::OsStrExt};
+use std::{
+    collections::HashSet,
+    ffi::CString,
+    fs,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+};
 
 use phemius::{
     context::{ByteRange, ContextCompiler, ContextRequest, CoverageDisposition, SourceSummary},
@@ -14,8 +20,9 @@ use phemius::{
         ingest_pdf, snapshot_web_from_responses,
     },
 };
+use rstest::*;
 
-#[test]
+#[rstest]
 fn receipt_accounts_for_every_applicable_source_once() {
     let raw = Snapshot::from_text(SourceKind::PlainText, b"required source", false).unwrap();
     let compacted =
@@ -67,7 +74,7 @@ fn receipt_accounts_for_every_applicable_source_once() {
             .receipt()
             .entries()
             .iter()
-            .map(|entry| entry.source_id().as_str())
+            .map(|entry| entry.source_id().unwrap().as_str())
             .collect::<HashSet<_>>()
             .len(),
         3
@@ -77,30 +84,30 @@ fn receipt_accounts_for_every_applicable_source_once() {
             .receipt()
             .entries()
             .iter()
-            .any(|entry| entry.disposition() == CoverageDisposition::Raw)
+            .any(|entry| entry.disposition() == Some(CoverageDisposition::Raw))
     );
     assert!(
         compiled
             .receipt()
             .entries()
             .iter()
-            .any(|entry| entry.disposition() == CoverageDisposition::Compacted)
+            .any(|entry| entry.disposition() == Some(CoverageDisposition::Compacted))
     );
     assert!(
         compiled
             .receipt()
             .entries()
             .iter()
-            .any(|entry| entry.disposition() == CoverageDisposition::Excluded)
+            .any(|entry| entry.disposition() == Some(CoverageDisposition::Excluded))
     );
 }
 
-#[test]
+#[rstest]
 fn required_raw_overflow_stops_instead_of_truncating() {
     let snapshot = Snapshot::from_text(SourceKind::PlainText, &vec![b'x'; 120], false).unwrap();
     let source_id = prefixed_uuid(EntityKind::Source);
     let manifest = SourceManifest::new(vec![SourceEntry::from_snapshot(
-        source_id,
+        source_id.clone(),
         SourceScope::Work,
         SourceTier::RequiredRaw,
         &snapshot,
@@ -116,16 +123,23 @@ fn required_raw_overflow_stops_instead_of_truncating() {
             requested_output_tokens: 100,
         })
         .unwrap_err();
-    assert!(error.to_string().contains("required raw context"));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "required raw context for {} exceeds the input budget",
+            source_id.as_str()
+        )
+    );
     assert_eq!(error.receipt().entries().len(), 1);
-    assert!(!error.receipt().entries()[0].truncated());
+    assert_eq!(error.receipt().entries()[0].truncated(), Some(false));
 }
 
-#[test]
+#[rstest]
 fn required_raw_budget_uses_a_conservative_byte_upper_bound() {
     let snapshot = Snapshot::from_text(SourceKind::PlainText, b"x", false).unwrap();
+    let source_id = prefixed_uuid(EntityKind::Source);
     let manifest = SourceManifest::new(vec![SourceEntry::from_snapshot(
-        prefixed_uuid(EntityKind::Source),
+        source_id.clone(),
         SourceScope::Work,
         SourceTier::RequiredRaw,
         &snapshot,
@@ -142,10 +156,16 @@ fn required_raw_budget_uses_a_conservative_byte_upper_bound() {
         })
         .unwrap_err();
 
-    assert!(error.to_string().contains("required raw context"));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "required raw context for {} exceeds the input budget",
+            source_id.as_str()
+        )
+    );
 }
 
-#[test]
+#[rstest]
 fn missing_compactable_summary_stops_with_a_complete_failure_receipt() {
     let compactable = Snapshot::from_text(SourceKind::PlainText, &vec![b'x'; 500], false).unwrap();
     let optional = Snapshot::from_text(SourceKind::PlainText, b"optional", false).unwrap();
@@ -153,7 +173,7 @@ fn missing_compactable_summary_stops_with_a_complete_failure_receipt() {
     let optional_id = prefixed_uuid(EntityKind::Source);
     let manifest = SourceManifest::new(vec![
         SourceEntry::from_snapshot(
-            compactable_id,
+            compactable_id.clone(),
             SourceScope::Work,
             SourceTier::Compactable,
             &compactable,
@@ -176,7 +196,13 @@ fn missing_compactable_summary_stops_with_a_complete_failure_receipt() {
             requested_output_tokens: 100,
         })
         .unwrap_err();
-    assert!(error.to_string().contains("no current summary"));
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "compactable source {} has no current summary and raw context does not fit",
+            compactable_id.as_str()
+        )
+    );
     assert_eq!(error.receipt().entries().len(), 2);
     assert!(
         error
@@ -187,7 +213,7 @@ fn missing_compactable_summary_stops_with_a_complete_failure_receipt() {
     );
 }
 
-#[test]
+#[rstest]
 fn exact_japanese_source_match_at_eighty_graphemes_blocks() {
     let source = "あ".repeat(80);
     let findings = scan_near_copy(
@@ -199,7 +225,7 @@ fn exact_japanese_source_match_at_eighty_graphemes_blocks() {
     assert!(findings[0].blocking);
 }
 
-#[test]
+#[rstest]
 fn exact_korean_source_match_at_eighty_graphemes_blocks() {
     let source = "가".repeat(80);
 
@@ -216,7 +242,7 @@ fn exact_korean_source_match_at_eighty_graphemes_blocks() {
     );
 }
 
-#[test]
+#[rstest]
 fn declared_quote_range_is_not_a_copy_blocker() {
     let source = "quoted phrase ".repeat(45);
     let findings = scan_near_copy(
@@ -227,7 +253,7 @@ fn declared_quote_range_is_not_a_copy_blocker() {
     assert!(findings.is_empty());
 }
 
-#[test]
+#[rstest]
 fn local_grants_reject_symlinks_and_secret_snapshots_have_no_artifacts() {
     let root = unique_test_dir("grant");
     let source = root.join("source.txt");
@@ -235,11 +261,13 @@ fn local_grants_reject_symlinks_and_secret_snapshots_have_no_artifacts() {
     fs::write(&source, "top secret").unwrap();
     std::os::unix::fs::symlink(&source, &link).unwrap();
 
-    assert!(PathGrant::freeze(&link).is_err());
+    let link_error = PathGrant::freeze(&link).unwrap_err();
+    assert_eq!(link_error.kind(), SourceErrorKind::InvalidGrant);
     let directory = root.join("directory");
     fs::create_dir(&directory).unwrap();
     std::os::unix::fs::symlink(&source, directory.join("inside-link.txt")).unwrap();
-    assert!(PathGrant::freeze(&directory).is_err());
+    let directory_error = PathGrant::freeze(&directory).unwrap_err();
+    assert_eq!(directory_error.kind(), SourceErrorKind::InvalidGrant);
     let grant = PathGrant::freeze(&source).unwrap();
     let snapshot = ingest_path(&source, &grant, true).unwrap();
     assert!(snapshot.candidate_artifacts().is_empty());
@@ -255,11 +283,9 @@ fn local_grants_reject_symlinks_and_secret_snapshots_have_no_artifacts() {
             .unwrap()
             .contains("top secret")
     );
-
-    fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
+#[rstest]
 fn secret_sources_require_a_one_time_confirmation_and_record_transmission() {
     let snapshot = Snapshot::from_text(SourceKind::PlainText, b"secret reference", true).unwrap();
     let source_id = prefixed_uuid(EntityKind::Source);
@@ -279,15 +305,46 @@ fn secret_sources_require_a_one_time_confirmation_and_record_transmission() {
     };
 
     let unconfirmed = compiler.compile(&request).unwrap_err();
-    assert!(unconfirmed.to_string().contains("one-time confirmation"));
+    assert_eq!(
+        unconfirmed.to_string(),
+        format!(
+            "secret source {} requires a one-time confirmation before transmission",
+            source_id.as_str()
+        )
+    );
     assert!(
         !serde_json::to_string(unconfirmed.receipt())
             .unwrap()
             .contains("secret reference")
     );
+    assert_eq!(
+        serde_json::to_value(unconfirmed.receipt()).unwrap()["entries"],
+        serde_json::json!([{
+            "source_sha256": snapshot.raw_sha256(),
+            "secret_transmitted": false,
+        }])
+    );
+    let jsonl = serde_json::json!({ "receipt": unconfirmed.receipt() });
+    let checkpoint = serde_json::json!({ "context_receipt": unconfirmed.receipt() });
+    let expected_entry = serde_json::json!({
+        "source_sha256": snapshot.raw_sha256(),
+        "secret_transmitted": false,
+    });
+    assert_eq!(
+        jsonl["receipt"]["entries"],
+        serde_json::json!([expected_entry])
+    );
+    assert_eq!(
+        checkpoint["context_receipt"]["entries"],
+        serde_json::json!([{
+            "source_sha256": snapshot.raw_sha256(),
+            "secret_transmitted": false,
+        }])
+    );
+    assert!(!format!("{:?}", unconfirmed.receipt()).contains(source_id.as_str()));
 }
 
-#[test]
+#[rstest]
 fn secret_web_metadata_cannot_enter_a_manifest() {
     let snapshot = snapshot_web_from_responses(
         "https://example.test/secret",
@@ -323,7 +380,7 @@ fn secret_web_metadata_cannot_enter_a_manifest() {
     );
 }
 
-#[test]
+#[rstest]
 fn local_grants_reject_symlinked_ancestor_directories() {
     let root = unique_test_dir("grant-ancestor-link");
     let external = root.join("external");
@@ -335,10 +392,9 @@ fn local_grants_reject_symlinked_ancestor_directories() {
     let error = PathGrant::freeze(&alias.join("source.txt")).unwrap_err();
 
     assert_eq!(error.kind(), SourceErrorKind::InvalidGrant);
-    fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
+#[rstest]
 fn local_grants_reject_fifos_without_waiting_for_a_writer() {
     let root = unique_test_dir("grant-fifo");
     let fifo = root.join("source.txt");
@@ -348,11 +404,9 @@ fn local_grants_reject_fifos_without_waiting_for_a_writer() {
     let error = PathGrant::freeze(&fifo).unwrap_err();
 
     assert_eq!(error.kind(), SourceErrorKind::InvalidGrant);
-    fs::remove_file(fifo).unwrap();
-    fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
+#[rstest]
 fn directory_grant_uses_its_held_capability_after_a_path_swap() {
     let root = unique_test_dir("grant-held-capability");
     let granted = root.join("granted");
@@ -374,10 +428,9 @@ fn directory_grant_uses_its_held_capability_after_a_path_swap() {
     let snapshot = ingest_path(&requested, &grant, false).unwrap();
 
     assert_eq!(snapshot.text(), "frozen reference");
-    fs::remove_file(&granted).unwrap();
-    fs::remove_dir_all(root).unwrap();
 }
 
+#[rstest]
 #[tokio::test]
 async fn empty_or_unextractable_pdf_returns_explicit_ocr_required() {
     let root = unique_test_dir("pdf");
@@ -387,11 +440,9 @@ async fn empty_or_unextractable_pdf_returns_explicit_ocr_required() {
 
     let error = ingest_pdf(&source, &grant, false).await.unwrap_err();
     assert_eq!(error.kind(), SourceErrorKind::OcrRequired);
-
-    fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
+#[rstest]
 fn web_snapshot_validates_redirects_before_conversion() {
     let error = snapshot_web_from_responses(
         "https://example.test/start",
@@ -403,7 +454,7 @@ fn web_snapshot_validates_redirects_before_conversion() {
     assert_eq!(error.kind(), SourceErrorKind::UnsafeUrl);
 }
 
-#[test]
+#[rstest]
 fn web_snapshot_rejects_ipv6_loopback_literals_on_initial_and_redirect_urls() {
     let initial = snapshot_web_from_responses(
         "https://[::1]/private",
@@ -450,7 +501,7 @@ fn web_snapshot_rejects_ipv6_loopback_literals_on_initial_and_redirect_urls() {
     assert_eq!(compatible_redirect.kind(), SourceErrorKind::UnsafeUrl);
 }
 
-#[test]
+#[rstest]
 fn manifest_document_preserves_unknown_frontmatter_and_body() {
     let snapshot = Snapshot::from_text(SourceKind::PlainText, b"source", false).unwrap();
     let source_id = prefixed_uuid(EntityKind::Source);
@@ -484,7 +535,7 @@ fn manifest_document_preserves_unknown_frontmatter_and_body() {
     );
 }
 
-#[test]
+#[rstest]
 fn directory_grant_detects_new_files_before_ingestion() {
     let root = unique_test_dir("directory-grant");
     let sources = root.join("sources");
@@ -496,11 +547,9 @@ fn directory_grant_detects_new_files_before_ingestion() {
 
     let error = ingest_path(&first, &grant, false).unwrap_err();
     assert_eq!(error.kind(), SourceErrorKind::GrantChanged);
-
-    fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
+#[rstest]
 fn structure_scope_includes_chapter_sources_for_a_scene_target() {
     let part = prefixed_uuid(EntityKind::Part);
     let chapter = prefixed_uuid(EntityKind::Chapter);
@@ -531,12 +580,12 @@ fn structure_scope_includes_chapter_sources_for_a_scene_target() {
     assert_eq!(compiled.receipt().entries().len(), 1);
     assert_eq!(
         compiled.receipt().entries()[0].disposition(),
-        CoverageDisposition::Raw
+        Some(CoverageDisposition::Raw)
     );
     assert_eq!(compiled.receipt().context_sha256(), Some(compiled.sha256()));
 }
 
-#[test]
+#[rstest]
 fn invalid_structure_keeps_a_complete_failure_receipt() {
     let part = prefixed_uuid(EntityKind::Part);
     let chapter = prefixed_uuid(EntityKind::Chapter);
@@ -596,7 +645,7 @@ fn invalid_structure_keeps_a_complete_failure_receipt() {
     );
 }
 
-#[test]
+#[rstest]
 fn hierarchy_scopes_require_a_known_target_and_validated_structure() {
     let part = prefixed_uuid(EntityKind::Part);
     let chapter = prefixed_uuid(EntityKind::Chapter);
@@ -643,7 +692,7 @@ fn hierarchy_scopes_require_a_known_target_and_validated_structure() {
     assert_eq!(unknown_target.receipt().entries().len(), 1);
 }
 
-#[test]
+#[rstest]
 fn ngram_overlap_blocks_even_when_no_eighty_grapheme_run_is_exact() {
     let source = (0..160)
         .map(|index| char::from_u32(0x4e00 + index).unwrap())
@@ -665,7 +714,7 @@ fn ngram_overlap_blocks_even_when_no_eighty_grapheme_run_is_exact() {
     );
 }
 
-#[test]
+#[rstest]
 fn ngram_overlap_survives_cjk_insertions_without_a_fixed_offset() {
     let source = (0..160)
         .map(|index| char::from_u32(0x4e00 + index).unwrap())
@@ -688,7 +737,7 @@ fn ngram_overlap_survives_cjk_insertions_without_a_fixed_offset() {
     );
 }
 
-#[test]
+#[rstest]
 fn ngram_overlap_survives_non_cjk_insertions_without_splitting_the_run() {
     let source = (0..160)
         .map(|index| char::from_u32(0x4e00 + index).unwrap())
@@ -711,7 +760,7 @@ fn ngram_overlap_survives_non_cjk_insertions_without_splitting_the_run() {
     );
 }
 
-#[test]
+#[rstest]
 fn copy_gate_ignores_format_characters_between_cjk_graphemes() {
     let source = "あ".repeat(160);
     let manuscript = format!("あ\u{200b}").repeat(160);
@@ -725,7 +774,7 @@ fn copy_gate_ignores_format_characters_between_cjk_graphemes() {
     assert!(findings.iter().any(|finding| finding.blocking));
 }
 
-#[test]
+#[rstest]
 fn cjk_nfkc_expansion_preserves_normalized_grapheme_boundaries() {
     let source = "㍿".repeat(80);
     let manuscript = "株式会社".repeat(80);
@@ -743,7 +792,7 @@ fn cjk_nfkc_expansion_preserves_normalized_grapheme_boundaries() {
     );
 }
 
-#[test]
+#[rstest]
 fn character_ngrams_allow_a_short_word_window_when_words_are_long_enough() {
     let source = "abcdefghij";
     let policy = CopyPolicy {
@@ -764,7 +813,7 @@ fn character_ngrams_allow_a_short_word_window_when_words_are_long_enough() {
     );
 }
 
-#[test]
+#[rstest]
 fn duplicate_exact_source_match_remains_blocking_outside_an_exempt_range() {
     let phrase = "あ".repeat(80);
     let source = format!("{phrase}区{phrase}");
@@ -783,7 +832,7 @@ fn duplicate_exact_source_match_remains_blocking_outside_an_exempt_range() {
     }));
 }
 
-#[test]
+#[rstest]
 fn invalid_declared_ranges_do_not_exempt_copy_findings() {
     let source = "あ".repeat(80);
     let findings = scan_near_copy(
@@ -799,7 +848,7 @@ fn invalid_declared_ranges_do_not_exempt_copy_findings() {
     assert!(findings.iter().any(|finding| finding.blocking));
 }
 
-#[test]
+#[rstest]
 fn supplemental_unicode_punctuation_normalizes_like_other_punctuation() {
     let manuscript = "あ".repeat(80);
     let source = format!("{}\u{2e00}{}", "あ".repeat(40), "あ".repeat(40));
@@ -817,7 +866,7 @@ fn supplemental_unicode_punctuation_normalizes_like_other_punctuation() {
     );
 }
 
-#[test]
+#[rstest]
 fn character_ngrams_cover_an_eighty_word_window() {
     let source = (0..82)
         .map(|index| format!("token{index:03}"))
@@ -843,7 +892,7 @@ fn character_ngrams_cover_an_eighty_word_window() {
     );
 }
 
-#[test]
+#[rstest]
 fn character_ngrams_survive_word_insertions_without_a_fixed_offset() {
     let words = (0..82)
         .map(|index| format!("token{index:03}"))
@@ -867,7 +916,7 @@ fn character_ngrams_survive_word_insertions_without_a_fixed_offset() {
     );
 }
 
-#[test]
+#[rstest]
 fn word_ngrams_survive_emoji_insertions_between_english_word_runs() {
     let words = (0..80)
         .map(|index| format!("token{index:03}"))
@@ -895,7 +944,7 @@ fn word_ngrams_survive_emoji_insertions_between_english_word_runs() {
     );
 }
 
-#[test]
+#[rstest]
 fn word_copy_gate_blocks_symbols_inserted_inside_each_english_word() {
     let source = (0..80)
         .map(|index| format!("token{index:03}"))
@@ -915,7 +964,7 @@ fn word_copy_gate_blocks_symbols_inserted_inside_each_english_word() {
     assert!(findings.iter().any(|finding| finding.blocking));
 }
 
-#[test]
+#[rstest]
 fn character_ngrams_block_punctuation_and_space_inserted_inside_english_words() {
     let source = (0..80)
         .map(|index| format!("token{index:03}"))
@@ -937,7 +986,7 @@ fn character_ngrams_block_punctuation_and_space_inserted_inside_english_words() 
     }
 }
 
-#[test]
+#[rstest]
 fn oversized_ngram_class_set_stops_with_a_typed_budget_error() {
     let policy = CopyPolicy {
         exact_cjk_graphemes: 30_000,
@@ -961,7 +1010,7 @@ fn oversized_ngram_class_set_stops_with_a_typed_budget_error() {
     ));
 }
 
-#[test]
+#[rstest]
 fn partial_declared_quote_range_remains_a_copy_blocker() {
     let source = "quoted phrase ".repeat(45);
     let findings = scan_near_copy(
@@ -976,7 +1025,7 @@ fn partial_declared_quote_range_remains_a_copy_blocker() {
     assert!(findings.iter().any(|finding| finding.blocking));
 }
 
-#[test]
+#[rstest]
 fn web_snapshot_returns_candidate_material_without_writing_canon() {
     let snapshot = snapshot_web_from_responses(
         "https://example.test/article",
@@ -1008,7 +1057,7 @@ fn web_snapshot_returns_candidate_material_without_writing_canon() {
     );
 }
 
-#[test]
+#[rstest]
 fn context_rejects_web_snapshot_metadata_that_does_not_match_the_raw_snapshot() {
     let snapshot = snapshot_web_from_responses(
         "https://example.test/article",
@@ -1039,7 +1088,7 @@ fn context_rejects_web_snapshot_metadata_that_does_not_match_the_raw_snapshot() 
     assert_eq!(error.kind(), SourceErrorKind::InvalidManifest);
 }
 
-#[test]
+#[rstest]
 fn repetitive_exact_copy_returns_a_single_bounded_witness() {
     let repeated = "あ".repeat(10_000);
 
@@ -1054,7 +1103,7 @@ fn repetitive_exact_copy_returns_a_single_bounded_witness() {
     assert_eq!(findings[0].rule, CopyRule::ContiguousCjk);
 }
 
-#[test]
+#[rstest]
 fn invalid_copy_policy_is_a_typed_fail_closed_error() {
     let policy = CopyPolicy {
         ngram_size: 0,
@@ -1069,13 +1118,71 @@ fn invalid_copy_policy_is_a_typed_fail_closed_error() {
     ));
 }
 
-fn unique_test_dir(label: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "phemius-source-context-{label}-{}",
-        uuid::Uuid::now_v7()
-    ));
-    fs::create_dir_all(&root).unwrap();
-    fs::canonicalize(root).unwrap()
+#[rstest]
+fn source_entry_defaults_an_omitted_tier_to_compactable() {
+    let snapshot = Snapshot::from_text(SourceKind::PlainText, b"reference", true).unwrap();
+    let entry = SourceEntry::from_snapshot(
+        prefixed_uuid(EntityKind::Source),
+        SourceScope::Work,
+        SourceTier::RequiredRaw,
+        &snapshot,
+    );
+    let mut serialized = serde_json::to_value(entry).unwrap();
+    serialized.as_object_mut().unwrap().remove("tier");
+
+    let parsed: SourceEntry = serde_json::from_value(serialized).unwrap();
+
+    assert_eq!(parsed.tier, SourceTier::Compactable);
+    SourceManifest::new(vec![parsed]).unwrap();
+}
+
+#[rstest]
+fn source_context_temporary_directory_is_removed_by_drop() {
+    let root = unique_test_dir("raii-cleanup");
+    let path = root.path().to_path_buf();
+
+    drop(root);
+
+    assert!(!path.exists());
+}
+
+struct TestDirectory {
+    path: PathBuf,
+}
+
+impl TestDirectory {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.path.join(path)
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!(
+                "failed to remove source-context temporary directory {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+fn unique_test_dir(label: &str) -> TestDirectory {
+    let mut root = TestDirectory {
+        path: std::env::temp_dir().join(format!(
+            "phemius-source-context-{label}-{}",
+            uuid::Uuid::now_v7()
+        )),
+    };
+    fs::create_dir_all(root.path()).unwrap();
+    root.path = fs::canonicalize(root.path()).unwrap();
+    root
 }
 
 fn scan_near_copy(

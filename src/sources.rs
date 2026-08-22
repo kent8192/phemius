@@ -1,3 +1,8 @@
+//! Source-manifest validation and bounded material ingestion.
+//!
+//! Ingestion produces hash-bound candidates only. Canonical source artifacts are persisted by
+//! the approved changeset flow rather than by this module.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -103,10 +108,16 @@ impl SourceScope {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+/// Determines when a source enters a compiled context.
+///
+/// Manifest entries that omit `tier` default to [`Self::Compactable`].
 pub enum SourceTier {
+    /// The complete source must fit before any lower-priority material is selected.
     RequiredRaw,
     #[default]
+    /// Prefer a current source-anchored summary and otherwise require complete raw fallback.
     Compactable,
+    /// Include only when complete material fits after required and compactable sources.
     Optional,
 }
 
@@ -124,6 +135,7 @@ pub struct SourceEntry {
     pub source_id: EntityId,
     pub kind: SourceKind,
     pub scope: SourceScope,
+    #[serde(default)]
     pub tier: SourceTier,
     pub expected_sha256: String,
     pub snapshot: SnapshotReference,
@@ -1579,8 +1591,9 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::*;
 
-    #[test]
+    #[rstest]
     fn dns_results_reject_a_mixed_public_and_loopback_answer() {
         let addresses = [
             "1.1.1.1:443".parse().unwrap(),

@@ -1,3 +1,8 @@
+//! Deterministic exact and near-copy checks with stable source byte ranges.
+//!
+//! Callers must treat [`scan_near_copy`](crate::copycheck::scan_near_copy) errors as blockers
+//! because bounded scans fail closed.
+
 use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,8 @@
+//! Deterministic compilation of source-complete model contexts and their receipts.
+//!
+//! Context text remains private until a same-compiler handoff records the corresponding
+//! transmission facts, including one-time confirmation for secret sources.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -127,49 +132,162 @@ pub struct ContextRequest {
     pub requested_output_tokens: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ContextReceiptEntry {
+/// Opaque in-memory correlation between a redacted receipt entry and one confirmation.
+///
+/// This value is deliberately excluded from serialized receipts and has no public constructor.
+#[doc(hidden)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct SecretReceiptKey {
     source_id: EntityId,
     source_sha256: String,
-    disposition: CoverageDisposition,
-    source_range: Option<ByteRange>,
-    reason: String,
-    truncated: bool,
-    failure: Option<String>,
-    secret_transmitted: bool,
+}
+
+impl SecretReceiptKey {
+    fn from_entry(entry: &SourceEntry) -> Self {
+        Self {
+            source_id: entry.source_id.clone(),
+            source_sha256: entry.expected_sha256.clone(),
+        }
+    }
+
+    fn is_confirmed_by(&self, confirmations: &BTreeSet<(String, String)>) -> bool {
+        confirmations.iter().any(|(source_id, source_sha256)| {
+            source_id == self.source_id.as_str() && source_sha256 == &self.source_sha256
+        })
+    }
+}
+
+impl fmt::Debug for SecretReceiptKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretReceiptKey(..)")
+    }
+}
+
+/// Coverage evidence for one applicable source.
+///
+/// Secret entries retain only a content hash and a transmission fact so the same value is safe
+/// to serialize into durable receipts.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ContextReceiptEntry {
+    /// Complete evidence for a non-secret source.
+    Source {
+        source_id: EntityId,
+        source_sha256: String,
+        disposition: CoverageDisposition,
+        source_range: Option<ByteRange>,
+        reason: String,
+        truncated: bool,
+        failure: Option<String>,
+        secret_transmitted: bool,
+    },
+    /// Redacted evidence for a secret source.
+    Secret {
+        source_sha256: String,
+        secret_transmitted: bool,
+        #[serde(skip)]
+        secret_key: Option<SecretReceiptKey>,
+    },
 }
 
 impl ContextReceiptEntry {
-    pub fn source_id(&self) -> &EntityId {
-        &self.source_id
+    /// Returns the source ID when the entry is non-secret.
+    pub fn source_id(&self) -> Option<&EntityId> {
+        match self {
+            Self::Source { source_id, .. } => Some(source_id),
+            Self::Secret { .. } => None,
+        }
     }
 
+    /// Returns the source content hash retained for both entry kinds.
     pub fn source_sha256(&self) -> &str {
-        &self.source_sha256
+        match self {
+            Self::Source { source_sha256, .. } | Self::Secret { source_sha256, .. } => {
+                source_sha256
+            }
+        }
     }
 
-    pub fn disposition(&self) -> CoverageDisposition {
-        self.disposition
+    /// Returns the coverage disposition for a non-secret source.
+    pub fn disposition(&self) -> Option<CoverageDisposition> {
+        match self {
+            Self::Source { disposition, .. } => Some(*disposition),
+            Self::Secret { .. } => None,
+        }
     }
 
+    /// Returns the source byte range for a non-secret source.
     pub fn source_range(&self) -> Option<ByteRange> {
-        self.source_range
+        match self {
+            Self::Source { source_range, .. } => *source_range,
+            Self::Secret { .. } => None,
+        }
     }
 
-    pub fn reason(&self) -> &str {
-        &self.reason
+    /// Returns the selection reason for a non-secret source.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Source { reason, .. } => Some(reason),
+            Self::Secret { .. } => None,
+        }
     }
 
-    pub fn truncated(&self) -> bool {
-        self.truncated
+    /// Returns truncation state for a non-secret source.
+    pub fn truncated(&self) -> Option<bool> {
+        match self {
+            Self::Source { truncated, .. } => Some(*truncated),
+            Self::Secret { .. } => None,
+        }
     }
 
+    /// Returns a failure reason for a non-secret source.
     pub fn failure(&self) -> Option<&str> {
-        self.failure.as_deref()
+        match self {
+            Self::Source { failure, .. } => failure.as_deref(),
+            Self::Secret { .. } => None,
+        }
     }
 
+    /// Reports whether secret material was handed to the transmitter.
     pub fn secret_transmitted(&self) -> bool {
-        self.secret_transmitted
+        match self {
+            Self::Source {
+                secret_transmitted, ..
+            }
+            | Self::Secret {
+                secret_transmitted, ..
+            } => *secret_transmitted,
+        }
+    }
+
+    fn is_secret(&self) -> bool {
+        matches!(self, Self::Secret { .. })
+    }
+
+    fn is_confirmed_by(&self, confirmations: &BTreeSet<(String, String)>) -> bool {
+        matches!(
+            self,
+            Self::Secret {
+                secret_key: Some(secret_key),
+                ..
+            } if secret_key.is_confirmed_by(confirmations)
+        )
+    }
+
+    fn ordering_key(&self) -> &str {
+        match self {
+            Self::Source { source_id, .. } => source_id.as_str(),
+            Self::Secret { source_sha256, .. } => source_sha256,
+        }
+    }
+
+    fn mark_secret_transmitted(&mut self) {
+        if let Self::Secret {
+            secret_transmitted, ..
+        } = self
+        {
+            *secret_transmitted = true;
+        }
     }
 }
 
@@ -559,16 +677,14 @@ impl ContextCompiler {
                         }
                         used_tokens += tokens;
                         context.push_str(&block);
-                        receipt.entries.push(ContextReceiptEntry {
-                            source_id: entry.source_id.clone(),
-                            source_sha256: entry.expected_sha256.clone(),
-                            disposition: CoverageDisposition::Raw,
-                            source_range: Some(ByteRange::new(0, snapshot.text().len())),
-                            reason: "required raw source".into(),
-                            truncated: false,
-                            failure: None,
-                            secret_transmitted: false,
-                        });
+                        receipt.entries.push(receipt_entry(
+                            entry,
+                            CoverageDisposition::Raw,
+                            Some(ByteRange::new(0, snapshot.text().len())),
+                            "required raw source",
+                            false,
+                            None,
+                        ));
                     }
                     SourceTier::Compactable => {
                         let snapshot = match self.snapshot_for(entry) {
@@ -591,16 +707,14 @@ impl ContextCompiler {
                             }
                             used_tokens += tokens;
                             context.push_str(&block);
-                            receipt.entries.push(ContextReceiptEntry {
-                                source_id: entry.source_id.clone(),
-                                source_sha256: entry.expected_sha256.clone(),
-                                disposition: CoverageDisposition::Compacted,
-                                source_range: Some(summary.source_range),
-                                reason: "current source-anchored summary".into(),
-                                truncated: false,
-                                failure: None,
-                                secret_transmitted: false,
-                            });
+                            receipt.entries.push(receipt_entry(
+                                entry,
+                                CoverageDisposition::Compacted,
+                                Some(summary.source_range),
+                                "current source-anchored summary",
+                                false,
+                                None,
+                            ));
                         } else {
                             let block = source_block(entry, snapshot.text());
                             let tokens = estimate_tokens(block.as_bytes());
@@ -621,32 +735,26 @@ impl ContextCompiler {
                             }
                             used_tokens += tokens;
                             context.push_str(&block);
-                            receipt.entries.push(ContextReceiptEntry {
-                                source_id: entry.source_id.clone(),
-                                source_sha256: entry.expected_sha256.clone(),
-                                disposition: CoverageDisposition::Raw,
-                                source_range: Some(ByteRange::new(0, snapshot.text().len())),
-                                reason:
-                                    "complete raw fallback because the summary is missing or stale"
-                                        .into(),
-                                truncated: false,
-                                failure: None,
-                                secret_transmitted: false,
-                            });
+                            receipt.entries.push(receipt_entry(
+                                entry,
+                                CoverageDisposition::Raw,
+                                Some(ByteRange::new(0, snapshot.text().len())),
+                                "complete raw fallback because the summary is missing or stale",
+                                false,
+                                None,
+                            ));
                         }
                     }
                     SourceTier::Optional => {
                         let Some(snapshot) = self.snapshots.get(entry.source_id.as_str()) else {
-                            receipt.entries.push(ContextReceiptEntry {
-                                source_id: entry.source_id.clone(),
-                                source_sha256: entry.expected_sha256.clone(),
-                                disposition: CoverageDisposition::Excluded,
-                                source_range: None,
-                                reason: "optional source snapshot is unavailable".into(),
-                                truncated: false,
-                                failure: Some("snapshot unavailable".into()),
-                                secret_transmitted: false,
-                            });
+                            receipt.entries.push(receipt_entry(
+                                entry,
+                                CoverageDisposition::Excluded,
+                                None,
+                                "optional source snapshot is unavailable",
+                                false,
+                                Some("snapshot unavailable".into()),
+                            ));
                             continue;
                         };
                         if let Some(summary) = self.current_summary(entry, snapshot) {
@@ -655,16 +763,14 @@ impl ContextCompiler {
                             if used_tokens.saturating_add(tokens) <= request.budget_tokens {
                                 used_tokens += tokens;
                                 context.push_str(&block);
-                                receipt.entries.push(ContextReceiptEntry {
-                                    source_id: entry.source_id.clone(),
-                                    source_sha256: entry.expected_sha256.clone(),
-                                    disposition: CoverageDisposition::Compacted,
-                                    source_range: Some(summary.source_range),
-                                    reason: "current optional source summary".into(),
-                                    truncated: false,
-                                    failure: None,
-                                    secret_transmitted: false,
-                                });
+                                receipt.entries.push(receipt_entry(
+                                    entry,
+                                    CoverageDisposition::Compacted,
+                                    Some(summary.source_range),
+                                    "current optional source summary",
+                                    false,
+                                    None,
+                                ));
                                 continue;
                             }
                         }
@@ -674,44 +780,36 @@ impl ContextCompiler {
                             match secret_reservation.reserve(entry, snapshot) {
                                 Ok(()) => {}
                                 Err(message) => {
-                                    receipt.entries.push(ContextReceiptEntry {
-                                        source_id: entry.source_id.clone(),
-                                        source_sha256: entry.expected_sha256.clone(),
-                                        disposition: CoverageDisposition::Excluded,
-                                        source_range: None,
-                                        reason:
-                                            "optional secret source lacks a one-time confirmation"
-                                                .into(),
-                                        truncated: false,
-                                        failure: Some(message),
-                                        secret_transmitted: false,
-                                    });
+                                    receipt.entries.push(receipt_entry(
+                                        entry,
+                                        CoverageDisposition::Excluded,
+                                        None,
+                                        "optional secret source lacks a one-time confirmation",
+                                        false,
+                                        Some(message),
+                                    ));
                                     continue;
                                 }
                             }
                             used_tokens += tokens;
                             context.push_str(&block);
-                            receipt.entries.push(ContextReceiptEntry {
-                                source_id: entry.source_id.clone(),
-                                source_sha256: entry.expected_sha256.clone(),
-                                disposition: CoverageDisposition::Raw,
-                                source_range: Some(ByteRange::new(0, snapshot.text().len())),
-                                reason: "complete optional raw fallback".into(),
-                                truncated: false,
-                                failure: None,
-                                secret_transmitted: false,
-                            });
+                            receipt.entries.push(receipt_entry(
+                                entry,
+                                CoverageDisposition::Raw,
+                                Some(ByteRange::new(0, snapshot.text().len())),
+                                "complete optional raw fallback",
+                                false,
+                                None,
+                            ));
                         } else {
-                            receipt.entries.push(ContextReceiptEntry {
-                                source_id: entry.source_id.clone(),
-                                source_sha256: entry.expected_sha256.clone(),
-                                disposition: CoverageDisposition::Excluded,
-                                source_range: None,
-                                reason: "optional source exceeds the remaining input budget".into(),
-                                truncated: false,
-                                failure: None,
-                                secret_transmitted: false,
-                            });
+                            receipt.entries.push(receipt_entry(
+                                entry,
+                                CoverageDisposition::Excluded,
+                                None,
+                                "optional source exceeds the remaining input budget",
+                                false,
+                                None,
+                            ));
                         }
                     }
                 }
@@ -719,7 +817,7 @@ impl ContextCompiler {
         }
         receipt
             .entries
-            .sort_by(|left, right| left.source_id.as_str().cmp(right.source_id.as_str()));
+            .sort_by(|left, right| left.ordering_key().cmp(right.ordering_key()));
         let sha256 = crate::sources::sha256_bytes(context.as_bytes());
         receipt.context_sha256 = Some(sha256.clone());
         Ok(CompiledContext {
@@ -749,26 +847,11 @@ impl ContextCompiler {
         }
         let confirmed_secret_keys = context.secret_reservation.keys.clone();
         if let Err(message) = context.secret_reservation.consume() {
-            for entry in &mut context.receipt.entries {
-                let key = (
-                    entry.source_id.as_str().to_owned(),
-                    entry.source_sha256.clone(),
-                );
-                if confirmed_secret_keys.contains(&key) {
-                    entry.failure = Some(message.clone());
-                    entry.secret_transmitted = false;
-                }
-            }
             return Err(ContextCompileError::new(message, context.receipt));
         }
         for entry in &mut context.receipt.entries {
-            let key = (
-                entry.source_id.as_str().to_owned(),
-                entry.source_sha256.clone(),
-            );
-            if entry.disposition == CoverageDisposition::Raw && confirmed_secret_keys.contains(&key)
-            {
-                entry.secret_transmitted = true;
+            if entry.is_confirmed_by(&confirmed_secret_keys) {
+                entry.mark_secret_transmitted();
             }
         }
         Ok(TransmittedContext {
@@ -911,42 +994,92 @@ impl ContextCompiler {
         mut receipt: ContextReceipt,
         applicable: &[&SourceEntry],
     ) -> Result<CompiledContext, ContextCompileError> {
-        let accounted = receipt
+        let mut accounted_non_secret = receipt
             .entries
             .iter()
-            .map(|entry| entry.source_id.as_str().to_owned())
+            .filter_map(|entry| {
+                entry
+                    .source_id()
+                    .map(|source_id| source_id.as_str().to_owned())
+            })
             .collect::<BTreeSet<_>>();
+        let mut accounted_secret_hashes = receipt.entries.iter().fold(
+            BTreeMap::<String, usize>::new(),
+            |mut counts, receipt_entry| {
+                if receipt_entry.is_secret() {
+                    *counts
+                        .entry(receipt_entry.source_sha256().to_owned())
+                        .or_default() += 1;
+                }
+                counts
+            },
+        );
         for entry in applicable {
-            if !accounted.contains(entry.source_id.as_str()) {
-                receipt.entries.push(ContextReceiptEntry {
-                    source_id: entry.source_id.clone(),
-                    source_sha256: entry.expected_sha256.clone(),
-                    disposition: CoverageDisposition::Excluded,
-                    source_range: None,
-                    reason: "context compilation stopped before source selection".into(),
-                    truncated: false,
-                    failure: Some(message.clone()),
-                    secret_transmitted: false,
-                });
+            let accounted = if entry.snapshot.ephemeral {
+                match accounted_secret_hashes.get_mut(&entry.expected_sha256) {
+                    Some(count) if *count > 0 => {
+                        *count -= 1;
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                accounted_non_secret.remove(entry.source_id.as_str())
+            };
+            if !accounted {
+                receipt.entries.push(receipt_entry(
+                    entry,
+                    CoverageDisposition::Excluded,
+                    None,
+                    "context compilation stopped before source selection",
+                    false,
+                    Some(message.clone()),
+                ));
             }
         }
         receipt
             .entries
-            .sort_by(|left, right| left.source_id.as_str().cmp(right.source_id.as_str()));
+            .sort_by(|left, right| left.ordering_key().cmp(right.ordering_key()));
         Err(ContextCompileError::new(message, receipt))
     }
 }
 
 fn failed_entry(entry: &SourceEntry, message: String) -> ContextReceiptEntry {
-    ContextReceiptEntry {
-        source_id: entry.source_id.clone(),
-        source_sha256: entry.expected_sha256.clone(),
-        disposition: CoverageDisposition::Excluded,
-        source_range: None,
-        reason: "source could not be selected".into(),
-        truncated: false,
-        failure: Some(message),
-        secret_transmitted: false,
+    receipt_entry(
+        entry,
+        CoverageDisposition::Excluded,
+        None,
+        "source could not be selected",
+        false,
+        Some(message),
+    )
+}
+
+fn receipt_entry(
+    entry: &SourceEntry,
+    disposition: CoverageDisposition,
+    source_range: Option<ByteRange>,
+    reason: impl Into<String>,
+    truncated: bool,
+    failure: Option<String>,
+) -> ContextReceiptEntry {
+    if entry.snapshot.ephemeral {
+        ContextReceiptEntry::Secret {
+            source_sha256: entry.expected_sha256.clone(),
+            secret_transmitted: false,
+            secret_key: Some(SecretReceiptKey::from_entry(entry)),
+        }
+    } else {
+        ContextReceiptEntry::Source {
+            source_id: entry.source_id.clone(),
+            source_sha256: entry.expected_sha256.clone(),
+            disposition,
+            source_range,
+            reason: reason.into(),
+            truncated,
+            failure,
+            secret_transmitted: false,
+        }
     }
 }
 
@@ -969,8 +1102,9 @@ mod tests {
         domain::{EntityKind, prefixed_uuid},
         sources::{SourceKind, SourceScope},
     };
+    use rstest::*;
 
-    #[test]
+    #[rstest]
     fn secret_confirmation_is_consumed_only_by_a_successful_handoff() {
         let secret = Snapshot::from_text(SourceKind::PlainText, b"secret reference", true).unwrap();
         let oversized = Snapshot::from_text(
@@ -1004,7 +1138,7 @@ mod tests {
         };
         compiler
             .confirm_secret_transmission(SecretTransmission::after_human_confirmation(
-                secret_id,
+                secret_id.clone(),
                 secret.raw_sha256(),
             ))
             .unwrap();
@@ -1040,10 +1174,108 @@ mod tests {
                 .iter()
                 .any(|entry| entry.secret_transmitted())
         );
-        assert!(compiler.compile(&high_budget).is_err());
+        let expected_secret_entry = serde_json::json!({
+            "source_sha256": secret.raw_sha256(),
+            "secret_transmitted": true,
+        });
+        let jsonl = serde_json::json!({ "receipt": transmitted.receipt() });
+        let checkpoint = serde_json::json!({ "context_receipt": transmitted.receipt() });
+        for persisted_receipt in [&jsonl["receipt"], &checkpoint["context_receipt"]] {
+            let entries = persisted_receipt["entries"].as_array().unwrap();
+            let secret_entry = entries
+                .iter()
+                .find(|entry| entry["source_sha256"] == expected_secret_entry["source_sha256"])
+                .unwrap();
+            assert_eq!(secret_entry, &expected_secret_entry);
+        }
+        assert!(
+            !serde_json::to_string(&jsonl)
+                .unwrap()
+                .contains(secret_id.as_str())
+        );
+        let exhausted = compiler.compile(&high_budget).unwrap_err();
+        assert_eq!(
+            exhausted.to_string(),
+            format!(
+                "secret source {} requires a one-time confirmation before transmission",
+                secret_id.as_str()
+            )
+        );
     }
 
-    #[test]
+    #[rstest]
+    fn handoff_marks_only_confirmed_duplicate_secret_sources_as_transmitted() {
+        let secret = Snapshot::from_text(SourceKind::PlainText, b"same secret", true).unwrap();
+        let confirmed_id = prefixed_uuid(EntityKind::Source);
+        let unconfirmed_id = prefixed_uuid(EntityKind::Source);
+        let manifest = SourceManifest::new(vec![
+            SourceEntry::from_snapshot(
+                confirmed_id.clone(),
+                SourceScope::Work,
+                SourceTier::RequiredRaw,
+                &secret,
+            ),
+            SourceEntry::from_snapshot(
+                unconfirmed_id,
+                SourceScope::Work,
+                SourceTier::Optional,
+                &secret,
+            ),
+        ])
+        .unwrap();
+        let compiler = ContextCompiler::new(manifest, vec![secret.clone()]).unwrap();
+        compiler
+            .confirm_secret_transmission(SecretTransmission::after_human_confirmation(
+                confirmed_id,
+                secret.raw_sha256(),
+            ))
+            .unwrap();
+        let request = ContextRequest {
+            target: prefixed_uuid(EntityKind::Chapter),
+            role: "writer".into(),
+            budget_tokens: 1_000,
+            requested_output_tokens: 100,
+        };
+
+        let compiled = compiler.compile(&request).unwrap();
+        assert_eq!(compiled.receipt().entries().len(), 2);
+        assert_eq!(
+            compiled
+                .receipt()
+                .entries()
+                .iter()
+                .filter(|entry| entry.secret_transmitted())
+                .count(),
+            0
+        );
+
+        let transmitted = compiler.handoff(compiled).unwrap();
+
+        assert_eq!(
+            transmitted
+                .receipt()
+                .entries()
+                .iter()
+                .filter(|entry| entry.secret_transmitted())
+                .count(),
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(transmitted.receipt()).unwrap()["entries"],
+            serde_json::json!([
+                {
+                    "source_sha256": secret.raw_sha256(),
+                    "secret_transmitted": true,
+                },
+                {
+                    "source_sha256": secret.raw_sha256(),
+                    "secret_transmitted": false,
+                },
+            ])
+        );
+    }
+
+    #[rstest]
     fn handoff_rejects_context_created_by_a_different_compiler() {
         let secret = Snapshot::from_text(SourceKind::PlainText, b"secret reference", true).unwrap();
         let secret_id = prefixed_uuid(EntityKind::Source);
@@ -1073,10 +1305,9 @@ mod tests {
 
         let error = other.handoff(compiled).unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("not created by this context compiler")
+        assert_eq!(
+            error.to_string(),
+            "compiled context was not created by this context compiler"
         );
         assert!(
             error

@@ -32,3 +32,6 @@ unicode-normalization = "0.1"
 unicode-general-category = "1"
 uuid = { version = "1", features = ["v7", "serde"] }
 yaml_serde = "0.10"
+
+[dev-dependencies]
+rstest = "0.26"
