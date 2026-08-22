@@ -146,6 +146,7 @@ fn capability_file_tools_reject_workspace_escapes() {
     let mut tools = ToolExecutor::new(root.path(), AgentRole::Author).unwrap();
     for path in [
         PathBuf::from(".git/config"),
+        PathBuf::from(".phemius/local.toml"),
         PathBuf::from("../outside"),
         PathBuf::from("/tmp/outside"),
     ] {

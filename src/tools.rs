@@ -782,7 +782,7 @@ where
 }
 
 fn is_forbidden_component(component: &std::ffi::OsStr) -> bool {
-    component == ".git"
+    component == ".git" || component == ".phemius"
 }
 
 #[cfg(test)]
