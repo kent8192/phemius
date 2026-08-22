@@ -172,6 +172,12 @@ impl Repl {
                     .await
                 {
                     Ok(response) => Ok(ReplOutcome::Coordinator(response)),
+                    Err(error) if error.downcast_ref::<CostConfirmationRequired>().is_some() => {
+                        Ok(ReplOutcome::AwaitingConfirmation(format!(
+                            "{}; repeat the request with --confirm",
+                            error
+                        )))
+                    }
                     Err(error) => {
                         self.ambiguous_request = error.to_string().contains("ambiguous");
                         Ok(ReplOutcome::Error(error.to_string()))
@@ -204,6 +210,12 @@ impl Repl {
                 let request = coordinator_request(command);
                 match controller.run_coordinator_request(role, request).await {
                     Ok(response) => Ok(ReplOutcome::Coordinator(response)),
+                    Err(error) if error.downcast_ref::<CostConfirmationRequired>().is_some() => {
+                        Ok(ReplOutcome::AwaitingConfirmation(format!(
+                            "{}; repeat the command with --confirm",
+                            error
+                        )))
+                    }
                     Err(error) => {
                         self.ambiguous_request = error.to_string().contains("ambiguous");
                         Ok(ReplOutcome::Error(error.to_string()))
@@ -349,11 +361,18 @@ impl Repl {
                         ));
                     }
                     match controller.resume_checkpoint() {
-                        Ok(Some(checkpoint)) => Ok(ReplOutcome::Message(format!(
-                            "latest checkpoint loaded at event offset {} (cost {} microdollars); state reconstruction is required before generation, manual resolution is required",
-                            checkpoint.last_event_offset,
-                            checkpoint.cost.as_u64()
-                        ))),
+                        Ok(Some(checkpoint)) => {
+                            let status = if controller.recovery_required() {
+                                "state reconstruction is required before generation, manual resolution is required"
+                            } else {
+                                "workflow state restored; generation can continue"
+                            };
+                            Ok(ReplOutcome::Message(format!(
+                                "latest checkpoint loaded at event offset {} (cost {} microdollars); {status}",
+                                checkpoint.last_event_offset,
+                                checkpoint.cost.as_u64()
+                            )))
+                        }
                         Ok(None) => Ok(ReplOutcome::Message(
                             "no durable project checkpoint is pending".into(),
                         )),

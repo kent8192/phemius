@@ -59,6 +59,29 @@ async fn async_coordinator_request_uses_a_typed_role_without_changing_canon() {
     assert_eq!(outcome, ReplOutcome::Coordinator("plan response".into()));
 }
 
+#[tokio::test]
+async fn coordinator_requests_require_the_same_cost_warning_confirmation() {
+    let backend = ScriptedModel::new([Ok(ModelResponse {
+        text: "plan response".into(),
+        tool_calls: Vec::new(),
+        usage: None,
+    })]);
+    let mut controller = RunController::fixture(backend);
+    controller.set_request_maximum_cost(Some(phemius::cost::MicroDollars::new(6_000_001)));
+    let mut repl = Repl::with_controller(controller);
+
+    assert!(matches!(
+        repl.handle_async("/plan next chapter").await.unwrap(),
+        ReplOutcome::AwaitingConfirmation(message) if message.contains("$5")
+    ));
+    assert_eq!(
+        repl.handle_async("/plan next chapter --confirm")
+            .await
+            .unwrap(),
+        ReplOutcome::Coordinator("plan response".into())
+    );
+}
+
 #[test]
 fn compact_command_writes_a_checkpoint_without_invoking_a_model() {
     let mut repl = Repl::with_controller(RunController::fixture(ScriptedModel::new([])));
@@ -400,7 +423,7 @@ async fn project_repl_resume_reads_the_latest_durable_checkpoint() {
     let mut repl = Repl::with_controller(controller);
     let outcome = repl.handle("/resume").unwrap();
     assert!(
-        matches!(outcome, ReplOutcome::Message(message) if message.contains("state reconstruction is required"))
+        matches!(outcome, ReplOutcome::Message(message) if message.contains("workflow state restored"))
     );
 }
 
@@ -419,7 +442,7 @@ async fn a_new_project_controller_resumes_the_latest_session_directory() {
 }
 
 #[tokio::test]
-async fn a_reopened_controller_cannot_regenerate_without_state_reconstruction() {
+async fn a_reopened_controller_restores_workflow_state_before_generation() {
     let directory = TestDir::new("workflow-resume-write");
     let project = initialize_project(directory.path(), &InitAnswers::minimal("作品")).unwrap();
     let chapter_id = prefixed_uuid(EntityKind::Chapter);
@@ -429,13 +452,11 @@ async fn a_reopened_controller_cannot_regenerate_without_state_reconstruction() 
         first.write_chapter(chapter_id.as_str()).await.unwrap();
     }
     let mut reopened = RunController::fixture_with_project(project, ScriptedModel::new([]));
-    let error = reopened
-        .write_chapter(chapter_id.as_str())
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("state reconstruction"),
-        "{error}"
+    assert!(reopened.resume_checkpoint().unwrap().is_some());
+    assert_eq!(reopened.recovery_required(), false);
+    assert_eq!(
+        reopened.chapter_run(chapter_id.as_str()).unwrap().state,
+        ChapterState::Approvable
     );
 }
 

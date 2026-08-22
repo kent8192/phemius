@@ -466,7 +466,7 @@ impl ChapterRun {
 }
 
 /// Cost state exposed to the REPL without exposing the durable ledger internals.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CostStatus {
     /// Amount estimated or charged for the active chapter.
     pub chapter: MicroDollars,
@@ -539,6 +539,33 @@ pub struct RunController {
     session: Option<SessionJournal>,
     checkpoint_path: Option<PathBuf>,
     recovery_required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ControllerSnapshot {
+    model_by_role: BTreeMap<AgentRole, String>,
+    chapters: BTreeMap<String, ChapterRecord>,
+    chapter_runs: BTreeMap<String, ChapterRun>,
+    findings: BTreeMap<String, Finding>,
+    finding_chapters: BTreeMap<String, String>,
+    corrections: Vec<CorrectionRule>,
+    preflight: PreflightReport,
+    strict_preflight: bool,
+    structure_required: bool,
+    length_unit: LengthUnit,
+    min_length: usize,
+    max_length: usize,
+    max_revisions: usize,
+    request_maximum_cost: Option<MicroDollars>,
+    request_price: Option<Price>,
+    cost_warning_confirmed: bool,
+    cost_status: CostStatus,
+    structure: Option<StoryStructure>,
+    plot_framework: Option<String>,
+    strict_backend_errors: bool,
+    provisional_canon: BTreeMap<String, String>,
+    provisional_canon_texts: BTreeMap<String, String>,
+    run_id: String,
 }
 
 impl RunController {
@@ -657,6 +684,65 @@ impl RunController {
             input_per_million: MicroDollars::new(input),
             output_per_million: MicroDollars::new(output),
         });
+    }
+
+    fn controller_snapshot(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(ControllerSnapshot {
+            model_by_role: self.model_by_role.clone(),
+            chapters: self.chapters.clone(),
+            chapter_runs: self.chapter_runs.clone(),
+            findings: self.findings.clone(),
+            finding_chapters: self.finding_chapters.clone(),
+            corrections: self.corrections.clone(),
+            preflight: self.preflight.clone(),
+            strict_preflight: self.strict_preflight,
+            structure_required: self.structure_required,
+            length_unit: self.length_unit,
+            min_length: self.min_length,
+            max_length: self.max_length,
+            max_revisions: self.max_revisions,
+            request_maximum_cost: self.request_maximum_cost,
+            request_price: self.request_price,
+            cost_warning_confirmed: self.cost_warning_confirmed,
+            cost_status: self.cost_status,
+            structure: self.structure.clone(),
+            plot_framework: self.plot_framework.clone(),
+            strict_backend_errors: self.strict_backend_errors,
+            provisional_canon: self.provisional_canon.clone(),
+            provisional_canon_texts: self.provisional_canon_texts.clone(),
+            run_id: self.run_id.clone(),
+        })
+        .context("failed to serialize workflow reconstruction state")
+    }
+
+    fn restore_controller_snapshot(&mut self, value: &serde_json::Value) -> Result<()> {
+        let snapshot: ControllerSnapshot = serde_json::from_value(value.clone())
+            .context("invalid workflow reconstruction state; manual resolution is required")?;
+        self.model_by_role = snapshot.model_by_role;
+        self.chapters = snapshot.chapters;
+        self.chapter_runs = snapshot.chapter_runs;
+        self.findings = snapshot.findings;
+        self.finding_chapters = snapshot.finding_chapters;
+        self.corrections = snapshot.corrections;
+        self.preflight = snapshot.preflight;
+        self.strict_preflight = snapshot.strict_preflight;
+        self.structure_required = snapshot.structure_required;
+        self.length_unit = snapshot.length_unit;
+        self.min_length = snapshot.min_length;
+        self.max_length = snapshot.max_length;
+        self.max_revisions = snapshot.max_revisions;
+        self.request_maximum_cost = snapshot.request_maximum_cost;
+        self.request_price = snapshot.request_price;
+        self.cost_warning_confirmed = snapshot.cost_warning_confirmed;
+        self.cost_status = snapshot.cost_status;
+        self.structure = snapshot.structure;
+        self.plot_framework = snapshot.plot_framework;
+        self.strict_backend_errors = snapshot.strict_backend_errors;
+        self.provisional_canon = snapshot.provisional_canon;
+        self.provisional_canon_texts = snapshot.provisional_canon_texts;
+        self.run_id = snapshot.run_id;
+        self.recovery_required = false;
+        Ok(())
     }
 
     fn load_declared_project_plan(&mut self) {
@@ -825,6 +911,11 @@ impl RunController {
         self.cost_status
     }
 
+    /// Returns whether the latest durable checkpoint still needs manual state reconstruction.
+    pub const fn recovery_required(&self) -> bool {
+        self.recovery_required
+    }
+
     /// Records a coordinator instruction through the durable session boundary.
     ///
     /// This path never approves canon or launches a model request; executable generation remains
@@ -857,7 +948,23 @@ impl RunController {
         request: impl Into<String>,
     ) -> Result<String> {
         let request = request.into();
+        let (request, inline_confirmation) = match request.strip_suffix(" --confirm") {
+            Some(request) => (request.trim_end().to_owned(), true),
+            None => (request, false),
+        };
         ensure!(!request.trim().is_empty(), "coordinator request is empty");
+        let prior_confirmation = self.cost_warning_confirmed;
+        self.cost_warning_confirmed = false;
+        if let Some(maximum) = self.request_maximum_cost
+            && maximum.as_u64() > 5_000_000
+            && !(inline_confirmation || prior_confirmation)
+        {
+            return Err(CostConfirmationRequired {
+                chapter_id: "coordinator".into(),
+                estimated_cost: maximum,
+            }
+            .into());
+        }
         if self.project.is_some() && self.session.is_none() {
             self.attach_latest_session()?;
         }
@@ -943,7 +1050,7 @@ impl RunController {
         let Some(path) = self.checkpoint_path.as_ref() else {
             return Ok(());
         };
-        let checkpoint = Checkpoint::from_journal(
+        let checkpoint = Checkpoint::from_journal_with_state(
             session,
             vec![ContextEpoch {
                 model: self.model(AgentRole::Writer).into(),
@@ -968,6 +1075,7 @@ impl RunController {
                 .map(|run| run.changeset.id.clone())
                 .collect(),
             self.cost_status.run,
+            Some(self.controller_snapshot()?),
         )?;
         session.write_checkpoint(path, &checkpoint)
     }
@@ -1026,10 +1134,16 @@ impl RunController {
         }
         let journal_path = session_dir.join("session.jsonl");
         let cost_path = session_dir.join("cost.jsonl");
-        self.session = Some(SessionJournal::open(&journal_path)?);
+        let session = SessionJournal::open(&journal_path)?;
+        let checkpoint = session.read_checkpoint(&checkpoint_path)?;
+        self.session = Some(session);
         self.cost_ledger = BudgetLedger::open(&cost_path)?;
         self.checkpoint_path = Some(checkpoint_path);
-        self.recovery_required = true;
+        if let Some(state) = checkpoint.controller_state.as_ref() {
+            self.restore_controller_snapshot(state)?;
+        } else {
+            self.recovery_required = true;
+        }
         Ok(())
     }
 
@@ -2099,7 +2213,13 @@ impl RunController {
             .await;
         for (_, reservation, result) in &results {
             match result {
-                Ok(response) => self.record_model_completion(reservation, response)?,
+                Ok(response) => {
+                    self.record_model_completion(reservation, response)?;
+                    ensure!(
+                        response.usage.is_some() || !self.strict_backend_errors,
+                        "model response omitted token usage; manual reconciliation is required"
+                    );
+                }
                 Err(error) if error.class() == ModelFailureClass::Ambiguous => {
                     self.append_session_event(SessionEvent::ModelCallAmbiguous {
                         request_id: reservation.request_id.clone(),
@@ -2170,6 +2290,11 @@ impl RunController {
             Ok(response) => {
                 self.record_model_completion(&reservation, &response)
                     .map_err(|error| crate::model::ModelFailure::stopped(error.to_string()))?;
+                if response.usage.is_none() && self.strict_backend_errors {
+                    return Err(crate::model::ModelFailure::ambiguous(
+                        "model response omitted token usage; manual reconciliation is required",
+                    ));
+                }
                 Ok(response)
             }
             Err(error) if error.class() == ModelFailureClass::Ambiguous => {
@@ -2192,7 +2317,12 @@ impl RunController {
         response: &ModelResponse,
     ) -> Result<()> {
         let Some(usage) = response.usage else {
-            return self.cost_ledger.retain_ambiguous(reservation);
+            self.cost_ledger.retain_ambiguous(reservation)?;
+            self.append_session_event(SessionEvent::ModelCallAmbiguous {
+                request_id: reservation.request_id.clone(),
+                reserved_cost: reservation.reserved_cost,
+            })?;
+            return Ok(());
         };
         self.append_session_event(SessionEvent::ModelCallCompleted {
             request_id: reservation.request_id.clone(),

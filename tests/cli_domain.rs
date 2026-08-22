@@ -13,6 +13,7 @@ use phemius::{
         Cli, ReplCommand, TopLevelCommand, parse_repl_command, run_with_input,
         run_with_input_with_backend,
     },
+    cost::Usage,
     domain::{EntityId, EntityKind, prefixed_uuid},
     model::{ModelBackend, ModelResponse, ScriptedModel},
     plot::{MacroBeat, StoryBox, StoryChapter, StoryPart, StoryScene, StoryStructure},
@@ -223,42 +224,42 @@ async fn trusted_cli_write_then_approve_applies_the_project_changeset() {
         Ok(ModelResponse {
             text: "plan".into(),
             tool_calls: Vec::new(),
-            usage: None,
+            usage: Some(Usage::new(1, 1)),
         }),
         Ok(ModelResponse {
             text: "本文".into(),
             tool_calls: Vec::new(),
-            usage: None,
+            usage: Some(Usage::new(1, 1)),
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
-            usage: None,
+            usage: Some(Usage::new(1, 1)),
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
-            usage: None,
+            usage: Some(Usage::new(1, 1)),
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
-            usage: None,
+            usage: Some(Usage::new(1, 1)),
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
-            usage: None,
+            usage: Some(Usage::new(1, 1)),
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
-            usage: None,
+            usage: Some(Usage::new(1, 1)),
         }),
         Ok(ModelResponse {
             text: String::new(),
             tool_calls: Vec::new(),
-            usage: None,
+            usage: Some(Usage::new(1, 1)),
         }),
     ]);
     let mut controller = RunController::with_project(project.clone(), backend.into());

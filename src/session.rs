@@ -193,6 +193,9 @@ pub struct Checkpoint {
     pub stale_changeset_ids: Vec<EntityId>,
     /// Typed cumulative cost, never represented in lossy summary text.
     pub cost: MicroDollars,
+    /// Optional controller state needed to reconstruct an unfinished workflow.
+    #[serde(default)]
+    pub controller_state: Option<serde_json::Value>,
 }
 
 impl Checkpoint {
@@ -206,6 +209,31 @@ impl Checkpoint {
         blocker_ids: Vec<EntityId>,
         stale_changeset_ids: Vec<EntityId>,
         cost: MicroDollars,
+    ) -> Result<Self> {
+        Self::from_journal_with_state(
+            journal,
+            context_epochs,
+            canon_fact_hashes,
+            source_hashes,
+            correction_ids,
+            blocker_ids,
+            stale_changeset_ids,
+            cost,
+            None,
+        )
+    }
+
+    /// Builds a checkpoint with a typed controller reconstruction payload.
+    pub fn from_journal_with_state(
+        journal: &SessionJournal,
+        context_epochs: Vec<ContextEpoch>,
+        canon_fact_hashes: Vec<String>,
+        source_hashes: Vec<String>,
+        correction_ids: Vec<EntityId>,
+        blocker_ids: Vec<EntityId>,
+        stale_changeset_ids: Vec<EntityId>,
+        cost: MicroDollars,
+        controller_state: Option<serde_json::Value>,
     ) -> Result<Self> {
         let (last_event_offset, last_event_sha256) = journal
             .last_event()
@@ -221,6 +249,7 @@ impl Checkpoint {
             blocker_ids,
             stale_changeset_ids,
             cost,
+            controller_state,
         })
     }
 }
