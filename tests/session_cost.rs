@@ -1,6 +1,8 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Barrier},
+    thread,
 };
 
 use phemius::{
@@ -8,7 +10,10 @@ use phemius::{
     cost::{BudgetLedger, MicroDollars, Price, Usage},
     domain::{EntityKind, prefixed_uuid},
     project::{Project, ProjectConfig},
-    session::{Checkpoint, CompactionDecision, SessionEvent, SessionJournal},
+    session::{
+        Checkpoint, CheckpointDurabilityUnknown, CompactionDecision, SessionEvent, SessionJournal,
+        TestCheckpointInterruption,
+    },
 };
 use rstest::*;
 
@@ -81,10 +86,36 @@ fn compaction_fails_closed_when_the_context_is_smaller_than_the_reserve() {
 
 #[rstest]
 fn three_parallel_critic_reservations_cannot_cross_chapter_cap() {
-    let ledger = BudgetLedger::new(micros(9_000_000), micros(100_000_000));
+    let directory = TestDir::new("parallel-reservations");
+    let path = directory.path().join("costs.jsonl");
+    let ledger =
+        BudgetLedger::open_with_costs(&path, micros(9_000_000), micros(100_000_000)).unwrap();
+    let barrier = Arc::new(Barrier::new(4));
+    let workers = (0..3)
+        .map(|_| {
+            let ledger = ledger.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                ledger.reserve("chapter_1", micros(400_000)).is_ok()
+            })
+        })
+        .collect::<Vec<_>>();
 
-    assert!(ledger.reserve("chapter_1", micros(400_000)).is_ok());
-    assert!(ledger.reserve("chapter_1", micros(700_000)).is_err());
+    barrier.wait();
+    let successes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .filter(|succeeded| *succeeded)
+        .count();
+
+    assert_eq!(successes, 2);
+    drop(ledger);
+
+    let replayed =
+        BudgetLedger::open_with_costs(&path, micros(9_000_000), micros(100_000_000)).unwrap();
+    assert_eq!(replayed.reserve("chapter_1", micros(200_000)).is_ok(), true);
+    assert_eq!(replayed.reserve("chapter_1", micros(1)).is_err(), true);
 }
 
 #[rstest]
@@ -117,6 +148,26 @@ fn durable_reservations_replay_settlement_and_emit_each_chapter_warning_once() {
         .reserve("chapter_1", micros(1_000_000))
         .unwrap();
     assert_eq!(third.warning_required, false);
+}
+
+#[rstest]
+fn failed_reservation_persistence_does_not_consume_the_chapter_warning() {
+    let ledger = BudgetLedger::new(MicroDollars::zero(), MicroDollars::zero());
+
+    assert_eq!(
+        ledger
+            .reserve_with_persist_failure_for_test("chapter_1", micros(6_000_000))
+            .is_err(),
+        true
+    );
+
+    assert_eq!(
+        ledger
+            .reserve("chapter_1", micros(6_000_000))
+            .unwrap()
+            .warning_required,
+        true
+    );
 }
 
 #[rstest]
@@ -153,6 +204,77 @@ fn checkpoint_is_anchored_to_the_last_durable_event() {
 }
 
 #[rstest]
+fn stale_handle_cannot_replace_a_checkpoint_after_another_handle_appends() {
+    let directory = TestDir::new("stale-checkpoint");
+    let journal_path = directory.path().join("events.jsonl");
+    let mut first = SessionJournal::create(&journal_path).unwrap();
+    first
+        .append(SessionEvent::UserInstruction {
+            text: "first event".into(),
+        })
+        .unwrap();
+    let stale_checkpoint = checkpoint_for(&first, micros(1));
+    let second_path = journal_path.clone();
+
+    thread::spawn(move || {
+        let mut second = SessionJournal::open(second_path).unwrap();
+        second
+            .append(SessionEvent::UserInstruction {
+                text: "second event".into(),
+            })
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+
+    let checkpoint_path = directory.path().join("checkpoint.json");
+    let error = first
+        .write_checkpoint(&checkpoint_path, &stale_checkpoint)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "checkpoint does not match the current session journal"
+    );
+    assert_eq!(checkpoint_path.exists(), false);
+}
+
+#[rstest]
+fn post_rename_checkpoint_sync_failure_is_durability_unknown_with_a_valid_checkpoint() {
+    let directory = TestDir::new("checkpoint-durability-unknown");
+    let journal_path = directory.path().join("events.jsonl");
+    let mut journal = SessionJournal::create(&journal_path).unwrap();
+    journal
+        .append(SessionEvent::UserInstruction {
+            text: "outline".into(),
+        })
+        .unwrap();
+    let previous = checkpoint_for(&journal, micros(1));
+    let replacement = checkpoint_for(&journal, micros(2));
+    let checkpoint_path = directory.path().join("checkpoint.json");
+    journal
+        .write_checkpoint(&checkpoint_path, &previous)
+        .unwrap();
+
+    let error = journal
+        .write_checkpoint_with_test_interruption(
+            &checkpoint_path,
+            &replacement,
+            TestCheckpointInterruption::AfterRenameBeforeDirectorySync,
+        )
+        .unwrap_err();
+    let durability_unknown = error.downcast_ref::<CheckpointDurabilityUnknown>().unwrap();
+
+    assert_eq!(
+        durability_unknown.checkpoint_path(),
+        checkpoint_path.as_path()
+    );
+    assert_eq!(
+        serde_json::from_slice::<Checkpoint>(&fs::read(&checkpoint_path).unwrap()).unwrap(),
+        replacement
+    );
+}
+
+#[rstest]
 fn session_records_do_not_change_the_canon_root_hash() {
     let root = TestDir::new("session-canon-boundary");
     fs::create_dir_all(root.path().join(".phemius/records/sessions/run_1")).unwrap();
@@ -184,6 +306,20 @@ fn session_records_do_not_change_the_canon_root_hash() {
 
 fn micros(value: u64) -> MicroDollars {
     MicroDollars::new(value)
+}
+
+fn checkpoint_for(journal: &SessionJournal, cost: MicroDollars) -> Checkpoint {
+    Checkpoint::from_journal(
+        journal,
+        Vec::new(),
+        vec!["canon-hash".into()],
+        vec!["source-hash".into()],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        cost,
+    )
+    .unwrap()
 }
 
 struct TestDir {

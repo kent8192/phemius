@@ -25,14 +25,17 @@ const RUN_CAP: MicroDollars = MicroDollars(120 * MICROS_PER_DOLLAR);
 pub struct MicroDollars(u64);
 
 impl MicroDollars {
+    /// Creates an amount from whole microdollars.
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
+    /// Returns the zero-cost amount.
     pub const fn zero() -> Self {
         Self(0)
     }
 
+    /// Returns the amount as whole microdollars.
     pub const fn as_u64(self) -> u64 {
         self.0
     }
@@ -56,7 +59,9 @@ impl MicroDollars {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Price {
+    /// Dollar price converted to microdollars per million input tokens.
     pub input_per_million: MicroDollars,
+    /// Dollar price converted to microdollars per million output tokens.
     pub output_per_million: MicroDollars,
 }
 
@@ -80,11 +85,14 @@ impl Price {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
+    /// Count of input tokens charged by the model.
     pub input_tokens: u64,
+    /// Count of output tokens charged by the model.
     pub output_tokens: u64,
 }
 
 impl Usage {
+    /// Creates a usage record from input and output token counts.
     pub const fn new(input_tokens: u64, output_tokens: u64) -> Self {
         Self {
             input_tokens,
@@ -97,9 +105,13 @@ impl Usage {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reservation {
+    /// Stable request ID used for explicit settlement.
     pub request_id: EntityId,
+    /// Chapter charged for this reservation.
     pub chapter_id: String,
+    /// Maximum held cost until settlement or reconciliation.
     pub reserved_cost: MicroDollars,
+    /// Whether this reservation crossed the one-time chapter warning threshold.
     pub warning_required: bool,
 }
 
@@ -228,6 +240,7 @@ impl BudgetLedger {
         Self::open_with_costs(path, MicroDollars::zero(), MicroDollars::zero())
     }
 
+    /// Opens a durable ledger with prior chapter and run costs supplied by a checkpoint.
     pub fn open_with_costs(
         path: impl AsRef<Path>,
         chapter_cost: MicroDollars,
@@ -267,15 +280,41 @@ impl BudgetLedger {
 
     /// Holds the maximum request cost before any network operation starts.
     pub fn reserve(&self, chapter_id: &str, maximum_cost: MicroDollars) -> Result<Reservation> {
+        self.reserve_inner(chapter_id, maximum_cost, false)
+    }
+
+    /// Injects a pre-write persistence failure for an integration regression test.
+    #[doc(hidden)]
+    pub fn reserve_with_persist_failure_for_test(
+        &self,
+        chapter_id: &str,
+        maximum_cost: MicroDollars,
+    ) -> Result<Reservation> {
+        self.reserve_inner(chapter_id, maximum_cost, true)
+    }
+
+    fn reserve_inner(
+        &self,
+        chapter_id: &str,
+        maximum_cost: MicroDollars,
+        force_persist_failure: bool,
+    ) -> Result<Reservation> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("cost ledger lock poisoned"))?;
+        let warning_was_emitted = state.warnings.contains(chapter_id);
         let reservation = state.reserve(chapter_id, maximum_cost)?;
-        if let Err(error) = self.persist(LedgerEvent::Reserved {
-            reservation: reservation.clone(),
-        }) {
+        if let Err(error) = self.persist(
+            LedgerEvent::Reserved {
+                reservation: reservation.clone(),
+            },
+            force_persist_failure,
+        ) {
             state.reservations.remove(reservation.request_id.as_str());
+            if reservation.warning_required && !warning_was_emitted {
+                state.warnings.remove(chapter_id);
+            }
             return Err(error);
         }
         Ok(reservation)
@@ -293,10 +332,13 @@ impl BudgetLedger {
             .cloned()
             .ok_or_else(|| anyhow!("reservation is unknown"))?;
         state.settle(&reservation.request_id, actual_cost)?;
-        if let Err(error) = self.persist(LedgerEvent::Settled {
-            request_id: reservation.request_id.clone(),
-            actual_cost,
-        }) {
+        if let Err(error) = self.persist(
+            LedgerEvent::Settled {
+                request_id: reservation.request_id.clone(),
+                actual_cost,
+            },
+            false,
+        ) {
             state
                 .reservations
                 .insert(reservation.request_id.as_str().into(), original);
@@ -323,7 +365,10 @@ impl BudgetLedger {
         Ok(())
     }
 
-    fn persist(&self, event: LedgerEvent) -> Result<()> {
+    fn persist(&self, event: LedgerEvent, force_failure: bool) -> Result<()> {
+        if force_failure {
+            return Err(anyhow!("simulated cost ledger persistence failure"));
+        }
         let Some(journal) = &self.journal else {
             return Ok(());
         };
