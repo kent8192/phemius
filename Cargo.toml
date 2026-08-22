@@ -1,0 +1,29 @@
+[package]
+name = "phemius"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+cap-std = "4"
+clap = { version = "4.6", features = ["derive", "env"] }
+directories = "6"
+eventsource-stream = "0.2"
+futures-util = "0.3"
+htmd = "0.5"
+pdf-extract = "0.12"
+process-wrap = "9"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+rustyline = { version = "18", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+similar = "2"
+tokio = { version = "~1.51", features = ["macros", "rt-multi-thread", "process", "signal", "sync", "time"] }
+toml = "1.1"
+unicode-segmentation = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+yaml_serde = "0.10"
