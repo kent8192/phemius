@@ -200,6 +200,8 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     /// Builds a checkpoint anchored to the current last durable journal event.
+    // The constructor mirrors every durable checkpoint field for explicit replay semantics.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_journal(
         journal: &SessionJournal,
         context_epochs: Vec<ContextEpoch>,
@@ -224,6 +226,8 @@ impl Checkpoint {
     }
 
     /// Builds a checkpoint with a typed controller reconstruction payload.
+    // The constructor mirrors every durable checkpoint field for explicit replay semantics.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_journal_with_state(
         journal: &SessionJournal,
         context_epochs: Vec<ContextEpoch>,

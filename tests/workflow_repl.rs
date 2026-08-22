@@ -453,7 +453,7 @@ async fn a_reopened_controller_restores_workflow_state_before_generation() {
     }
     let mut reopened = RunController::fixture_with_project(project, ScriptedModel::new([]));
     assert!(reopened.resume_checkpoint().unwrap().is_some());
-    assert_eq!(reopened.recovery_required(), false);
+    assert!(!reopened.recovery_required());
     assert_eq!(
         reopened.chapter_run(chapter_id.as_str()).unwrap().state,
         ChapterState::Approvable

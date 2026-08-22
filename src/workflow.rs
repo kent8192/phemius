@@ -2732,6 +2732,8 @@ impl ReplMode {
     }
 }
 
+// The change builder keeps artifact, receipt, and dependency inputs explicit for atomic approval.
+#[allow(clippy::too_many_arguments)]
 fn prepare_project_change(
     project: &Project,
     changeset_id: &crate::domain::EntityId,
@@ -2833,7 +2835,7 @@ fn prepare_project_change(
             format!(
                 "{}\n\n# compiled context\n{}\n\n# correction receipts\n{}",
                 context_receipt
-                    .map(|receipt| serde_json::to_string(receipt))
+                    .map(serde_json::to_string)
                     .transpose()
                     .context("failed to serialize context receipt")?
                     .unwrap_or_default(),

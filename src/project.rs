@@ -354,10 +354,10 @@ impl StagingDirectory {
             let source = self
                 .path()
                 .join(target.file_name().expect("moved path has a file name"));
-            if let Err(error) = rename_without_replacing(target, &source) {
-                if failure.is_none() {
-                    failure = Some(error);
-                }
+            if let Err(error) = rename_without_replacing(target, &source)
+                && failure.is_none()
+            {
+                failure = Some(error);
             }
         }
         if let Some(error) = failure {

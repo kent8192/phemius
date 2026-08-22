@@ -27,7 +27,7 @@ fn receipt_accounts_for_every_applicable_source_once() {
     let raw = Snapshot::from_text(SourceKind::PlainText, b"required source", false).unwrap();
     let compacted =
         Snapshot::from_text(SourceKind::Markdown, b"long compactable source", false).unwrap();
-    let optional = Snapshot::from_text(SourceKind::PlainText, &vec![b'x'; 1_000], false).unwrap();
+    let optional = Snapshot::from_text(SourceKind::PlainText, vec![b'x'; 1_000], false).unwrap();
     let raw_id = prefixed_uuid(EntityKind::Source);
     let compacted_id = prefixed_uuid(EntityKind::Source);
     let optional_id = prefixed_uuid(EntityKind::Source);
@@ -104,7 +104,7 @@ fn receipt_accounts_for_every_applicable_source_once() {
 
 #[rstest]
 fn required_raw_overflow_stops_instead_of_truncating() {
-    let snapshot = Snapshot::from_text(SourceKind::PlainText, &vec![b'x'; 120], false).unwrap();
+    let snapshot = Snapshot::from_text(SourceKind::PlainText, vec![b'x'; 120], false).unwrap();
     let source_id = prefixed_uuid(EntityKind::Source);
     let manifest = SourceManifest::new(vec![SourceEntry::from_snapshot(
         source_id.clone(),
@@ -167,7 +167,7 @@ fn required_raw_budget_uses_a_conservative_byte_upper_bound() {
 
 #[rstest]
 fn missing_compactable_summary_stops_with_a_complete_failure_receipt() {
-    let compactable = Snapshot::from_text(SourceKind::PlainText, &vec![b'x'; 500], false).unwrap();
+    let compactable = Snapshot::from_text(SourceKind::PlainText, vec![b'x'; 500], false).unwrap();
     let optional = Snapshot::from_text(SourceKind::PlainText, b"optional", false).unwrap();
     let compactable_id = prefixed_uuid(EntityKind::Source);
     let optional_id = prefixed_uuid(EntityKind::Source);
@@ -763,7 +763,7 @@ fn ngram_overlap_survives_non_cjk_insertions_without_splitting_the_run() {
 #[rstest]
 fn copy_gate_ignores_format_characters_between_cjk_graphemes() {
     let source = "あ".repeat(160);
-    let manuscript = format!("あ\u{200b}").repeat(160);
+    let manuscript = "あ\u{200b}".to_string().repeat(160);
 
     let findings = scan_near_copy(
         &manuscript,

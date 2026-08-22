@@ -40,7 +40,7 @@ fn crash_truncated_last_line_is_repaired_but_interior_corruption_stops() {
     let journal = SessionJournal::open(&last_path).unwrap();
 
     assert_eq!(journal.events().len(), 1);
-    assert_eq!(fs::read(&last_path).unwrap().ends_with(b"\n"), true);
+    assert!(fs::read(&last_path).unwrap().ends_with(b"\n"));
 
     let middle = TestDir::new("corrupt-middle");
     let middle_path = middle.path().join("events.jsonl");
@@ -67,7 +67,7 @@ fn crash_truncated_last_line_is_repaired_but_interior_corruption_stops() {
 fn compaction_preserves_fifteen_thousand_token_tail() {
     let decision = CompactionDecision::for_usage(1_030_000, 1_048_576, 12_000);
 
-    assert_eq!(decision.required, true);
+    assert!(decision.required);
     assert_eq!(decision.preserve_recent_tokens, 15_000);
 }
 
@@ -76,15 +76,15 @@ fn compaction_uses_the_larger_output_reserve_at_the_exact_boundary() {
     let at_boundary = CompactionDecision::for_usage(1_028_576, 1_048_576, 12_000);
     let after_boundary = CompactionDecision::for_usage(1_028_577, 1_048_576, 12_000);
 
-    assert_eq!(at_boundary.required, false);
-    assert_eq!(after_boundary.required, true);
+    assert!(!at_boundary.required);
+    assert!(after_boundary.required);
 }
 
 #[rstest]
 fn compaction_fails_closed_when_the_context_is_smaller_than_the_reserve() {
     let decision = CompactionDecision::for_usage(0, 10_000, 12_000);
 
-    assert_eq!(decision.required, true);
+    assert!(decision.required);
 }
 
 #[rstest]
@@ -117,8 +117,8 @@ fn three_parallel_critic_reservations_cannot_cross_chapter_cap() {
 
     let replayed =
         BudgetLedger::open_with_costs(&path, micros(9_000_000), micros(100_000_000)).unwrap();
-    assert_eq!(replayed.reserve("chapter_1", micros(200_000)).is_ok(), true);
-    assert_eq!(replayed.reserve("chapter_1", micros(1)).is_err(), true);
+    assert!(replayed.reserve("chapter_1", micros(200_000)).is_ok());
+    assert!(replayed.reserve("chapter_1", micros(1)).is_err());
 }
 
 #[rstest]
@@ -136,40 +136,38 @@ fn durable_reservations_replay_settlement_and_emit_each_chapter_warning_once() {
     let ledger = BudgetLedger::open(&path).unwrap();
     let first = ledger.reserve("chapter_1", micros(4_000_000)).unwrap();
 
-    assert_eq!(first.warning_required, false);
+    assert!(!first.warning_required);
     ledger.settle(&first, micros(1_000_000)).unwrap();
     drop(ledger);
 
     let replayed = BudgetLedger::open(&path).unwrap();
     let second = replayed.reserve("chapter_1", micros(5_000_000)).unwrap();
 
-    assert_eq!(second.warning_required, true);
+    assert!(second.warning_required);
     drop(replayed);
 
     let replayed_again = BudgetLedger::open(&path).unwrap();
     let third = replayed_again
         .reserve("chapter_1", micros(1_000_000))
         .unwrap();
-    assert_eq!(third.warning_required, false);
+    assert!(!third.warning_required);
 }
 
 #[rstest]
 fn failed_reservation_persistence_does_not_consume_the_chapter_warning() {
     let ledger = BudgetLedger::new(MicroDollars::zero(), MicroDollars::zero());
 
-    assert_eq!(
+    assert!(
         ledger
             .reserve_with_persist_failure_for_test("chapter_1", micros(6_000_000))
-            .is_err(),
-        true
+            .is_err()
     );
 
-    assert_eq!(
+    assert!(
         ledger
             .reserve("chapter_1", micros(6_000_000))
             .unwrap()
-            .warning_required,
-        true
+            .warning_required
     );
 }
 
@@ -189,21 +187,17 @@ fn post_write_reservation_failure_keeps_the_durable_hold_and_freezes_the_ledger(
     let durability_unknown = error.downcast_ref::<CostDurabilityUnknown>().unwrap();
 
     assert_eq!(durability_unknown.stage(), CostPersistenceStage::Write);
-    assert_eq!(ledger.reserve("chapter_1", micros(1)).is_err(), true);
-    assert_eq!(fs::read(&path).unwrap().ends_with(b"\n"), true);
+    assert!(ledger.reserve("chapter_1", micros(1)).is_err());
+    assert!(fs::read(&path).unwrap().ends_with(b"\n"));
     drop(ledger);
 
     let replayed = BudgetLedger::open(&path).unwrap();
-    assert_eq!(
-        replayed.reserve("chapter_1", micros(5_000_000)).is_err(),
-        true
-    );
-    assert_eq!(
-        replayed
+    assert!(replayed.reserve("chapter_1", micros(5_000_000)).is_err());
+    assert!(
+        !replayed
             .reserve("chapter_1", micros(4_000_000))
             .unwrap()
-            .warning_required,
-        false
+            .warning_required
     );
 }
 
@@ -272,7 +266,7 @@ fn stale_handle_cannot_replace_a_checkpoint_after_another_handle_appends() {
         error.to_string(),
         "checkpoint does not match the current session journal"
     );
-    assert_eq!(checkpoint_path.exists(), false);
+    assert!(!checkpoint_path.exists());
 }
 
 #[rstest]

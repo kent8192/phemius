@@ -5,7 +5,7 @@ use phemius::eval::{
 };
 
 fn grade_fixture(outcome: Outcome) -> EvalReport {
-    Grader::default().grade(outcome)
+    Grader.grade(outcome)
 }
 
 #[test]

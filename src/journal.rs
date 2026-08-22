@@ -306,7 +306,7 @@ fn prepare_transaction(root: &Dir, runtime: &Dir, change: &Changeset) -> Result<
             .join(format!("{}.json", change.id.as_str())),
     };
 
-    let result = (|| {
+    (|| {
         let mut entries = Vec::with_capacity(change.operations.len());
         let mut targets = Vec::with_capacity(change.operations.len());
         for (index, operation) in change.operations.iter().enumerate() {
@@ -338,8 +338,7 @@ fn prepare_transaction(root: &Dir, runtime: &Dir, change: &Changeset) -> Result<
             targets,
             approval,
         })
-    })();
-    result
+    })()
 }
 
 fn snapshot_operation(
@@ -479,14 +478,14 @@ fn durability_unknown_resolution(
 fn recover_pending_locked(root: &Dir, runtime: &Dir) -> Result<RecoveryOutcome> {
     let transactions = load_transactions(root, runtime)?;
     for transaction in &transactions {
-        if transaction.journal.state == JournalState::Committed {
-            if let Err(error) = verify_committed_approval(transaction) {
-                return Err(ManualResolutionRequired::committed_approval(
-                    &transaction.journal.changeset_id,
-                    error,
-                )
-                .into());
-            }
+        if transaction.journal.state == JournalState::Committed
+            && let Err(error) = verify_committed_approval(transaction)
+        {
+            return Err(ManualResolutionRequired::committed_approval(
+                &transaction.journal.changeset_id,
+                error,
+            )
+            .into());
         }
     }
     let prepared = transactions

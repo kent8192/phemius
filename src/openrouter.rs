@@ -364,8 +364,8 @@ impl SseAccumulator {
             .ok_or_else(|| ModelFailure::stopped("OpenRouter completion has no choice zero"))?;
         let tool_calls = choice
             .tools
-            .iter()
-            .map(|(_, call)| {
+            .values()
+            .map(|call| {
                 let name = call
                     .name
                     .clone()

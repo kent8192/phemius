@@ -278,10 +278,7 @@ pub fn run_eval(fixture_root: &Path) -> Result<EvalReport> {
         statuses.push(graded.status);
         messages.extend(graded.messages);
     }
-    let status = if statuses
-        .iter()
-        .any(|status| *status == EvalStatus::Inconclusive)
-    {
+    let status = if statuses.contains(&EvalStatus::Inconclusive) {
         EvalStatus::Inconclusive
     } else if statuses.iter().all(|status| *status == EvalStatus::Pass) {
         EvalStatus::Pass

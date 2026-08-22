@@ -733,6 +733,8 @@ fn word_windows_for_runs(runs: &[WordCharRun], word_count: usize) -> Vec<Indexed
     windows
 }
 
+// The scanner keeps independent slices and budgets explicit to preserve the bounded-search contract.
+#[allow(clippy::too_many_arguments)]
 fn scan_ngram_witness(
     manuscript_runs: &[&[Token]],
     manuscript_windows: &[IndexedWindow],

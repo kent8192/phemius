@@ -1228,11 +1228,11 @@ fn collect_directory_into(
         }
         if file_type.is_dir() {
             let child = open_directory_at(directory, &entry.file_name())?;
-            collect_directory_into(&child, &relative.join(&entry.file_name()), files)?;
+            collect_directory_into(&child, &relative.join(entry.file_name()), files)?;
         } else if file_type.is_file() {
             let (_, fingerprint) =
                 read_open_regular_file(open_file_at(directory, &entry.file_name())?)?;
-            let child_relative = relative.join(&entry.file_name());
+            let child_relative = relative.join(entry.file_name());
             if files.insert(child_relative, fingerprint).is_some() {
                 return Err(SourceError::new(
                     SourceErrorKind::InvalidGrant,

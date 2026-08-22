@@ -607,6 +607,8 @@ impl ContextCompiler {
         self
     }
 
+    // The structured receipt is intentionally retained on failures so missing source coverage is auditable.
+    #[allow(clippy::result_large_err)]
     pub fn compile(
         &self,
         request: &ContextRequest,
@@ -829,6 +831,8 @@ impl ContextCompiler {
         })
     }
 
+    // The structured receipt is intentionally retained on failures so transmission failures are auditable.
+    #[allow(clippy::result_large_err)]
     pub fn handoff(
         &self,
         mut context: CompiledContext,
@@ -988,6 +992,8 @@ impl ContextCompiler {
         .then_some(summary)
     }
 
+    // The structured receipt is intentionally retained on failures so coverage failures are auditable.
+    #[allow(clippy::result_large_err)]
     fn fail(
         &self,
         message: String,

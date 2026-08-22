@@ -574,7 +574,7 @@ fn validates_object(schema: &serde_json::Map<String, Value>, value: &Value) -> b
             Some(property) => validates_schema(property, value),
             None => schema
                 .get("additionalProperties")
-                .map_or(true, |additional| validates_schema(additional, value)),
+                .is_none_or(|additional| validates_schema(additional, value)),
         }
     })
 }

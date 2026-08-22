@@ -1024,7 +1024,7 @@ fn validate_operations_in(
                     format!("canon file is missing: {}", operation.path.display()),
                 )
             })?;
-            if sha256_bytes(&bytes) != *expected {
+            if sha256_bytes(bytes) != *expected {
                 return validation_error(
                     ValidationErrorKind::HashMismatch,
                     format!("canon hash mismatch for {}", operation.path.display()),
