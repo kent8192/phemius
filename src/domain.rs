@@ -22,6 +22,12 @@ pub enum EntityKind {
     Changeset,
     Finding,
     Run,
+    World,
+    Timeline,
+    Foreshadowing,
+    Style,
+    Rule,
+    Structure,
 }
 
 impl EntityKind {
@@ -37,10 +43,29 @@ impl EntityKind {
             Self::Changeset => "change",
             Self::Finding => "finding",
             Self::Run => "run",
+            Self::World => "world",
+            Self::Timeline => "timeline",
+            Self::Foreshadowing => "foreshadowing",
+            Self::Style => "style",
+            Self::Rule => "rule",
+            Self::Structure => "structure",
         }
     }
 }
 
 pub fn prefixed_uuid(kind: EntityKind) -> EntityId {
     EntityId(format!("{}_{}", kind.prefix(), Uuid::now_v7()))
+}
+
+pub fn is_prefixed_uuid(value: &str, kind: EntityKind) -> bool {
+    let Some(uuid_text) = value
+        .strip_prefix(kind.prefix())
+        .and_then(|value| value.strip_prefix('_'))
+    else {
+        return false;
+    };
+    let Ok(uuid) = Uuid::parse_str(uuid_text) else {
+        return false;
+    };
+    uuid.get_version_num() == 7 && uuid.hyphenated().to_string() == uuid_text
 }

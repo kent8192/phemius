@@ -1,6 +1,8 @@
+use std::{fs, io::Cursor, path::PathBuf};
+
 use clap::Parser;
 use phemius::{
-    cli::{Cli, ReplCommand, TopLevelCommand, parse_repl_command},
+    cli::{Cli, ReplCommand, TopLevelCommand, parse_repl_command, run_with_input},
     domain::{EntityKind, prefixed_uuid},
 };
 
@@ -90,4 +92,32 @@ fn dollar_prefixed_skill_selection_is_explicit() {
             name: "writer".into()
         }
     );
+}
+
+#[tokio::test]
+async fn init_reads_a_nonempty_title_and_creates_the_project() {
+    let root = std::env::temp_dir().join(format!("phemius-cli-init-{}", uuid::Uuid::now_v7()));
+    let cli = Cli {
+        command: Some(TopLevelCommand::Init { path: root.clone() }),
+        project: PathBuf::from("."),
+    };
+
+    run_with_input(cli, &mut Cursor::new("作品名\n"))
+        .await
+        .unwrap();
+
+    assert!(root.join("project.toml").is_file());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn init_rejects_an_empty_title_without_creating_a_project() {
+    let root = std::env::temp_dir().join(format!("phemius-cli-empty-{}", uuid::Uuid::now_v7()));
+    let cli = Cli {
+        command: Some(TopLevelCommand::Init { path: root.clone() }),
+        project: PathBuf::from("."),
+    };
+
+    assert!(run_with_input(cli, &mut Cursor::new(" \n")).await.is_err());
+    assert!(!root.exists());
 }

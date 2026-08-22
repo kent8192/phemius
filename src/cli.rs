@@ -1,7 +1,12 @@
-use std::path::PathBuf;
+use std::{
+    io::{self, BufRead, Write},
+    path::PathBuf,
+};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+
+use crate::project::{InitAnswers, initialize_project};
 
 #[derive(Parser, Debug)]
 #[command(name = "phemius", version)]
@@ -129,7 +134,25 @@ pub fn parse_repl_command(input: &str) -> Result<ReplCommand> {
     }
 }
 
-pub async fn run(_cli: Cli) -> Result<()> {
+pub async fn run(cli: Cli) -> Result<()> {
+    if matches!(cli.command, Some(TopLevelCommand::Init { .. })) {
+        eprint!("Project title: ");
+        io::stderr()
+            .flush()
+            .context("failed to prompt for project title")?;
+    }
+    let stdin = io::stdin();
+    run_with_input(cli, &mut stdin.lock()).await
+}
+
+pub async fn run_with_input(cli: Cli, input: &mut impl BufRead) -> Result<()> {
+    if let Some(TopLevelCommand::Init { path }) = cli.command {
+        let mut title = String::new();
+        input
+            .read_line(&mut title)
+            .context("failed to read project title")?;
+        initialize_project(&path, &InitAnswers::minimal(title.trim()))?;
+    }
     Ok(())
 }
 
