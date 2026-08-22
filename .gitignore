@@ -1,0 +1,5 @@
+/target/
+/.superpowers/
+/.phemius/runtime/
+/.phemius/local.toml
+.DS_Store
