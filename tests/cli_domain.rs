@@ -8,8 +8,17 @@ use std::{
 
 use clap::Parser;
 use phemius::{
-    cli::{Cli, ReplCommand, TopLevelCommand, parse_repl_command, run_with_input},
-    domain::{EntityKind, prefixed_uuid},
+    changeset::approval_record_path,
+    cli::{
+        Cli, ReplCommand, TopLevelCommand, parse_repl_command, run_with_input,
+        run_with_input_with_backend,
+    },
+    domain::{EntityId, EntityKind, prefixed_uuid},
+    model::{ModelBackend, ModelResponse, ScriptedModel},
+    plot::{MacroBeat, StoryBox, StoryChapter, StoryPart, StoryScene, StoryStructure},
+    project::{InitAnswers, Project, initialize_project},
+    repl::{Repl, ReplOutcome},
+    workflow::{LengthUnit, RunController},
 };
 
 #[test]
@@ -156,6 +165,109 @@ fn binary_initializes_the_current_directory_without_replacing_it() {
     assert!(root.path().join("project.toml").is_file());
     assert!(root.path().join("前提/作品.md").is_file());
     assert_eq!(fs::metadata(root.path()).unwrap().ino(), inode);
+}
+
+#[test]
+fn project_open_canonicalizes_root_and_validates_work_id() {
+    let root = TestDir::new("project-open");
+    initialize_project(root.path(), &InitAnswers::minimal("作品")).unwrap();
+
+    let opened = Project::open(root.path()).unwrap();
+    assert_eq!(opened.root, fs::canonicalize(root.path()).unwrap());
+    assert_eq!(opened.config.format_version, 1);
+    assert!(opened.config.work_id.as_str().starts_with("work_"));
+
+    fs::write(
+        root.path().join("project.toml"),
+        "format_version = 1\nwork_id = \"chapter_not-a-work\"\n",
+    )
+    .unwrap();
+    assert!(Project::open(root.path()).is_err());
+}
+
+#[tokio::test]
+async fn normal_project_repl_is_attached_to_a_controller() {
+    let root = TestDir::new("project-repl");
+    initialize_project(root.path(), &InitAnswers::minimal("作品")).unwrap();
+    let cli = Cli {
+        command: None,
+        project: root.path().to_path_buf(),
+    };
+
+    let repl = run_with_input_with_backend(
+        cli,
+        &mut Cursor::new(Vec::<u8>::new()),
+        ModelBackend::Scripted(phemius::model::ScriptedModel::new([])),
+    )
+    .await
+    .unwrap();
+    assert!(repl.has_controller());
+}
+
+#[tokio::test]
+async fn trusted_cli_write_then_approve_applies_the_project_changeset() {
+    let root = TestDir::new("cli-write-approve");
+    let project = initialize_project(root.path(), &InitAnswers::minimal("作品")).unwrap();
+    let part_id = prefixed_uuid(EntityKind::Part);
+    let chapter_id = prefixed_uuid(EntityKind::Chapter);
+    let scene_id = prefixed_uuid(EntityKind::Scene);
+    let box_id = prefixed_uuid(EntityKind::Box);
+    let structure = StoryStructure {
+        parts: vec![StoryPart::new(part_id.as_str(), 1)],
+        chapters: vec![StoryChapter::new(chapter_id.as_str(), part_id.as_str(), 1)],
+        scenes: vec![StoryScene::new(scene_id.as_str(), chapter_id.as_str(), 1)],
+        boxes: vec![StoryBox::new(box_id.as_str(), scene_id.as_str(), 1)],
+        macro_beats: vec![MacroBeat::new("beat_1", 1, [scene_id.as_str()])],
+    };
+    let backend = ScriptedModel::new([
+        Ok(ModelResponse {
+            text: "plan".into(),
+            tool_calls: Vec::new(),
+        }),
+        Ok(ModelResponse {
+            text: "本文".into(),
+            tool_calls: Vec::new(),
+        }),
+        Ok(ModelResponse {
+            text: String::new(),
+            tool_calls: Vec::new(),
+        }),
+    ]);
+    let mut controller = RunController::with_project(project.clone(), backend.into());
+    controller.set_preflight(true, true, true);
+    controller.set_structure(structure).unwrap();
+    controller.set_plot_framework("hakogaki").unwrap();
+    controller
+        .set_length_bounds(LengthUnit::Graphemes, 0, usize::MAX)
+        .unwrap();
+    let mut repl = Repl::with_controller(controller);
+
+    let write = repl
+        .handle_async(&format!("/write {}", chapter_id.as_str()))
+        .await
+        .unwrap();
+    let ReplOutcome::Message(write_message) = write else {
+        panic!("/write did not return a candidate message: {write:?}");
+    };
+    let changeset_id = write_message
+        .split_whitespace()
+        .skip_while(|word| *word != "/approve")
+        .nth(1)
+        .expect("write message has changeset ID");
+    assert!(write_message.contains("candidate"));
+
+    let approved = repl.handle(&format!("/approve {changeset_id}")).unwrap();
+    assert_eq!(
+        approved,
+        ReplOutcome::Message(format!("approved {changeset_id}"))
+    );
+    assert!(
+        root.path()
+            .join(format!("本文/{}.md", chapter_id.as_str()))
+            .is_file()
+    );
+    let changeset_entity = EntityId::from_validated(changeset_id.to_owned()).unwrap();
+    assert!(approval_record_path(root.path(), &changeset_entity).is_file());
 }
 
 struct TestDir(PathBuf);

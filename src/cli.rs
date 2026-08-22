@@ -6,8 +6,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::project::{InitAnswers, initialize_project};
 use crate::repl::{Repl, ReplOutcome};
+use crate::{
+    model::ModelBackend,
+    openrouter::OpenRouterClient,
+    project::{InitAnswers, Project, initialize_project},
+    workflow::RunController,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "phemius", version)]
@@ -152,24 +157,72 @@ pub async fn run_with_input(cli: Cli, input: &mut impl BufRead) -> Result<()> {
         input
             .read_line(&mut title)
             .context("failed to read project title")?;
-        initialize_project(path, &InitAnswers::minimal(title.trim()))?;
+        let project = initialize_project(path, &InitAnswers::minimal(title.trim()))?;
+        let backend = production_backend()?;
+        let _ = run_project_repl(project, backend, input).await?;
     } else if cli.command.is_none() {
-        let mut repl = Repl::new();
-        for line in input.lines() {
-            let line = line.context("failed to read REPL input")?;
-            match repl.handle_async(&line).await? {
-                ReplOutcome::Quit => break,
-                ReplOutcome::Continue => {}
-                ReplOutcome::Message(message)
-                | ReplOutcome::Coordinator(message)
-                | ReplOutcome::ReadOnly(message)
-                | ReplOutcome::AgentText(message)
-                | ReplOutcome::AwaitingConfirmation(message)
-                | ReplOutcome::Error(message) => println!("{message}"),
-            }
-        }
+        let project = Project::open(&cli.project)?;
+        let backend = production_backend()?;
+        let _ = run_project_repl(project, backend, input).await?;
     }
     Ok(())
+}
+
+/// Runs a project REPL with a caller-supplied backend for deterministic evaluation.
+///
+/// This is hidden from generated API documentation because production callers should use
+/// [`run`] and the OpenRouter backend.  It keeps CLI integration tests offline without adding a
+/// second authority path: the returned REPL still routes every trusted action through its
+/// controller.
+#[doc(hidden)]
+pub async fn run_with_input_with_backend(
+    cli: Cli,
+    input: &mut impl BufRead,
+    backend: ModelBackend,
+) -> Result<Repl> {
+    let project = match cli.command {
+        Some(TopLevelCommand::Init { path }) => {
+            let mut title = String::new();
+            input
+                .read_line(&mut title)
+                .context("failed to read project title")?;
+            initialize_project(&path, &InitAnswers::minimal(title.trim()))?
+        }
+        None => Project::open(&cli.project)?,
+        Some(TopLevelCommand::Eval { .. }) => {
+            bail!("eval does not start an interactive project REPL")
+        }
+    };
+    run_project_repl(project, backend, input).await
+}
+
+fn production_backend() -> Result<ModelBackend> {
+    let client = OpenRouterClient::from_environment()
+        .map_err(anyhow::Error::new)
+        .context("failed to initialize the OpenRouter model client")?;
+    Ok(ModelBackend::OpenRouter(client))
+}
+
+async fn run_project_repl(
+    project: Project,
+    backend: ModelBackend,
+    input: &mut impl BufRead,
+) -> Result<Repl> {
+    let mut repl = Repl::with_controller(RunController::with_project(project, backend));
+    for line in input.lines() {
+        let line = line.context("failed to read REPL input")?;
+        match repl.handle_async(&line).await? {
+            ReplOutcome::Quit => break,
+            ReplOutcome::Continue => {}
+            ReplOutcome::Message(message)
+            | ReplOutcome::Coordinator(message)
+            | ReplOutcome::ReadOnly(message)
+            | ReplOutcome::AgentText(message)
+            | ReplOutcome::AwaitingConfirmation(message)
+            | ReplOutcome::Error(message) => println!("{message}"),
+        }
+    }
+    Ok(repl)
 }
 
 fn parse_skill(name: &str) -> Result<ReplCommand> {

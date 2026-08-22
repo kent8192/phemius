@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use yaml_serde::{Mapping, Value};
 
-use crate::domain::{EntityId, EntityKind, prefixed_uuid};
+use crate::domain::{EntityId, EntityKind, is_prefixed_uuid, prefixed_uuid};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectConfig {
@@ -38,10 +38,51 @@ pub struct Project {
 }
 
 impl Project {
+    /// Opens an existing project without changing any canonical bytes.
+    ///
+    /// The root is canonicalized before it is retained, and the on-disk
+    /// `project.toml` is checked for the supported format and immutable work ID.
+    pub fn open(root: &Path) -> Result<Self> {
+        let root = fs::canonicalize(root)
+            .with_context(|| format!("failed to canonicalize project root {}", root.display()))?;
+        ensure!(
+            root.is_dir(),
+            "project root is not a directory: {}",
+            root.display()
+        );
+        let config_path = root.join("project.toml");
+        ensure!(
+            config_path.is_file(),
+            "project.toml is missing from project root {}",
+            root.display()
+        );
+        let bytes = fs::read(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!("{} is not valid UTF-8", config_path.display()))?;
+        let config: ProjectConfig = toml::from_str(text)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?;
+        ensure!(
+            config.format_version == 1,
+            "unsupported project format version {}",
+            config.format_version
+        );
+        ensure!(
+            is_prefixed_uuid(config.work_id.as_str(), EntityKind::Work),
+            "project.toml work_id is not a valid work UUID"
+        );
+        Ok(Self { root, config })
+    }
+
     pub fn resolve_path(&self, relative: &Path) -> Result<PathBuf> {
         validate_relative_path(relative)?;
         Ok(self.root.join(relative))
     }
+}
+
+/// Loads an existing project from a path, retaining the canonical root.
+pub fn load_project(root: &Path) -> Result<Project> {
+    Project::open(root)
 }
 
 #[derive(Clone, Debug)]

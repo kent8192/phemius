@@ -94,6 +94,11 @@ impl Repl {
         self.history.len()
     }
 
+    /// Returns whether the trusted REPL is attached to a project controller.
+    pub fn has_controller(&self) -> bool {
+        self.controller.is_some()
+    }
+
     /// Returns whether the last model request stopped ambiguously.
     pub const fn has_ambiguous_request(&self) -> bool {
         self.ambiguous_request

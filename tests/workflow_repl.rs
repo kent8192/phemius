@@ -6,7 +6,9 @@ use phemius::{
     model::{ModelFailure, ModelResponse, ScriptedModel},
     project::{InitAnswers, initialize_project},
     repl::{Repl, ReplOutcome, RoutedInput, route_input},
-    workflow::{AgentRole, ChapterState, Finding, FindingDisposition, FindingKind, RunController},
+    workflow::{
+        AgentRole, AgentSpec, ChapterState, Finding, FindingDisposition, FindingKind, RunController,
+    },
 };
 
 #[tokio::test]
@@ -21,9 +23,43 @@ async fn chapter_pipeline_runs_writer_then_three_critics_at_most_then_reviser() 
         .unwrap();
     assert_eq!(result.trace.writer_calls, 1);
     assert_eq!(result.trace.architect_calls, 1);
-    assert!(result.trace.max_parallel_critics <= 3);
+    assert_eq!(result.trace.max_parallel_critics, 3);
+    assert_eq!(result.trace.critic_calls, 6);
+    assert_eq!(
+        result
+            .trace
+            .roles
+            .iter()
+            .filter(|role| role.is_critic())
+            .copied()
+            .collect::<Vec<_>>(),
+        AgentSpec::critic_roles()
+    );
     assert!(result.changeset.state.is_approvable());
     assert_eq!(result.trace.roles.first(), Some(&AgentRole::StoryArchitect));
+}
+
+#[tokio::test]
+async fn unknown_finding_kind_stops_the_pipeline_fail_closed() {
+    let backend = ScriptedModel::new([
+        Ok(ModelResponse {
+            text: "plan".into(),
+            tool_calls: Vec::new(),
+        }),
+        Ok(ModelResponse {
+            text: "draft".into(),
+            tool_calls: Vec::new(),
+        }),
+        Ok(ModelResponse {
+            text: "FINDING|invented-kind|本文/chapter_1.md|0|4|unknown".into(),
+            tool_calls: Vec::new(),
+        }),
+    ]);
+    let error = RunController::fixture(backend)
+        .write_chapter("chapter_1")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown finding kind"));
 }
 
 #[test]
@@ -97,6 +133,51 @@ async fn corrections_are_present_in_later_context_receipts() {
     );
 }
 
+#[test]
+fn scoped_corrections_for_scene_character_and_location_reach_later_chapters() {
+    let mut run = RunController::fixture(ScriptedModel::new([]));
+    run.register_chapter("chapter_2", 2, ChapterState::Planned);
+    run.register_chapter("chapter_3", 3, ChapterState::Planned);
+    assert!(
+        run.accept_human_correction("chapter_2", "old", "new", "character", Some("scene_2"),)
+            .is_err()
+    );
+    let scene = run
+        .accept_human_correction(
+            "chapter_2",
+            "old scene",
+            "new scene",
+            "scene",
+            Some("scene_2"),
+        )
+        .unwrap();
+    let character = run
+        .accept_human_correction(
+            "chapter_2",
+            "old character",
+            "new character",
+            "character",
+            Some("character_2"),
+        )
+        .unwrap();
+    let location = run
+        .accept_human_correction(
+            "chapter_2",
+            "old location",
+            "new location",
+            "location",
+            Some("location_2"),
+        )
+        .unwrap();
+
+    let receipt = run.correction_receipt("chapter_3");
+    assert_eq!(receipt.len(), 3);
+    assert_eq!(receipt[0].rule_id, scene.id);
+    assert_eq!(receipt[1].rule_id, character.id);
+    assert_eq!(receipt[2].rule_id, location.id);
+    assert!(run.correction_receipt("chapter_2").is_empty());
+}
+
 #[tokio::test]
 async fn approval_is_human_only_and_follows_changeset_order() {
     let directory = TestDir::new("workflow-order");
@@ -135,11 +216,15 @@ async fn revision_cycles_are_bounded_and_ambiguous_requests_are_not_retried() {
             tool_calls: Vec::new(),
         }),
         Ok(ModelResponse {
-            text: "revision".into(),
+            text: blocker.into(),
             tool_calls: Vec::new(),
         }),
         Ok(ModelResponse {
-            text: "revision".into(),
+            text: blocker.into(),
+            tool_calls: Vec::new(),
+        }),
+        Ok(ModelResponse {
+            text: blocker.into(),
             tool_calls: Vec::new(),
         }),
     ]);

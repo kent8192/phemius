@@ -28,7 +28,10 @@ use crate::{
     copycheck::{AllowedSource, CopyPolicy, scan_near_copy},
     cost::{BudgetLedger, MicroDollars},
     domain::{EntityKind, prefixed_uuid},
-    model::{ModelBackend, ModelFailureClass, ModelMessage, ModelRequest, ScriptedModel},
+    model::{
+        ModelBackend, ModelFailureClass, ModelMessage, ModelRequest, ModelResponse, ModelResult,
+        ScriptedModel,
+    },
     plot::{StoryStructure, builtin_framework, validate_structure},
     project::Project,
     sources::ManifestDocument,
@@ -480,7 +483,6 @@ pub struct RunController {
     length_unit: LengthUnit,
     min_length: usize,
     max_length: usize,
-    max_critics: usize,
     max_revisions: usize,
     cost_ledger: BudgetLedger,
     request_maximum_cost: Option<MicroDollars>,
@@ -522,7 +524,6 @@ impl RunController {
             length_unit: LengthUnit::Graphemes,
             min_length: 8_000,
             max_length: 12_000,
-            max_critics: 3,
             max_revisions: 2,
             cost_ledger: BudgetLedger::new(MicroDollars::zero(), MicroDollars::zero()),
             request_maximum_cost: Some(MicroDollars::new(100_000)),
@@ -736,6 +737,10 @@ impl RunController {
     }
 
     /// Resolves exactly one finding through the trusted false-positive branch.
+    ///
+    /// The public method exists for deterministic harness integration, but production callers
+    /// must invoke it only from the trusted `/resolve` REPL branch.  Model output and natural
+    /// language routing never call this method.
     pub fn resolve_false_positive(
         &mut self,
         finding_id: &str,
@@ -846,12 +851,14 @@ impl RunController {
             let target = target.ok_or_else(|| anyhow!("scoped corrections require a target"))?;
             ensure!(!target.trim().is_empty(), "correction target is required");
             ensure!(
-                target.starts_with("chapter_")
-                    || target.starts_with("scene_")
-                    || target.starts_with("box_")
-                    || target.starts_with("character_")
-                    || target.starts_with("location_"),
-                "correction target has an unknown entity prefix"
+                match scope {
+                    CorrectionScope::Chapter => target.starts_with("chapter_"),
+                    CorrectionScope::Scene => target.starts_with("scene_"),
+                    CorrectionScope::Character => target.starts_with("character_"),
+                    CorrectionScope::Location => target.starts_with("location_"),
+                    CorrectionScope::Project => false,
+                },
+                "correction target does not match its scope"
             );
             if let Some(target_chapter) = self.chapter_opt(target) {
                 ensure!(
@@ -1206,70 +1213,41 @@ impl RunController {
         let mut candidate_text = writer_text.clone();
 
         let mut findings = Vec::new();
-        let critic_count = self.max_critics.min(AgentSpec::critic_roles().len());
-        trace.max_parallel_critics = critic_count;
-        let role_order = AgentSpec::critic_roles()[..critic_count].to_vec();
-        let mut critic_requests = Vec::with_capacity(role_order.len());
-        for role in &role_order {
-            trace.roles.push(*role);
-            trace.critic_calls += 1;
-            let request = ModelRequest::new(
-                role.name(),
-                vec![ModelMessage::user(format!(
-                    "Review candidate chapter {chapter_id} without editing it.\n\nImmutable candidate:\n{candidate_text}\n\nProvisional context: {provisional_canon_hashes:?}\nCorrection receipt: {correction_receipts:?}"
-                ))],
-                Vec::new(),
-            )
-            .with_model(self.model(*role));
-            self.reserve_request(chapter_id)?;
-            critic_requests.push((*role, request, self.backend.clone()));
-        }
+        let role_order = AgentSpec::critic_roles().to_vec();
+        trace.max_parallel_critics = 3;
         let strict_backend_errors = self.strict_backend_errors;
         let mut failing_critic_roles = BTreeSet::new();
-        let mut critic_results = stream::iter(critic_requests)
-            .map(|(role, request, mut backend)| async move {
-                let result = backend.complete(request).await;
-                (role, result)
-            })
-            .buffer_unordered(3)
-            .collect::<Vec<_>>()
-            .await;
-        critic_results.sort_by_key(|(role, _)| role_order.iter().position(|item| item == role));
-        for (role, result) in critic_results {
-            match result {
-                Ok(response) => {
-                    let role_findings =
-                        parse_findings(&response.text, role, &candidate_hash, &candidate_text)?;
-                    if role_findings
-                        .iter()
-                        .any(|finding| finding.blocks(&candidate_hash))
-                    {
-                        failing_critic_roles.insert(role);
+        for role_batch in role_order.chunks(3) {
+            let mut specs = Vec::with_capacity(role_batch.len());
+            for role in role_batch {
+                trace.roles.push(*role);
+                trace.critic_calls += 1;
+                specs.push((
+                    *role,
+                    format!(
+                        "Review candidate chapter {chapter_id} without editing it.\n\nImmutable candidate:\n{candidate_text}\n\nImmutable context receipt: provisional canon hashes={provisional_canon_hashes:?}; corrections={correction_receipts:?}. Report typed evidence as FINDING|kind|artifact|start|end|message."
+                    ),
+                ));
+            }
+            for (role, result) in self.run_critic_batch(chapter_id, &specs).await? {
+                match result {
+                    Ok(response) => {
+                        let role_findings =
+                            parse_findings(&response.text, role, &candidate_hash, &candidate_text)?;
+                        if role_findings
+                            .iter()
+                            .any(|finding| finding.blocks(&candidate_hash))
+                        {
+                            failing_critic_roles.insert(role);
+                        }
+                        findings.extend(role_findings);
                     }
-                    findings.extend(role_findings);
+                    Err(error)
+                        if !strict_backend_errors
+                            && error.class() == ModelFailureClass::Stopped => {}
+                    Err(error) => return Err(model_error(error)),
                 }
-                Err(error)
-                    if !strict_backend_errors && error.class() == ModelFailureClass::Stopped => {}
-                Err(error) => return Err(model_error(error)),
             }
-        }
-        let existing_findings = self
-            .findings
-            .iter()
-            .filter(|(id, _)| {
-                self.finding_chapters.get(*id).map(String::as_str) == Some(chapter_id)
-            })
-            .map(|(_, finding)| finding.clone())
-            .collect::<Vec<_>>();
-        for finding in existing_findings {
-            if !findings.iter().any(|item: &Finding| item.id == finding.id) {
-                findings.push(finding);
-            }
-        }
-        for finding in &findings {
-            self.finding_chapters
-                .insert(finding.id.clone(), chapter_id.into());
-            self.findings.insert(finding.id.clone(), finding.clone());
         }
 
         let mut state = ChapterState::Candidate;
@@ -1283,11 +1261,24 @@ impl RunController {
             }
             trace.roles.push(AgentRole::Reviser);
             trace.reviser_calls += 1;
+            let typed_findings = findings
+                .iter()
+                .map(|finding| {
+                    format!(
+                        "kind={:?}; artifact={}; range={}..{}; message={}",
+                        finding.kind, finding.artifact, finding.start, finding.end, finding.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let required_facts = format!(
+                "provisional canon hashes={provisional_canon_hashes:?}; correction receipts={correction_receipts:?}"
+            );
             let request = ModelRequest::new(
                 AgentRole::Reviser.name(),
-                vec![ModelMessage::user(
-                    "Revise only the candidate; preserve approved facts.",
-                )],
+                vec![ModelMessage::user(format!(
+                    "Revise only this candidate prose and preserve every approved fact.\n\nCandidate:\n{candidate_text}\n\nTyped findings:\n{typed_findings}\n\nRequired facts and correction directives:\n{required_facts}"
+                ))],
                 Vec::new(),
             )
             .with_model(self.model(AgentRole::Reviser));
@@ -1295,6 +1286,8 @@ impl RunController {
             match self.backend.complete(request).await {
                 Ok(response) if !response.text.is_empty() => {
                     candidate_text = response.text;
+                    self.invalidate_chapter_findings(chapter_id);
+                    findings.clear();
                     if let (Some(project), Some(previous)) =
                         (self.project.as_ref(), prepared.as_ref())
                     {
@@ -1313,47 +1306,42 @@ impl RunController {
                     } else {
                         candidate_hash = sha256_bytes(candidate_text.as_bytes());
                     }
-                    findings = parse_findings(
-                        &candidate_text,
-                        AgentRole::Reviser,
-                        &candidate_hash,
-                        &candidate_text,
-                    )?;
                     let rerun_roles = failing_critic_roles.iter().copied().collect::<Vec<_>>();
                     failing_critic_roles.clear();
-                    for role in rerun_roles {
-                        trace.roles.push(role);
-                        trace.critic_calls += 1;
-                        let request = ModelRequest::new(
-                            role.name(),
-                            vec![ModelMessage::user(format!(
-                                "Re-review the revised immutable candidate chapter {chapter_id}; report only changed evidence.\n\nCandidate:\n{candidate_text}"
-                            ))],
-                            Vec::new(),
-                        )
-                        .with_model(self.model(role));
-                        self.reserve_request(chapter_id)?;
-                        let mut backend = self.backend.clone();
-                        match backend.complete(request).await {
-                            Ok(response) => {
-                                let role_findings = parse_findings(
-                                    &response.text,
-                                    role,
-                                    &candidate_hash,
-                                    &candidate_text,
-                                )?;
-                                if role_findings
-                                    .iter()
-                                    .any(|finding| finding.blocks(&candidate_hash))
-                                {
-                                    failing_critic_roles.insert(role);
+                    for role_batch in rerun_roles.chunks(3) {
+                        let mut specs = Vec::with_capacity(role_batch.len());
+                        for role in role_batch {
+                            trace.roles.push(*role);
+                            trace.critic_calls += 1;
+                            specs.push((
+                                *role,
+                                format!(
+                                    "Re-review this revised immutable candidate chapter {chapter_id}; report only current typed evidence as FINDING|kind|artifact|start|end|message.\n\nCandidate:\n{candidate_text}\n\nRequired facts and correction directives:\n{required_facts}"
+                                ),
+                            ));
+                        }
+                        for (role, result) in self.run_critic_batch(chapter_id, &specs).await? {
+                            match result {
+                                Ok(response) => {
+                                    let role_findings = parse_findings(
+                                        &response.text,
+                                        role,
+                                        &candidate_hash,
+                                        &candidate_text,
+                                    )?;
+                                    if role_findings
+                                        .iter()
+                                        .any(|finding| finding.blocks(&candidate_hash))
+                                    {
+                                        failing_critic_roles.insert(role);
+                                    }
+                                    findings.extend(role_findings);
                                 }
-                                findings.extend(role_findings);
+                                Err(error)
+                                    if !self.strict_backend_errors
+                                        && error.class() == ModelFailureClass::Stopped => {}
+                                Err(error) => return Err(model_error(error)),
                             }
-                            Err(error)
-                                if !self.strict_backend_errors
-                                    && error.class() == ModelFailureClass::Stopped => {}
-                            Err(error) => return Err(model_error(error)),
                         }
                     }
                 }
@@ -1513,6 +1501,39 @@ impl RunController {
         Ok(runs)
     }
 
+    async fn run_critic_batch(
+        &mut self,
+        chapter_id: &str,
+        specs: &[(AgentRole, String)],
+    ) -> Result<Vec<(AgentRole, ModelResult<ModelResponse>)>> {
+        let mut requests = Vec::with_capacity(specs.len());
+        for (role, prompt) in specs {
+            let request = ModelRequest::new(
+                role.name(),
+                vec![ModelMessage::user(prompt.clone())],
+                Vec::new(),
+            )
+            .with_model(self.model(*role));
+            self.reserve_request(chapter_id)?;
+            requests.push((*role, request, self.backend.clone()));
+        }
+        let mut results = stream::iter(requests)
+            .map(|(role, request, mut backend)| async move {
+                let result = backend.complete(request).await;
+                (role, result)
+            })
+            .buffer_unordered(3)
+            .collect::<Vec<_>>()
+            .await;
+        results.sort_by_key(|(role, _)| {
+            specs
+                .iter()
+                .position(|(expected, _)| expected == role)
+                .unwrap_or(usize::MAX)
+        });
+        Ok(results)
+    }
+
     fn reserve_request(&mut self, chapter_id: &str) -> Result<()> {
         let maximum = self
             .request_maximum_cost
@@ -1610,7 +1631,7 @@ fn correction_applies(rule: &CorrectionRule, chapter_id: &str, controller: &RunC
     let Some(target) = rule.target.as_deref() else {
         return false;
     };
-    if target == chapter_id {
+    if target == chapter_id && rule.scope == CorrectionScope::Chapter {
         return true;
     }
     match rule.scope {
@@ -1629,9 +1650,8 @@ fn correction_applies(rule: &CorrectionRule, chapter_id: &str, controller: &RunC
                 target.starts_with("scene_") || target.starts_with("box_")
             }
         }
-        CorrectionScope::Location | CorrectionScope::Character => {
-            target.starts_with("character_") || target.starts_with("location_")
-        }
+        CorrectionScope::Location => target.starts_with("location_"),
+        CorrectionScope::Character => target.starts_with("character_"),
         CorrectionScope::Project => true,
     }
 }
@@ -1733,7 +1753,8 @@ fn parse_findings(
             "style" => FindingKind::Style,
             "source-adherence" => FindingKind::SourceAdherence,
             "story-edit" => FindingKind::StoryEdit,
-            _ => FindingKind::Other,
+            "other" => FindingKind::Other,
+            unknown => bail!("unknown finding kind {unknown} from {}", role.name()),
         };
         let start = start
             .parse::<usize>()
