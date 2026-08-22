@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 
 use crate::repl::{Repl, ReplOutcome};
@@ -160,6 +160,15 @@ pub async fn run_with_input(cli: Cli, input: &mut impl BufRead) -> Result<()> {
         let project = initialize_project(path, &InitAnswers::minimal(title.trim()))?;
         let backend = production_backend()?;
         let _ = run_project_repl(project, backend, input).await?;
+    } else if let Some(TopLevelCommand::Eval { project }) = &cli.command {
+        let report = crate::eval::run_eval(project)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        print!("{}", report.to_markdown());
+        ensure!(
+            report.status == crate::eval::EvalStatus::Pass,
+            "evaluation did not pass: {:?}",
+            report.status
+        );
     } else if cli.command.is_none() {
         let project = Project::open(&cli.project)?;
         let backend = production_backend()?;

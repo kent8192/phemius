@@ -12,6 +12,8 @@ pub mod copycheck;
 pub mod cost;
 /// Defines stable IDs and core command-domain types.
 pub mod domain;
+/// Runs offline evaluation fixtures with hidden expectations and deterministic grading.
+pub mod eval;
 /// Records append-only durable runtime evidence.
 pub mod journal;
 /// Defines concrete model backends and validates returned tool calls.

@@ -1,0 +1,8 @@
+{
+  "responses": [
+    {
+      "text": "SMOKE_PASS: deterministic offline candidate",
+      "tool_calls": []
+    }
+  ]
+}
