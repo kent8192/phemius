@@ -231,8 +231,7 @@ impl Repl {
             | ReplCommand::Revise { .. }
             | ReplCommand::Diff { .. }
             | ReplCommand::Skills
-            | ReplCommand::Skill { .. }
-            | ReplCommand::Compact) => {
+            | ReplCommand::Skill { .. }) => {
                 if self.mode == ReplMode::Consult {
                     Ok(ReplOutcome::ReadOnly(
                         "consult mode: coordinator request is read-only".into(),
@@ -249,6 +248,23 @@ impl Repl {
                         .expect("controller was checked above");
                     match controller.record_coordinator_request(request) {
                         Ok(message) => Ok(ReplOutcome::Coordinator(message)),
+                        Err(error) => Ok(ReplOutcome::Error(error.to_string())),
+                    }
+                }
+            }
+            ReplCommand::Compact => {
+                if self.mode == ReplMode::Consult {
+                    Ok(ReplOutcome::ReadOnly(
+                        "consult mode: compaction is read-only".into(),
+                    ))
+                } else {
+                    let Some(controller) = self.controller.as_mut() else {
+                        return Ok(ReplOutcome::ReadOnly(
+                            "no writing controller is attached; request was not executed".into(),
+                        ));
+                    };
+                    match controller.compact_session() {
+                        Ok(message) => Ok(ReplOutcome::Message(message)),
                         Err(error) => Ok(ReplOutcome::Error(error.to_string())),
                     }
                 }

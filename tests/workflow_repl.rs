@@ -59,6 +59,16 @@ async fn async_coordinator_request_uses_a_typed_role_without_changing_canon() {
     assert_eq!(outcome, ReplOutcome::Coordinator("plan response".into()));
 }
 
+#[test]
+fn compact_command_writes_a_checkpoint_without_invoking_a_model() {
+    let mut repl = Repl::with_controller(RunController::fixture(ScriptedModel::new([])));
+
+    assert_eq!(
+        repl.handle("/compact").unwrap(),
+        ReplOutcome::Message("session checkpoint written; canon unchanged".into())
+    );
+}
+
 #[tokio::test]
 async fn shared_scripted_backend_consumes_distinct_writer_and_critic_responses() {
     let responses = [

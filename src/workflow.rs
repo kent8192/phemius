@@ -884,6 +884,24 @@ impl RunController {
         Ok(response.text)
     }
 
+    /// Writes a typed session checkpoint without invoking a model or changing canon.
+    pub fn compact_session(&mut self) -> Result<String> {
+        if self.project.is_some() && self.session.is_none() {
+            self.attach_latest_session()?;
+        }
+        ensure!(
+            !self.recovery_required,
+            "durable checkpoint requires in-memory state reconstruction; manual resolution is required"
+        );
+        self.ensure_durable_session()?;
+        self.append_session_event(SessionEvent::UserInstruction {
+            text: "compact session".into(),
+        })?;
+        let hash = sha256_bytes(b"compact-session");
+        self.checkpoint(&hash)?;
+        Ok("session checkpoint written; canon unchanged".into())
+    }
+
     /// Opens the project-local append-only session journal and cost ledger on first use.
     ///
     /// The lazy open keeps fixture controllers in-memory while production project controllers
