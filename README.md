@@ -118,8 +118,11 @@ included in later context receipts. Editing an upstream chapter marks
 unapproved descendants stale; approved descendants require revalidation.
 Prepared journals and ambiguous model calls stop for manual resolution rather
 than guessing or replaying a request. Sessions use append-only JSONL plus a
-derived checkpoint; compaction preserves typed canon, source, correction,
-blocker, stale, and cost facts instead of treating a lossy summary as truth.
+derived checkpoint containing the hash-bound controller state needed to resume
+chapters, findings, corrections, provisional canon, model epochs, and costs.
+Compaction preserves typed canon, source, correction, blocker, stale, and cost
+facts instead of treating a lossy summary as truth. Legacy checkpoints without
+that state remain manual-resolution-only.
 When the provider returns usage, it is recorded and settled against the
 optional configured price; without a trusted price, the maximum reservation is
 kept provisional.

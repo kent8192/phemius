@@ -109,11 +109,12 @@ and stops continuous generation at `$120`. The REPL asks for
 Session evidence is kept in `.phemius/records/sessions/<run-id>/` as
 append-only `session.jsonl` and `cost.jsonl`, with a derived `checkpoint.json`.
 If a session has events but no checkpoint, the next run stops for manual
-resolution. `/resume` loads a checkpoint without resending an API request and
-reports that state reconstruction is still required. A fresh process does not
-regenerate from a checkpoint until its in-memory workflow state has been
-reconstructed; this is a deliberate fail-closed boundary against duplicate or
-authority-losing writes.
+resolution. `/resume` loads a checkpoint without resending an API request. New
+checkpoints carry the hash-bound controller state needed to restore chapters,
+findings, corrections, provisional canon, and model/cost state before
+generation continues. Legacy checkpoints without that state remain manual-
+resolution-only; this is a deliberate fail-closed boundary against duplicate
+or authority-losing writes.
 
 ## Skills and shell
 
