@@ -125,6 +125,23 @@ fn oversized_file_tool_input_stops_before_artifact_retention() {
 }
 
 #[rstest]
+fn oversized_single_search_line_stops_before_record_duplication() {
+    let root = TestDirectory::new("oversized-search-line");
+    let path = root.path().join("line.txt");
+    fs::File::create(&path)
+        .unwrap()
+        .set_len(100 * 1024 * 1024)
+        .unwrap();
+    let mut tools = ToolExecutor::new(root.path(), AgentRole::Author).unwrap();
+    let error = tools
+        .execute(ToolRequest::SearchFiles {
+            query: "\0".to_owned(),
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("search result exceeds 100 MiB"));
+}
+
+#[rstest]
 fn critic_directly_cannot_mutate_candidates() {
     let root = TestDirectory::new("critic-tools");
     let mut tools = ToolExecutor::new(root.path(), AgentRole::ConsistencyCritic).unwrap();

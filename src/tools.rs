@@ -354,13 +354,9 @@ impl ToolExecutor {
                 if let Ok(text) = std::str::from_utf8(&bytes) {
                     for (line_number, line) in text.lines().enumerate() {
                         if line.contains(query) {
-                            let record = format!(
-                                "{}:{}:{}",
-                                child_relative.display(),
-                                line_number + 1,
-                                line
-                            );
-                            append_search_result(output, &record, MAX_RESULT_BYTES as usize)?;
+                            let prefix =
+                                format!("{}:{}", child_relative.display(), line_number + 1);
+                            append_search_result(output, &prefix, line, MAX_RESULT_BYTES as usize)?;
                         }
                     }
                 }
@@ -593,8 +589,13 @@ fn read_bounded(reader: &mut impl Read, limit: u64, label: &str) -> Result<Vec<u
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {
+        let requested = limit
+            .checked_add(1)
+            .and_then(|maximum| maximum.checked_sub(bytes.len() as u64))
+            .context("bounded read length overflow")?
+            .min(buffer.len() as u64) as usize;
         let read = reader
-            .read(&mut buffer)
+            .read(&mut buffer[..requested])
             .with_context(|| format!("failed to read {label}"))?;
         if read == 0 {
             return Ok(bytes);
@@ -608,20 +609,25 @@ fn read_bounded(reader: &mut impl Read, limit: u64, label: &str) -> Result<Vec<u
     }
 }
 
-fn append_search_result(output: &mut String, record: &str, limit: usize) -> Result<()> {
+fn append_search_result(output: &mut String, prefix: &str, line: &str, limit: usize) -> Result<()> {
     let separator = usize::from(!output.is_empty());
-    ensure!(
-        output
-            .len()
-            .saturating_add(separator)
-            .saturating_add(record.len())
-            <= limit,
-        "search result exceeds 100 MiB"
-    );
+    let record_length = prefix
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_add(line.len()))
+        .context("search result length overflow")?;
+    let total_length = output
+        .len()
+        .checked_add(separator)
+        .and_then(|length| length.checked_add(record_length))
+        .context("search result length overflow")?;
+    ensure!(total_length <= limit, "search result exceeds 100 MiB");
     if separator == 1 {
         output.push('\n');
     }
-    output.push_str(record);
+    output.push_str(prefix);
+    output.push(':');
+    output.push_str(line);
     Ok(())
 }
 
@@ -653,7 +659,10 @@ fn is_forbidden_component(component: &std::ffi::OsStr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{
+        io::{Cursor, Read},
+        sync::{Arc, Mutex},
+    };
 
     use rstest::rstest;
 
@@ -669,8 +678,34 @@ mod tests {
     #[rstest]
     fn search_result_limit_rejects_before_appending() {
         let mut output = String::from("1234");
-        let error = append_search_result(&mut output, "5", 4).unwrap_err();
+        let error = append_search_result(&mut output, "", "5", 4).unwrap_err();
         assert_eq!(error.to_string(), "search result exceeds 100 MiB");
         assert_eq!(output, "1234");
+    }
+
+    #[rstest]
+    fn bounded_reader_requests_only_the_first_byte_after_its_limit() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut input = RecordingReader {
+            bytes: b"1234".to_vec(),
+            requests: requests.clone(),
+        };
+        assert!(read_bounded(&mut input, 3, "tool input").is_err());
+        assert_eq!(*requests.lock().unwrap(), vec![4]);
+    }
+
+    struct RecordingReader {
+        bytes: Vec<u8>,
+        requests: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Read for RecordingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.requests.lock().unwrap().push(buffer.len());
+            let count = buffer.len().min(self.bytes.len());
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes.drain(..count);
+            Ok(count)
+        }
     }
 }
